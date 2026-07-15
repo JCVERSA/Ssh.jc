@@ -61,14 +61,96 @@ confirm() {
     [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]
 }
 
+# Validates a pasted string looks like a real SSH public key (OpenSSH format).
+# FIX (Medium #7): previously any string was accepted, silently corrupting
+# authorized_keys if the paste was malformed.
+is_valid_pubkey() {
+    [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
+}
+
+# Appends a public key to an authorized_keys file, skipping it if already present.
+# FIX (High #6): the original script appended unconditionally, duplicating the
+# key on every re-run of the script.
+add_key_dedup() {
+    local key="$1" path="$2"
+    sudo mkdir -p "$(dirname "$path")"
+    sudo touch "$path"
+    if sudo grep -qF "$key" "$path" 2>/dev/null; then
+        info "This key is already present in $path, skipping."
+    else
+        echo "$key" | sudo tee -a "$path" > /dev/null
+    fi
+}
+
+# Installs jq if missing. Extracted into a function (FIX Low): was duplicated
+# inline and only triggered inside the tunnel-creation step, even though the
+# cloudflared checksum verification step now also needs it.
+ensure_jq() {
+    if ! command -v jq &>/dev/null; then
+        info "jq is not installed (needed to parse JSON output reliably)."
+        sudo apt update 2>&1 | tee -a "$LOG_FILE"
+        sudo apt install -y jq 2>&1 | tee -a "$LOG_FILE"
+    fi
+}
+
+# Creates a dedicated sudo-capable admin user with SSH key auth.
+# FIX (Critical #1): offers a safer alternative to enabling root SSH login
+# directly on a tunnel that will be reachable from the public internet.
+create_admin_user() {
+    local username pubkey
+    username=$(ask "Username for the new admin account" "admin")
+
+    if id "$username" &>/dev/null; then
+        ok "User '$username' already exists."
+    else
+        sudo useradd -m -s /bin/bash -G sudo "$username" 2>&1 | tee -a "$LOG_FILE"
+        if id "$username" &>/dev/null; then
+            ok "User '$username' created and added to the 'sudo' group."
+        else
+            error "Failed to create user '$username'. Check the log: $LOG_FILE"
+            return 1
+        fi
+    fi
+
+    pubkey=$(ask "Paste the SSH public key for '$username' (contents of your .pub key)" "")
+    if [[ -n "$pubkey" ]]; then
+        if ! is_valid_pubkey "$pubkey"; then
+            warn "This doesn't look like a standard SSH public key format. Adding it anyway, but double-check it works before closing this session."
+        fi
+        add_key_dedup "$pubkey" "/home/$username/.ssh/authorized_keys"
+        sudo chown -R "${username}:${username}" "/home/$username/.ssh"
+        sudo chmod 700 "/home/$username/.ssh"
+        sudo chmod 600 "/home/$username/.ssh/authorized_keys"
+        ok "Key added for '$username'."
+    else
+        warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys), or set a password with: sudo passwd $username"
+    fi
+
+    echo "$username" > /tmp/.setup-ssh-tunnel-user
+}
+
 require_root_tools() {
     if ! command -v sudo &>/dev/null; then
         error "sudo is not available on this system. The script must be run as root or with sudo installed."
         exit 1
     fi
+    # FIX (Medium #9): the original script only checked that the `sudo`
+    # binary existed, not that the current user can actually use it. This
+    # caused late, confusing failures deep into the script instead of a
+    # clear failure up front.
+    if ! sudo -v 2>/dev/null; then
+        error "The current user does not appear to have sudo privileges (or the sudo password was refused)."
+        exit 1
+    fi
 }
 
 LOG_FILE="/tmp/setup-ssh-tunnel-$(date +%Y%m%d-%H%M%S).log"
+# FIX (Low #10): log file was only implicitly created by the first `tee -a`
+# call; explicitly creating it up front fails fast if /tmp isn't writable.
+if ! touch "$LOG_FILE" 2>/dev/null; then
+    error "Cannot create log file at $LOG_FILE"
+    exit 1
+fi
 
 banner
 info "Command details will also be logged to: $LOG_FILE"
@@ -129,7 +211,15 @@ if [[ "$DO_SSH" -eq 1 ]]; then
         info "Installing..."
         sudo apt update 2>&1 | tee -a "$LOG_FILE"
         sudo apt install -y openssh-server 2>&1 | tee -a "$LOG_FILE"
-        ok "OpenSSH server installed."
+        # FIX (High #5): the original script never re-checked success after
+        # this install and would blindly try to start a possibly-missing
+        # service.
+        if command -v sshd &>/dev/null; then
+            ok "OpenSSH server installed."
+        else
+            error "openssh-server installation failed. Check the log: $LOG_FILE"
+            exit 1
+        fi
     fi
 
     sudo mkdir -p /run/sshd
@@ -159,31 +249,69 @@ if [[ "$DO_SSH" -eq 1 ]]; then
     fi
 
     echo
-    if confirm "Do you want to set/change the root password now (needed to connect over SSH)?"; then
-        sudo passwd root
-    else
-        warn "Remember to set a root password (or an SSH key) before connecting."
-    fi
+    # FIX (Critical #1 + #2): the original flow set a root password and
+    # advertised root SSH login in the final summary, but never touched
+    # PermitRootLogin (Ubuntu/Debian default: "prohibit-password"), so the
+    # promised root/password login would silently fail over SSH. It also
+    # offered no safer alternative before exposing SSH on a public tunnel.
+    warn "SECURITY: once the tunnel is running, SSH will be reachable from the public internet via your Cloudflare hostname, with no extra login wall unless you separately configure Cloudflare Access."
+    echo "  1) Create a dedicated admin user with an SSH key (recommended)"
+    echo "  2) Configure root access (password and/or key) - legacy, less secure"
+    echo "  3) Skip user/access configuration for now"
+    ACCESS_MODE=$(ask "Choice (1-3)" "1")
 
-    echo
-    if confirm "Do you want to disable password login in favor of a public key (more secure)?"; then
-        PUBKEY=$(ask "Paste your SSH public key (contents of your .pub key)" "")
-        if [[ -n "$PUBKEY" ]]; then
-            sudo mkdir -p /root/.ssh
-            echo "$PUBKEY" | sudo tee -a /root/.ssh/authorized_keys > /dev/null
-            sudo chmod 700 /root/.ssh
-            sudo chmod 600 /root/.ssh/authorized_keys
-            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-            ok "Key added and password authentication disabled."
-            if [[ -d /run/systemd/system ]]; then
-                warn "Restart sshd to apply the change: sudo systemctl restart ssh"
+    case "$ACCESS_MODE" in
+        1)
+            create_admin_user
+            ;;
+        2)
+            if confirm "Are you sure you want to enable root SSH access? A dedicated user (option 1) is safer."; then
+                if confirm "Do you want to set/change the root password now?"; then
+                    sudo passwd root
+                    if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
+                        sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+                        warn "PermitRootLogin set to 'yes'. Root + password over a public tunnel is a significant exposure; consider adding a key and disabling password auth below."
+                    else
+                        sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+                        info "PermitRootLogin left as 'prohibit-password': the root password will work locally (console) but NOT over SSH. Add a key below, or use option 1."
+                    fi
+                else
+                    warn "Remember to set a root password (or an SSH key) before connecting."
+                fi
+
+                echo
+                if confirm "Do you want to add an SSH public key for root (more secure than password)?"; then
+                    PUBKEY=$(ask "Paste your SSH public key (contents of your .pub key)" "")
+                    if [[ -n "$PUBKEY" ]]; then
+                        if ! is_valid_pubkey "$PUBKEY"; then
+                            warn "This doesn't look like a standard SSH public key format. Adding it anyway, but double-check it works before closing this session."
+                        fi
+                        add_key_dedup "$PUBKEY" "/root/.ssh/authorized_keys"
+                        sudo chmod 700 /root/.ssh
+                        sudo chmod 600 /root/.ssh/authorized_keys
+                        sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+                        ok "Key added for root (PermitRootLogin set to 'prohibit-password': key-only)."
+                        if confirm "Disable password login entirely now that a key is configured? (recommended)"; then
+                            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+                            ok "Password authentication disabled."
+                        fi
+                        if [[ -d /run/systemd/system ]]; then
+                            warn "Restart sshd to apply changes: sudo systemctl restart ssh"
+                        else
+                            warn "Restart sshd to apply changes: sudo pkill sshd && sudo /usr/sbin/sshd"
+                        fi
+                    else
+                        warn "No key provided, current settings kept."
+                    fi
+                fi
             else
-                warn "Restart sshd to apply the change: sudo pkill sshd && sudo /usr/sbin/sshd"
+                info "Root access configuration skipped."
             fi
-        else
-            warn "No key provided, password authentication kept enabled."
-        fi
-    fi
+            ;;
+        *)
+            info "User/access configuration skipped."
+            ;;
+    esac
 
     ok "SSH step complete."
 fi
@@ -199,17 +327,42 @@ if [[ "$DO_INSTALL_CF" -eq 1 ]]; then
     else
         ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
         info "Detected architecture: $ARCH"
-        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
+        ASSET_NAME="cloudflared-linux-${ARCH}.deb"
+        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${ASSET_NAME}"
         info "Downloading from: $URL"
 
         TMP_DEB="/tmp/cloudflared-${ARCH}.deb"
+
         if curl -fL -o "$TMP_DEB" "$URL" 2>&1 | tee -a "$LOG_FILE"; then
+            # FIX (Critical #3): verify integrity when GitHub publishes a
+            # digest for the asset, instead of trusting the download blindly.
+            ensure_jq
+            EXPECTED_SHA=""
+            if command -v jq &>/dev/null; then
+                EXPECTED_SHA=$(curl -fsSL "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" 2>/dev/null \
+                    | jq -r --arg name "$ASSET_NAME" '.assets[]? | select(.name == $name) | (.digest // empty)' 2>/dev/null \
+                    | sed -n 's/^sha256://p')
+            fi
+            if [[ -n "$EXPECTED_SHA" ]]; then
+                ACTUAL_SHA=$(sha256sum "$TMP_DEB" | awk '{print $1}')
+                if [[ "$EXPECTED_SHA" == "$ACTUAL_SHA" ]]; then
+                    ok "Checksum verified (sha256)."
+                else
+                    error "Checksum mismatch for $ASSET_NAME (expected $EXPECTED_SHA, got $ACTUAL_SHA). Aborting."
+                    rm -f "$TMP_DEB"
+                    exit 1
+                fi
+            else
+                warn "No published checksum available via the GitHub API for this asset; skipping integrity verification (download was over HTTPS from github.com)."
+            fi
+
             sudo dpkg -i "$TMP_DEB" 2>&1 | tee -a "$LOG_FILE"
             # Resolve any missing dependencies
             sudo apt-get install -f -y 2>&1 | tee -a "$LOG_FILE"
             rm -f "$TMP_DEB"
         else
             error "Failed to download cloudflared. Check your network connection."
+            rm -f "$TMP_DEB"
             exit 1
         fi
     fi
@@ -253,12 +406,7 @@ if [[ "$DO_CREATE_TUNNEL" -eq 1 ]]; then
     # -----------------------------------------------------------------------
     title "Tunnel configuration"
 
-    # jq is required to parse the JSON output reliably.
-    if ! command -v jq &>/dev/null; then
-        info "jq is not installed (needed to read the tunnel list reliably)."
-        sudo apt update 2>&1 | tee -a "$LOG_FILE"
-        sudo apt install -y jq 2>&1 | tee -a "$LOG_FILE"
-    fi
+    ensure_jq
 
     get_tunnel_id() {
         # Looks up a tunnel by exact name via JSON output (more reliable than
@@ -358,16 +506,62 @@ if [[ "$DO_RUN" -eq 1 ]]; then
 
     echo
     echo "  1) Run in the foreground (the terminal must stay open)"
-    echo "  2) Run in the background (nohup, keeps running after you close the terminal)"
-    RUN_MODE=$(ask "Run mode (1-2)" "2")
+    echo "  2) Run in the background (nohup - stops on reboot)"
+    if [[ -d /run/systemd/system ]]; then
+        echo "  3) Install as a systemd service (recommended - survives reboots)"
+        RUN_MODE=$(ask "Run mode (1-3)" "3")
+    else
+        warn "systemd not available here: option 3 won't work on this system."
+        RUN_MODE=$(ask "Run mode (1-2)" "2")
+    fi
 
     CMD_ARR=(cloudflared tunnel run --url "ssh://localhost:${LOCAL_PORT}" "${TUNNEL_NAME}")
+
+    # FIX (High #4): the original script only offered nohup, which does not
+    # survive a VPS reboot - a real problem for what is meant to be a
+    # permanent access method. This adds a proper systemd-managed option.
+    if [[ "$RUN_MODE" == "3" ]]; then
+        ensure_jq
+        if [[ -z "${TUNNEL_ID:-}" ]]; then
+            TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | jq -r --arg name "$TUNNEL_NAME" '.[] | select(.name == $name) | .id' | head -1)
+        fi
+        CRED_FILE="$HOME/.cloudflared/${TUNNEL_ID}.json"
+
+        if [[ -z "$TUNNEL_ID" ]] || [[ ! -f "$CRED_FILE" ]]; then
+            error "Could not find the tunnel credentials file ($CRED_FILE). Cannot install the systemd service."
+            warn "Falling back to background mode."
+            RUN_MODE=2
+        else
+            info "Writing /etc/cloudflared/config.yml ..."
+            sudo mkdir -p /etc/cloudflared
+            sudo tee /etc/cloudflared/config.yml > /dev/null <<EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: ${CRED_FILE}
+url: ssh://localhost:${LOCAL_PORT}
+EOF
+            if sudo cloudflared service install 2>&1 | tee -a "$LOG_FILE" && \
+               sudo systemctl enable --now cloudflared 2>&1 | tee -a "$LOG_FILE"; then
+                sleep 2
+                if systemctl is-active --quiet cloudflared; then
+                    ok "cloudflared installed and running as a systemd service."
+                    info "Manage it with: sudo systemctl {status|restart|stop} cloudflared"
+                    info "Logs: sudo journalctl -u cloudflared -f"
+                else
+                    error "The cloudflared service does not look active. Check: sudo journalctl -u cloudflared -e"
+                fi
+            else
+                error "Failed to install/start the cloudflared systemd service."
+                warn "Falling back to background mode."
+                RUN_MODE=2
+            fi
+        fi
+    fi
 
     if [[ "$RUN_MODE" == "1" ]]; then
         info "Running in the foreground. Press Ctrl+C to stop."
         info "Command: ${CMD_ARR[*]}"
         "${CMD_ARR[@]}"
-    else
+    elif [[ "$RUN_MODE" == "2" ]]; then
         NOHUP_LOG="/tmp/cloudflared-${TUNNEL_NAME}.log"
         info "Running in the background. Logs: $NOHUP_LOG"
         nohup "${CMD_ARR[@]}" > "$NOHUP_LOG" 2>&1 &
@@ -375,7 +569,10 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         sleep 3
         if kill -0 "$TUNNEL_PID" 2>/dev/null; then
             ok "Tunnel running in the background (PID: $TUNNEL_PID)."
-            info "To stop it later: kill $TUNNEL_PID"
+            # FIX (Medium #8): the PID used to only be printed to the
+            # terminal, with no way to retrieve it in a later session.
+            echo "$TUNNEL_PID" > /tmp/.setup-ssh-tunnel-pid
+            info "To stop it later: kill \$(cat /tmp/.setup-ssh-tunnel-pid)"
             info "To view the logs: tail -f $NOHUP_LOG"
         else
             error "The tunnel appears to have failed to start. Check: $NOHUP_LOG"
@@ -398,6 +595,11 @@ if [[ -z "$HOSTNAME_SAVED" ]]; then
     fi
 fi
 
+# FIX: the connection command was hardcoded to "root@", which is wrong (and
+# insecure to suggest by default) whenever a dedicated admin user was created.
+CONNECT_USER="root"
+[[ -f /tmp/.setup-ssh-tunnel-user ]] && CONNECT_USER=$(cat /tmp/.setup-ssh-tunnel-user)
+
 if [[ -n "$HOSTNAME_SAVED" ]]; then
     echo -e "${GREEN}To connect over SSH from another device (Termux, PC, etc.):${NC}"
     echo
@@ -406,9 +608,10 @@ if [[ -n "$HOSTNAME_SAVED" ]]; then
     echo -e "     ${BOLD}sudo apt install openssh-client${NC} + cloudflared   # (Linux/macOS)"
     echo
     echo "  2. Connect with this command:"
-    echo -e "     ${BOLD}ssh -o ProxyCommand=\"cloudflared access ssh --hostname ${HOSTNAME_SAVED}\" root@${HOSTNAME_SAVED}${NC}"
+    echo -e "     ${BOLD}ssh -o ProxyCommand=\"cloudflared access ssh --hostname ${HOSTNAME_SAVED}\" ${CONNECT_USER}@${HOSTNAME_SAVED}${NC}"
     echo
     info "This command works as long as the tunnel is running on the server side (see above)."
+    warn "Reminder: this hostname is reachable by anyone on the internet. For stronger protection, add a Cloudflare Access policy in front of it (Zero Trust dashboard)."
 fi
 
 ok "Done. Full log available at: $LOG_FILE"
