@@ -106,6 +106,61 @@ check_sshd_setting() {
     fi
 }
 
+# Ensures the SFTP subsystem is active. On Ubuntu/Debian, openssh-server
+# enables it out of the box (`Subsystem sftp ...` in the default
+# sshd_config), so this is normally a no-op; it only intervenes if that line
+# was removed/commented (e.g. hardened baseline images). Any user who can
+# already log in over SSH (password or key, per the access mode chosen above)
+# automatically gets SFTP too - no separate account or key is needed.
+ensure_sftp_enabled() {
+    # `sshd -T` reports the merged, effective configuration (main file +
+    # Include drop-ins), so this reflects reality rather than just the main
+    # file's contents.
+    if sudo sshd -T 2>/dev/null | grep -qi '^subsystem sftp'; then
+        ok "SFTP is already active for any user who can log in over SSH."
+        return 0
+    fi
+
+    warn "The SFTP subsystem is not active in the current sshd configuration."
+    if ! confirm "Enable SFTP now (adds a 'Subsystem sftp' line to /etc/ssh/sshd_config)?"; then
+        info "SFTP left disabled."
+        return 0
+    fi
+
+    local sftp_server=""
+    for candidate in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server; do
+        [[ -x "$candidate" ]] && { sftp_server="$candidate"; break; }
+    done
+
+    if [[ -z "$sftp_server" ]]; then
+        error "Could not locate the sftp-server binary. Is openssh-sftp-server installed? Try: sudo apt install -y openssh-sftp-server"
+        return 1
+    fi
+
+    if grep -qi '^#\?Subsystem[[:space:]]\+sftp' /etc/ssh/sshd_config 2>/dev/null; then
+        sudo sed -i "s|^#\?Subsystem[[:space:]]\+sftp.*|Subsystem sftp ${sftp_server}|" /etc/ssh/sshd_config
+    else
+        echo "Subsystem sftp ${sftp_server}" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+    fi
+
+    if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+        error "sshd_config now has a syntax error after adding the SFTP subsystem - DO NOT restart sshd until this is fixed. See $LOG_FILE."
+        return 1
+    fi
+
+    if sudo sshd -T 2>/dev/null | grep -qi '^subsystem sftp'; then
+        ok "SFTP subsystem configured (${sftp_server})."
+    else
+        warn "Could not confirm SFTP is active after the change. A drop-in file under /etc/ssh/sshd_config.d/*.conf may be interfering. Verify manually: sudo sshd -T | grep -i subsystem"
+    fi
+
+    if [[ -d /run/systemd/system ]]; then
+        warn "Restart sshd to apply changes: sudo systemctl restart ssh"
+    else
+        warn "Restart sshd to apply changes: sudo pkill sshd && sudo /usr/sbin/sshd"
+    fi
+}
+
 # Installs jq if missing. Extracted into a function (FIX Low): was duplicated
 # inline and only triggered inside the tunnel-creation step, even though the
 # cloudflared checksum verification step now also needs it.
@@ -149,6 +204,30 @@ create_admin_user() {
         sudo chmod 700 "/home/$username/.ssh"
         sudo chmod 600 "/home/$username/.ssh/authorized_keys"
         ok "Key added for '$username'."
+
+        # FIX (High #14 - audit 3): this path was presented as the
+        # "recommended" and secure option, but only added a key for the new
+        # user - it never touched PasswordAuthentication. Any other local
+        # account with a password (including the one running this script)
+        # could still log in with a password once the tunnel made sshd
+        # publicly reachable, silently undermining the "recommended" label.
+        echo
+        if confirm "Disable SSH password authentication for ALL accounts now that '$username' has a key? (recommended - do this only after confirming the key works)"; then
+            sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+            if sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+                ok "Password authentication disabled for all accounts."
+                check_sshd_setting "PasswordAuthentication" "no"
+                if [[ -d /run/systemd/system ]]; then
+                    warn "Restart sshd to apply changes: sudo systemctl restart ssh"
+                else
+                    warn "Restart sshd to apply changes: sudo pkill sshd && sudo /usr/sbin/sshd"
+                fi
+            else
+                error "sshd_config now has a syntax error - DO NOT restart sshd until this is fixed, or you may lock yourself out. See $LOG_FILE."
+            fi
+        else
+            warn "Password authentication left enabled. Any local account with a password can still log in over SSH once the tunnel is public."
+        fi
     else
         warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys), or set a password with: sudo passwd $username"
     fi
@@ -171,11 +250,13 @@ require_root_tools() {
     fi
 }
 
-LOG_FILE="/tmp/setup-ssh-tunnel-$(date +%Y%m%d-%H%M%S).log"
-# FIX (Low #10): log file was only implicitly created by the first `tee -a`
-# call; explicitly creating it up front fails fast if /tmp isn't writable.
-if ! touch "$LOG_FILE" 2>/dev/null; then
-    error "Cannot create log file at $LOG_FILE"
+# FIX (Medium #15 - audit 3): a predictable filename under the shared,
+# world-writable /tmp is a symlink/TOCTOU risk (a local attacker could
+# pre-create the path before this script runs). mktemp allocates the file
+# atomically with a unique name and 0600 permissions.
+LOG_FILE=$(mktemp "/tmp/setup-ssh-tunnel-$(date +%Y%m%d-%H%M%S)-XXXXXX.log" 2>/dev/null)
+if [[ -z "$LOG_FILE" ]] || ! touch "$LOG_FILE" 2>/dev/null; then
+    error "Cannot create log file under /tmp."
     exit 1
 fi
 
@@ -363,6 +444,9 @@ if [[ "$DO_SSH" -eq 1 ]]; then
             ;;
     esac
 
+    echo
+    ensure_sftp_enabled
+
     ok "SSH step complete."
 fi
 
@@ -375,13 +459,23 @@ if [[ "$DO_INSTALL_CF" -eq 1 ]]; then
     if command -v cloudflared &>/dev/null; then
         ok "cloudflared is already installed ($(cloudflared --version 2>&1 | head -1))."
     else
-        ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-        info "Detected architecture: $ARCH"
+        # FIX (Low #18 - audit 3): a failed detection used to fall back to
+        # "amd64" silently, which could download the wrong package on a
+        # non-amd64 host with no dpkg. Now it's an explicit, visible warning.
+        if ARCH=$(dpkg --print-architecture 2>/dev/null) && [[ -n "$ARCH" ]]; then
+            info "Detected architecture: $ARCH"
+        else
+            ARCH="amd64"
+            warn "Could not detect architecture via dpkg; defaulting to amd64. If this host is not x86_64, cancel and check manually."
+        fi
         ASSET_NAME="cloudflared-linux-${ARCH}.deb"
         URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${ASSET_NAME}"
         info "Downloading from: $URL"
 
-        TMP_DEB="/tmp/cloudflared-${ARCH}.deb"
+        # FIX (Medium #15 - audit 3): predictable /tmp path replaced with
+        # mktemp for the same symlink/TOCTOU reason as LOG_FILE above - this
+        # file is about to be installed as root via sudo dpkg -i.
+        TMP_DEB=$(mktemp "/tmp/cloudflared-${ARCH}-XXXXXX.deb")
 
         if curl -fL -o "$TMP_DEB" "$URL" 2>&1 | tee -a "$LOG_FILE"; then
             # FIX (Critical #3): verify integrity when GitHub publishes a
@@ -557,7 +651,10 @@ if [[ "$DO_RUN" -eq 1 ]]; then
     # validation, so a typo would silently produce a broken tunnel URL.
     while true; do
         LOCAL_PORT=$(ask "Local port to expose (SSH = 22)" "22")
-        if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_PORT >= 1 && LOCAL_PORT <= 65535 )); then
+        # FIX (Low #17 - audit 3): bash arithmetic treats a leading-zero
+        # numeral (e.g. "022") as octal, which could validate/reject a port
+        # differently from its plain decimal reading. Force base 10.
+        if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && (( 10#$LOCAL_PORT >= 1 && 10#$LOCAL_PORT <= 65535 )); then
             break
         fi
         error "Invalid port: '$LOCAL_PORT'. Enter a number between 1 and 65535."
@@ -653,11 +750,17 @@ if [[ -z "$HOSTNAME_SAVED" ]]; then
     fi
 fi
 
-# FIX: the connection command was hardcoded to "root@", which is wrong (and
-# insecure to suggest by default) whenever a dedicated admin user was created.
+# FIX (Medium #16 - audit 3): CONNECT_USER used to default to "root" even
+# when access configuration was explicitly skipped (ACCESS_MODE 3), which
+# advertised a login that was never actually configured. Track whether any
+# access setup actually happened and say so plainly if not.
 CONNECT_USER="root"
 SAVED_USER=$(state_get user)
-[[ -n "$SAVED_USER" ]] && CONNECT_USER="$SAVED_USER"
+if [[ -n "$SAVED_USER" ]]; then
+    CONNECT_USER="$SAVED_USER"
+elif [[ "${ACCESS_MODE:-}" != "2" ]]; then
+    warn "No SSH access (user or root) was configured in this run. The command below is a template only - set up a login first (re-run and choose option 1 or 2), or it will fail."
+fi
 
 if [[ -n "$HOSTNAME_SAVED" ]]; then
     echo -e "${GREEN}To connect over SSH from another device (Termux, PC, etc.):${NC}"
@@ -668,6 +771,11 @@ if [[ -n "$HOSTNAME_SAVED" ]]; then
     echo
     echo "  2. Connect with this command:"
     echo -e "     ${BOLD}ssh -o ProxyCommand=\"cloudflared access ssh --hostname ${HOSTNAME_SAVED}\" ${CONNECT_USER}@${HOSTNAME_SAVED}${NC}"
+    echo
+    echo "  3. For file transfer (SFTP), same principle, same tunnel and same key:"
+    echo -e "     ${BOLD}sftp -o ProxyCommand=\"cloudflared access ssh --hostname ${HOSTNAME_SAVED}\" ${CONNECT_USER}@${HOSTNAME_SAVED}${NC}"
+    echo -e "     Or with a graphical client (FileZilla, WinSCP, Cyberduck...): protocol SFTP, host ${HOSTNAME_SAVED},"
+    echo -e "     user ${CONNECT_USER}, and the same ProxyCommand configured as an external SFTP/SSH proxy option."
     echo
     info "This command works as long as the tunnel is running on the server side (see above)."
     warn "Reminder: this hostname is reachable by anyone on the internet. For stronger protection, add a Cloudflare Access policy in front of it (Zero Trust dashboard)."
