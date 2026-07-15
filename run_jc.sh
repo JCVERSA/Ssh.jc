@@ -123,7 +123,19 @@ create_admin_user() {
         sudo chmod 600 "/home/$username/.ssh/authorized_keys"
         ok "Key added for '$username'."
     else
-        warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys), or set a password with: sudo passwd $username"
+        warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys)."
+    fi
+
+    # FIX (audit #2): a user created by useradd has no password set (locked
+    # account). On Debian/Ubuntu, the 'sudo' group still requires password
+    # authentication by default, so without this step the new admin user
+    # could log in over SSH (with the key above) but would be unable to run
+    # any sudo command at all.
+    echo
+    if confirm "Set a password for '$username' now? (required to use 'sudo' on this system, even with an SSH key configured for login)"; then
+        sudo passwd "$username"
+    else
+        warn "'$username' has no password and won't be able to run 'sudo' until you set one: sudo passwd $username"
     fi
 
     echo "$username" > /tmp/.setup-ssh-tunnel-user
@@ -539,7 +551,10 @@ tunnel: ${TUNNEL_ID}
 credentials-file: ${CRED_FILE}
 url: ssh://localhost:${LOCAL_PORT}
 EOF
-            if sudo cloudflared service install 2>&1 | tee -a "$LOG_FILE" && \
+            # FIX (audit #2): cloudflared defaults to looking for $HOME/.cloudflared/config.yml,
+            # and $HOME resolves to /root under sudo - which may not contain our config.
+            # Cloudflare's own docs recommend passing --config explicitly to avoid this.
+            if sudo cloudflared --config /etc/cloudflared/config.yml service install 2>&1 | tee -a "$LOG_FILE" && \
                sudo systemctl enable --now cloudflared 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet cloudflared; then
