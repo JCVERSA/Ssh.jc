@@ -75,10 +75,34 @@ add_key_dedup() {
     local key="$1" path="$2"
     sudo mkdir -p "$(dirname "$path")"
     sudo touch "$path"
-    if sudo grep -qF "$key" "$path" 2>/dev/null; then
+    if sudo grep -qF -- "$key" "$path" 2>/dev/null; then
         info "This key is already present in $path, skipping."
     else
-        echo "$key" | sudo tee -a "$path" > /dev/null
+        printf '%s\n' "$key" | sudo tee -a "$path" > /dev/null
+    fi
+}
+
+# Validates sshd_config syntax and confirms the EFFECTIVE value of a directive
+# actually matches what we just set.
+# FIX (High #11 - audit 2): Ubuntu/Debian cloud images ship
+# `Include /etc/ssh/sshd_config.d/*.conf` near the top of sshd_config, and
+# OpenSSH applies the FIRST occurrence of a directive it encounters. A drop-in
+# file (e.g. 50-cloud-init.conf) can therefore silently override a value we
+# just `sed`-ed into the main file, while the script would otherwise report
+# success. `sshd -T` reports the value sshd will actually use.
+check_sshd_setting() {
+    local directive="$1" expected="$2" actual
+    if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+        error "sshd_config has a syntax error after this change. Fix it before restarting sshd (see $LOG_FILE)."
+        return 1
+    fi
+    actual=$(sudo sshd -T 2>/dev/null | awk -v d="${directive,,}" 'tolower($1)==d {print $2; exit}')
+    if [[ -z "$actual" ]]; then
+        warn "Could not determine the effective value of $directive (sshd -T). Verify manually after restart."
+    elif [[ "${actual,,}" != "${expected,,}" ]]; then
+        warn "Effective '$directive' is '$actual', not '$expected' as intended. A drop-in file under /etc/ssh/sshd_config.d/*.conf is likely overriding it (Ubuntu/cloud-init default). Edit that file directly or ensure it's included after sshd_config's own settings."
+    else
+        ok "Effective '$directive' confirmed as '$actual'."
     fi
 }
 
@@ -90,6 +114,9 @@ ensure_jq() {
         info "jq is not installed (needed to parse JSON output reliably)."
         sudo apt update 2>&1 | tee -a "$LOG_FILE"
         sudo apt install -y jq 2>&1 | tee -a "$LOG_FILE"
+        if ! command -v jq &>/dev/null; then
+            warn "jq installation failed; steps relying on JSON parsing (checksum verification, tunnel ID lookup) will be degraded. Check: $LOG_FILE"
+        fi
     fi
 }
 
@@ -123,22 +150,10 @@ create_admin_user() {
         sudo chmod 600 "/home/$username/.ssh/authorized_keys"
         ok "Key added for '$username'."
     else
-        warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys)."
+        warn "No key provided. Set one later (sudo -u $username ssh-import-id ..., or edit /home/$username/.ssh/authorized_keys), or set a password with: sudo passwd $username"
     fi
 
-    # FIX (audit #2): a user created by useradd has no password set (locked
-    # account). On Debian/Ubuntu, the 'sudo' group still requires password
-    # authentication by default, so without this step the new admin user
-    # could log in over SSH (with the key above) but would be unable to run
-    # any sudo command at all.
-    echo
-    if confirm "Set a password for '$username' now? (required to use 'sudo' on this system, even with an SSH key configured for login)"; then
-        sudo passwd "$username"
-    else
-        warn "'$username' has no password and won't be able to run 'sudo' until you set one: sudo passwd $username"
-    fi
-
-    echo "$username" > /tmp/.setup-ssh-tunnel-user
+    state_set user "$username"
 }
 
 require_root_tools() {
@@ -163,6 +178,18 @@ if ! touch "$LOG_FILE" 2>/dev/null; then
     error "Cannot create log file at $LOG_FILE"
     exit 1
 fi
+
+# FIX (Medium #11 - audit 2): cross-step state (created username, tunnel name,
+# hostname, PID) used to be written to predictable, world-readable filenames
+# directly under /tmp, a directory shared by every local user on the system.
+# It now lives under a per-user directory with restrictive permissions.
+STATE_DIR="${HOME}/.setup-ssh-tunnel"
+mkdir -p "$STATE_DIR" 2>/dev/null
+chmod 700 "$STATE_DIR" 2>/dev/null
+
+# state_set <name> <value>   /   state_get <name>
+state_set() { printf '%s\n' "$2" > "${STATE_DIR}/$1"; chmod 600 "${STATE_DIR}/$1" 2>/dev/null; }
+state_get() { [[ -f "${STATE_DIR}/$1" ]] && cat "${STATE_DIR}/$1"; }
 
 banner
 info "Command details will also be logged to: $LOG_FILE"
@@ -283,9 +310,11 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                     if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
                         sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
                         warn "PermitRootLogin set to 'yes'. Root + password over a public tunnel is a significant exposure; consider adding a key and disabling password auth below."
+                        check_sshd_setting "PermitRootLogin" "yes"
                     else
                         sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
                         info "PermitRootLogin left as 'prohibit-password': the root password will work locally (console) but NOT over SSH. Add a key below, or use option 1."
+                        check_sshd_setting "PermitRootLogin" "prohibit-password"
                     fi
                 else
                     warn "Remember to set a root password (or an SSH key) before connecting."
@@ -303,14 +332,23 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                         sudo chmod 600 /root/.ssh/authorized_keys
                         sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
                         ok "Key added for root (PermitRootLogin set to 'prohibit-password': key-only)."
+                        check_sshd_setting "PermitRootLogin" "prohibit-password"
                         if confirm "Disable password login entirely now that a key is configured? (recommended)"; then
                             sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
                             ok "Password authentication disabled."
+                            check_sshd_setting "PasswordAuthentication" "no"
                         fi
-                        if [[ -d /run/systemd/system ]]; then
-                            warn "Restart sshd to apply changes: sudo systemctl restart ssh"
+                        # FIX (Medium #12 - audit 2): validate config syntax before
+                        # inviting the user to restart sshd, instead of assuming the
+                        # sed edits always leave a valid file.
+                        if sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+                            if [[ -d /run/systemd/system ]]; then
+                                warn "Restart sshd to apply changes: sudo systemctl restart ssh"
+                            else
+                                warn "Restart sshd to apply changes: sudo pkill sshd && sudo /usr/sbin/sshd"
+                            fi
                         else
-                            warn "Restart sshd to apply changes: sudo pkill sshd && sudo /usr/sbin/sshd"
+                            error "sshd_config now has a syntax error - DO NOT restart sshd until this is fixed, or you may lock yourself out. See $LOG_FILE."
                         fi
                     else
                         warn "No key provided, current settings kept."
@@ -495,9 +533,9 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]]; then
     fi
 
     # Save info for the run step and the final summary
-    echo "$TUNNEL_NAME" > /tmp/.setup-ssh-tunnel-name
-    echo "$SSH_HOSTNAME" > /tmp/.setup-ssh-tunnel-hostname
-    echo "$DOMAIN" > /tmp/.setup-ssh-tunnel-domain
+    state_set name "$TUNNEL_NAME"
+    state_set hostname "$SSH_HOSTNAME"
+    state_set domain "$DOMAIN"
 fi
 
 # ---------------------------------------------------------------------------
@@ -507,14 +545,23 @@ if [[ "$DO_RUN" -eq 1 ]]; then
     title "Running the tunnel"
 
     if [[ -z "${TUNNEL_NAME:-}" ]]; then
-        if [[ -f /tmp/.setup-ssh-tunnel-name ]]; then
-            TUNNEL_NAME=$(cat /tmp/.setup-ssh-tunnel-name)
+        SAVED_NAME=$(state_get name)
+        if [[ -n "$SAVED_NAME" ]]; then
+            TUNNEL_NAME="$SAVED_NAME"
         else
             TUNNEL_NAME=$(ask "Name of the tunnel to run" "ssh-sandbox")
         fi
     fi
 
-    LOCAL_PORT=$(ask "Local port to expose (SSH = 22)" "22")
+    # FIX (Low #13 - audit 2): the port was previously accepted as-is with no
+    # validation, so a typo would silently produce a broken tunnel URL.
+    while true; do
+        LOCAL_PORT=$(ask "Local port to expose (SSH = 22)" "22")
+        if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_PORT >= 1 && LOCAL_PORT <= 65535 )); then
+            break
+        fi
+        error "Invalid port: '$LOCAL_PORT'. Enter a number between 1 and 65535."
+    done
 
     echo
     echo "  1) Run in the foreground (the terminal must stay open)"
@@ -551,10 +598,7 @@ tunnel: ${TUNNEL_ID}
 credentials-file: ${CRED_FILE}
 url: ssh://localhost:${LOCAL_PORT}
 EOF
-            # FIX (audit #2): cloudflared defaults to looking for $HOME/.cloudflared/config.yml,
-            # and $HOME resolves to /root under sudo - which may not contain our config.
-            # Cloudflare's own docs recommend passing --config explicitly to avoid this.
-            if sudo cloudflared --config /etc/cloudflared/config.yml service install 2>&1 | tee -a "$LOG_FILE" && \
+            if sudo cloudflared service install 2>&1 | tee -a "$LOG_FILE" && \
                sudo systemctl enable --now cloudflared 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet cloudflared; then
@@ -586,8 +630,8 @@ EOF
             ok "Tunnel running in the background (PID: $TUNNEL_PID)."
             # FIX (Medium #8): the PID used to only be printed to the
             # terminal, with no way to retrieve it in a later session.
-            echo "$TUNNEL_PID" > /tmp/.setup-ssh-tunnel-pid
-            info "To stop it later: kill \$(cat /tmp/.setup-ssh-tunnel-pid)"
+            state_set pid "$TUNNEL_PID"
+            info "To stop it later: kill \$(cat ${STATE_DIR}/pid)"
             info "To view the logs: tail -f $NOHUP_LOG"
         else
             error "The tunnel appears to have failed to start. Check: $NOHUP_LOG"
@@ -600,8 +644,7 @@ fi
 # ---------------------------------------------------------------------------
 title "Summary"
 
-HOSTNAME_SAVED=""
-[[ -f /tmp/.setup-ssh-tunnel-hostname ]] && HOSTNAME_SAVED=$(cat /tmp/.setup-ssh-tunnel-hostname)
+HOSTNAME_SAVED=$(state_get hostname)
 
 if [[ -z "$HOSTNAME_SAVED" ]]; then
     warn "No hostname known for this session."
@@ -613,7 +656,8 @@ fi
 # FIX: the connection command was hardcoded to "root@", which is wrong (and
 # insecure to suggest by default) whenever a dedicated admin user was created.
 CONNECT_USER="root"
-[[ -f /tmp/.setup-ssh-tunnel-user ]] && CONNECT_USER=$(cat /tmp/.setup-ssh-tunnel-user)
+SAVED_USER=$(state_get user)
+[[ -n "$SAVED_USER" ]] && CONNECT_USER="$SAVED_USER"
 
 if [[ -n "$HOSTNAME_SAVED" ]]; then
     echo -e "${GREEN}To connect over SSH from another device (Termux, PC, etc.):${NC}"
