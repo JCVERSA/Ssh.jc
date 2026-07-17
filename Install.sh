@@ -99,6 +99,21 @@ is_valid_pubkey() {
     [[ "$1" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/]+=*([[:space:]].*)?$ ]]
 }
 
+# FIX (bug - audit 9): a tunnel name is used verbatim as a directory
+# component under STATE_DIR/tunnels/<name>/ (see tunnel_state_set), with NO
+# validation before this fix. A pasted comment line, a path with slashes,
+# or pure whitespace would be silently accepted and turned into a real
+# directory - observed in testing as a literal
+# "# ---------------------------..." directory after a stray paste into the
+# tunnel-name prompt. Restricts tunnel names to a safe, predictable
+# character set: letters, digits, dot, dash, underscore - which covers
+# every legitimate name shown in this script's own defaults/examples
+# (ssh-sandbox, ssh, etc.) while rejecting anything that could misbehave as
+# a path component or be mistaken for a comment/flag.
+is_valid_tunnel_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
 # Appends a public key to an authorized_keys file, skipping it if already present.
 # FIX (High #6): the original script appended unconditionally, duplicating the
 # key on every re-run of the script.
@@ -469,6 +484,13 @@ list_active_tunnels() {
         for tdir in "${STATE_DIR}/tunnels"/*/; do
             [[ -d "$tdir" ]] || continue
             tname=$(basename "$tdir")
+            # FIX (bug - audit 9): defensive skip for directories that
+            # predate is_valid_tunnel_name (e.g. a stray "# ---..." comment
+            # accidentally pasted into a name prompt in an earlier session,
+            # observed in testing). Validation now prevents new ones from
+            # being created, but this ignores any that already exist rather
+            # than displaying them as a fake "active tunnel".
+            is_valid_tunnel_name "$tname" || continue
             pid_file="${tdir}pid"
             [[ -f "$pid_file" ]] || continue
             pid=$(cat "$pid_file" 2>/dev/null)
@@ -493,7 +515,19 @@ list_active_tunnels() {
             fi
 
             found=1
-            provider_saved=$(state_get provider)
+            # FIX (bug - audit 9): previously read the GLOBAL last-session
+            # provider (state_get provider) instead of THIS tunnel's own
+            # saved provider, silently guessing wrong whenever more than
+            # one tunnel/session existed - this is why the endpoint showed
+            # "unknown" for a tunnel that had, in fact, already detected
+            # and saved its fx_endpoint earlier. Per-tunnel provider is now
+            # saved wherever a tunnel is created/configured; fall back to
+            # the old global read only for tunnels created before this fix
+            # (so previously-configured tunnels keep working).
+            provider_saved=$(tunnel_state_get "$tname" provider)
+            if [[ -z "$provider_saved" ]]; then
+                provider_saved=$(state_get provider)
+            fi
             [[ -z "$provider_saved" ]] && provider_saved="cloudflared"
             endpoint_saved=""
             if [[ "$provider_saved" == "fxtunnel" ]]; then
@@ -919,9 +953,16 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         fi
     done
 
-    TUNNEL_NAME=$(ask "Name to identify this tunnel locally (used only for this script's own bookkeeping)" "ssh-sandbox")
+    while true; do
+        TUNNEL_NAME=$(ask "Name to identify this tunnel locally (used only for this script's own bookkeeping)" "ssh-sandbox")
+        if is_valid_tunnel_name "$TUNNEL_NAME"; then
+            break
+        fi
+        error "Invalid tunnel name: '$TUNNEL_NAME'. Use only letters, digits, dots, dashes, or underscores (no spaces, slashes, or special characters)."
+    done
 
     tunnel_state_set "$TUNNEL_NAME" name "$TUNNEL_NAME"
+    tunnel_state_set "$TUNNEL_NAME" provider "$TUNNEL_PROVIDER"
     tunnel_state_set "$TUNNEL_NAME" token "$FX_TOKEN"
     ok "Token saved for tunnel '$TUNNEL_NAME'."
     info "fxTunnel (SaaS) assigns its public host/port dynamically when the tunnel starts; there is no DNS route to configure here (unlike Cloudflare Tunnel)."
@@ -961,7 +1002,13 @@ else
         cloudflared tunnel list --output json 2>/dev/null | jq -r --arg name "$1" '.[] | select(.name == $name) | .id' | head -1
     }
 
-    TUNNEL_NAME=$(ask "Name of the tunnel to create (or existing one to reuse)" "ssh-sandbox")
+    while true; do
+        TUNNEL_NAME=$(ask "Name of the tunnel to create (or existing one to reuse)" "ssh-sandbox")
+        if is_valid_tunnel_name "$TUNNEL_NAME"; then
+            break
+        fi
+        error "Invalid tunnel name: '$TUNNEL_NAME'. Use only letters, digits, dots, dashes, or underscores (no spaces, slashes, or special characters)."
+    done
 
     EXISTING_ID=$(get_tunnel_id "$TUNNEL_NAME")
 
@@ -970,7 +1017,13 @@ else
         if confirm "Reuse it?"; then
             TUNNEL_ID="$EXISTING_ID"
         else
-            TUNNEL_NAME=$(ask "New tunnel name" "${TUNNEL_NAME}-2")
+            while true; do
+                TUNNEL_NAME=$(ask "New tunnel name" "${TUNNEL_NAME}-2")
+                if is_valid_tunnel_name "$TUNNEL_NAME"; then
+                    break
+                fi
+                error "Invalid tunnel name: '$TUNNEL_NAME'. Use only letters, digits, dots, dashes, or underscores (no spaces, slashes, or special characters)."
+            done
             cloudflared tunnel create "$TUNNEL_NAME" 2>&1 | tee -a "$LOG_FILE"
             TUNNEL_ID=$(get_tunnel_id "$TUNNEL_NAME")
         fi
@@ -984,6 +1037,7 @@ else
         error "Could not retrieve the tunnel ID. Check the log: $LOG_FILE"
         exit 1
     fi
+    tunnel_state_set "$TUNNEL_NAME" provider "$TUNNEL_PROVIDER"
     ok "Tunnel ready: $TUNNEL_NAME (ID: $TUNNEL_ID)"
 fi
 fi
@@ -1049,7 +1103,13 @@ if [[ "$DO_RUN" -eq 1 ]]; then
             info "Using the last configured tunnel: $SAVED_NAME"
             TUNNEL_NAME="$SAVED_NAME"
         else
-            TUNNEL_NAME=$(ask "Name of the tunnel to run" "ssh-sandbox")
+            while true; do
+                TUNNEL_NAME=$(ask "Name of the tunnel to run" "ssh-sandbox")
+                if is_valid_tunnel_name "$TUNNEL_NAME"; then
+                    break
+                fi
+                error "Invalid tunnel name: '$TUNNEL_NAME'. Use only letters, digits, dots, dashes, or underscores (no spaces, slashes, or special characters)."
+            done
         fi
     fi
 
