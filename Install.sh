@@ -97,6 +97,12 @@ add_key_dedup() {
 # file (e.g. 50-cloud-init.conf) can therefore silently override a value we
 # just `sed`-ed into the main file, while the script would otherwise report
 # success. `sshd -T` reports the value sshd will actually use.
+#
+# FIX (audit 5): "prohibit-password" and "without-password" are the SAME
+# effective PermitRootLogin value (OpenSSH kept the old name as an alias for
+# backward compatibility; `sshd -T` normalizes to "without-password"). A
+# literal string comparison flagged this as a drop-in override on every
+# single run, which is a false positive - not a real misconfiguration.
 check_sshd_setting() {
     local directive="$1" expected="$2" actual
     if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
@@ -104,9 +110,18 @@ check_sshd_setting() {
         return 1
     fi
     actual=$(sudo sshd -T 2>/dev/null | awk -v d="${directive,,}" 'tolower($1)==d {print $2; exit}')
+
+    # Normalize known synonymous values before comparing, so we only warn on
+    # an actual mismatch rather than an alias of the same setting.
+    local norm_actual="${actual,,}" norm_expected="${expected,,}"
+    if [[ "${directive,,}" == "permitrootlogin" ]]; then
+        [[ "$norm_actual" == "without-password" ]] && norm_actual="prohibit-password"
+        [[ "$norm_expected" == "without-password" ]] && norm_expected="prohibit-password"
+    fi
+
     if [[ -z "$actual" ]]; then
         warn "Could not determine the effective value of $directive (sshd -T). Verify manually after restart."
-    elif [[ "${actual,,}" != "${expected,,}" ]]; then
+    elif [[ "$norm_actual" != "$norm_expected" ]]; then
         warn "Effective '$directive' is '$actual', not '$expected' as intended. A drop-in file under /etc/ssh/sshd_config.d/*.conf is likely overriding it (Ubuntu/cloud-init default). Edit that file directly or ensure it's included after sshd_config's own settings."
     else
         ok "Effective '$directive' confirmed as '$actual'."
@@ -314,6 +329,34 @@ tunnel_state_get() {
     [[ -f "$path" ]] && cat "$path"
 }
 last_tunnel_used() { state_get "last_tunnel"; }
+
+# FIX (audit 5): parses the fxTunnel client's own stdout/log for the line it
+# prints on successful connection, e.g. "TCP: fxtun.dev:10023" or
+# "TCP: some-other-host.example:44821". The host is NOT assumed to always be
+# fxtun.dev - fxTunnel's backend can hand out a different relay host - so
+# this is parsed dynamically from whatever the client actually printed
+# rather than hardcoded. Retries briefly since the line only appears a
+# second or two after the process starts.
+# Prints "host:port" on stdout and returns 0 on success, or returns 1 if the
+# line never appeared within the timeout.
+parse_fxtunnel_endpoint() {
+    local log_path="$1" tries="${2:-10}" delay="${3:-1}" line i
+    for (( i=0; i<tries; i++ )); do
+        # Matches "TCP: <host>:<port>" (host can be a hostname or IP; port is
+        # digits only). -m1 stops at the first match found in the file.
+        line=$(grep -m1 -oE 'TCP:[[:space:]]+[A-Za-z0-9.-]+:[0-9]+' "$log_path" 2>/dev/null)
+        if [[ -n "$line" ]]; then
+            # Strip the "TCP:" prefix and surrounding whitespace, leaving
+            # "host:port".
+            line="${line#TCP:}"
+            line="${line# }"
+            printf '%s\n' "$line"
+            return 0
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
 
 banner
 info "Command details will also be logged to: $LOG_FILE"
@@ -554,7 +597,16 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
     fi
 
     if command -v fxtunnel &>/dev/null; then
-        ok "fxTunnel installed: $(fxtunnel --version 2>&1 | head -1)"
+        # FIX (audit 5): newer fxtunnel builds reject "--version" ("unknown
+        # flag") - the confirmation line used to print that error text
+        # instead of an actual version. Try "fxtunnel version" (no dashes,
+        # the current subcommand) first and fall back to the old flag for
+        # older installs, so this still degrades gracefully either way.
+        FX_VER=$(fxtunnel version 2>&1 | head -1)
+        if [[ -z "$FX_VER" || "$FX_VER" == *"unknown"* || "$FX_VER" == *"Error"* ]]; then
+            FX_VER=$(fxtunnel --version 2>&1 | head -1)
+        fi
+        ok "fxTunnel installed: $FX_VER"
     else
         error "fxtunnel does not appear to be installed correctly (not found in PATH)."
         warn "If install.sh placed it under ~/.local/bin, open a new shell or run: export PATH=\$PATH:\$HOME/.local/bin"
@@ -944,6 +996,14 @@ EOF
                     ok "fxTunnel installed and running as a systemd service ($UNIT_NAME)."
                     info "Manage it with: sudo systemctl {status|restart|stop} $UNIT_NAME"
                     info "Logs: sudo journalctl -u $UNIT_NAME -f"
+                    # FIX (audit 5): systemd mode also parses the endpoint,
+                    # same as background mode, so the final summary can show
+                    # a ready-to-use ssh command instead of just "check
+                    # journalctl".
+                    FX_ENDPOINT=$(parse_fxtunnel_endpoint <(sudo journalctl -u "$UNIT_NAME" --no-pager -n 50) 5 1 || true)
+                    if [[ -n "$FX_ENDPOINT" ]]; then
+                        tunnel_state_set "$TUNNEL_NAME" fx_endpoint "$FX_ENDPOINT"
+                    fi
                 else
                     error "The $UNIT_NAME service does not look active. Check: sudo journalctl -u $UNIT_NAME -e"
                 fi
@@ -978,7 +1038,19 @@ EOF
             info "To stop it later: kill \$(cat \"${STATE_DIR}/tunnels/${TUNNEL_NAME}/pid\")"
             info "To view the logs: tail -f $NOHUP_LOG"
             if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
-                info "fxTunnel prints the assigned public host:port to this log on startup - check it to get your connection details."
+                # FIX (audit 5): previously this only told the user to go
+                # check the log manually. Now the script itself waits for
+                # and parses the "TCP: host:port" line fxTunnel prints on
+                # startup, so the final summary can show a ready-to-use ssh
+                # command - the same experience as the Cloudflare path.
+                info "Waiting for fxTunnel to report its assigned public endpoint..."
+                FX_ENDPOINT=$(parse_fxtunnel_endpoint "$NOHUP_LOG" 10 1 || true)
+                if [[ -n "$FX_ENDPOINT" ]]; then
+                    tunnel_state_set "$TUNNEL_NAME" fx_endpoint "$FX_ENDPOINT"
+                    ok "fxTunnel endpoint detected: $FX_ENDPOINT"
+                else
+                    warn "Could not detect the endpoint automatically within the timeout. Check the log manually: tail -f $NOHUP_LOG"
+                fi
             fi
         else
             error "The tunnel appears to have failed to start. Check: $NOHUP_LOG"
@@ -1009,15 +1081,44 @@ elif [[ "${ACCESS_MODE:-}" != "2" ]]; then
 fi
 
 if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
-    echo -e "${GREEN}fxTunnel (SaaS) does not assign a fixed hostname.${NC}"
-    echo "The public host and port are printed by the fxtunnel client itself when the"
-    echo "tunnel starts - check the foreground output, the background log shown above,"
-    echo "or 'sudo journalctl -u fxtunnel-<name> -f' if installed as a systemd service."
-    echo
-    echo "Once you have that host:port, connect with:"
-    echo -e "     ${BOLD}ssh -p <port> ${CONNECT_USER}@<host>${NC}"
-    echo
-    warn "Reminder: this port is reachable by anyone on the internet who knows it."
+    # FIX (audit 5): if the background/systemd run step above managed to
+    # parse the "TCP: host:port" line fxTunnel prints on startup, show the
+    # ready-to-use ssh command directly - matching the Cloudflare summary's
+    # behavior - instead of always telling the user to go check a log by
+    # hand. Falls back to the old generic instructions if parsing failed or
+    # this is a fresh "run only" invocation with no state saved yet.
+    FX_ENDPOINT_SAVED=""
+    if [[ -n "${TUNNEL_NAME:-}" ]]; then
+        FX_ENDPOINT_SAVED=$(tunnel_state_get "$TUNNEL_NAME" fx_endpoint)
+    fi
+    if [[ -z "$FX_ENDPOINT_SAVED" ]]; then
+        SAVED_NAME_FOR_SUMMARY=$(last_tunnel_used)
+        [[ -n "$SAVED_NAME_FOR_SUMMARY" ]] && FX_ENDPOINT_SAVED=$(tunnel_state_get "$SAVED_NAME_FOR_SUMMARY" fx_endpoint)
+    fi
+
+    if [[ -n "$FX_ENDPOINT_SAVED" ]]; then
+        FX_HOST_SAVED="${FX_ENDPOINT_SAVED%:*}"
+        FX_PORT_SAVED="${FX_ENDPOINT_SAVED##*:}"
+        echo -e "${GREEN}fxTunnel is up. Detected public endpoint: ${BOLD}${FX_ENDPOINT_SAVED}${NC}"
+        echo
+        echo "Connect over SSH from another device with:"
+        echo -e "     ${BOLD}ssh -p ${FX_PORT_SAVED} ${CONNECT_USER}@${FX_HOST_SAVED}${NC}"
+        echo
+        echo "For file transfer (SFTP), same host/port, same key:"
+        echo -e "     ${BOLD}sftp -P ${FX_PORT_SAVED} ${CONNECT_USER}@${FX_HOST_SAVED}${NC}"
+        echo
+        warn "Reminder: this host:port is reachable by anyone on the internet who knows it. fxTunnel may assign a different port on a future restart - re-run this script (menu option 5) or check the log to confirm the current one."
+    else
+        echo -e "${GREEN}fxTunnel (SaaS) does not assign a fixed hostname.${NC}"
+        echo "The public host and port are printed by the fxtunnel client itself when the"
+        echo "tunnel starts - check the foreground output, the background log shown above,"
+        echo "or 'sudo journalctl -u fxtunnel-<name> -f' if installed as a systemd service."
+        echo
+        echo "Once you have that host:port, connect with:"
+        echo -e "     ${BOLD}ssh -p <port> ${CONNECT_USER}@<host>${NC}"
+        echo
+        warn "Reminder: this port is reachable by anyone on the internet who knows it."
+    fi
 else
     HOSTNAME_SAVED=""
     if [[ -n "${TUNNEL_NAME:-}" ]]; then
