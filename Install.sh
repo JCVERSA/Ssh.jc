@@ -31,11 +31,42 @@ error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 title()   { echo -e "\n${BOLD}== $1 ==${NC}\n"; }
 
 banner() {
+    # FIX (feature - audit 8): the previous banner used a fixed-width box
+    # (49 chars). On a narrow terminal (e.g. Termux in portrait mode, or
+    # any terminal under ~50 columns) the box borders wrap unpredictably
+    # and the whole thing becomes unreadable. This version measures the
+    # actual terminal width via `tput cols` and picks one of three
+    # renderings: a full bordered box (wide terminals), a slim
+    # borderless version (medium), or a single centered line (narrow /
+    # unknown width - e.g. `tput` unavailable in some minimal containers).
+    local cols title_line="SSH TUNNEL BY JCVERSA"
+    cols=$(tput cols 2>/dev/null)
+    # Not a positive integer (tput failed, non-interactive, etc.) -> treat
+    # as narrow so we always fall back to the safest rendering.
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=0
+
     echo -e "${CYAN}${BOLD}"
-    echo "  ┌─────────────────────────────────────────────┐"
-    echo "  │   SSH + Cloudflare Tunnel Setup              │"
-    echo "  │   for Jcversa                                │"
-    echo "  └─────────────────────────────────────────────┘"
+    if (( cols >= 60 )); then
+        # Wide: full box, sized to the title with consistent side padding.
+        # Built as an explicit loop rather than `printf '%*s'` + `tr`: that
+        # combination doesn't reliably repeat a multi-byte UTF-8 character
+        # (border ends up empty, corners only) - explicit repetition is
+        # slower but correct in every locale/printf implementation.
+        local inner=$(( ${#title_line} + 4 ))
+        local border="" i
+        for (( i=0; i<inner; i++ )); do border+="─"; done
+        echo "  ┌${border}┐"
+        printf '  │  %s  │\n' "$title_line"
+        echo "  └${border}┘"
+    elif (( cols >= 40 )); then
+        # Medium: no box (borders would eat too much of the width budget),
+        # just the title flanked by simple markers, still centered-ish.
+        echo "  == ${title_line} =="
+    else
+        # Narrow / unknown: bare title only, guaranteed to never wrap
+        # awkwardly regardless of terminal width.
+        echo "$title_line"
+    fi
     echo -e "${NC}"
 }
 
@@ -358,8 +389,153 @@ parse_fxtunnel_endpoint() {
     return 1
 }
 
+# FIX (feature - audit 7): lists every tunnel that is ACTUALLY active right
+# now, checked live rather than trusting stale saved state. Three possible
+# sources of an active tunnel, all scanned:
+#   1. A systemd "cloudflared" service (menu 1/4 + run mode 3, Cloudflare).
+#   2. Any systemd "fxtunnel-<name>" service (menu 1/4 + run mode 3, fxTunnel).
+#      There can be more than one, since each has its own unit name.
+#   3. A nohup'd background process, whose PID was saved under
+#      STATE_DIR/tunnels/<name>/pid. Verified live with `kill -0` - a PID
+#      file surviving a reboot (stale, pointing at nothing or a recycled
+#      PID) would otherwise silently be reported as "active", which is
+#      worse than not having this feature at all.
+# Prints a human-readable block per active tunnel: provider, status,
+# endpoint (hostname for Cloudflare, host:port for fxTunnel if known),
+# local port exposed, and uptime. Prints a clear "nothing active" message
+# if no source yields a running tunnel.
+list_active_tunnels() {
+    local found=0
+
+    # --- Source 1: cloudflared as a systemd service --------------------
+    if [[ -d /run/systemd/system ]] && systemctl list-unit-files 'cloudflared.service' &>/dev/null; then
+        if systemctl is-active --quiet cloudflared 2>/dev/null; then
+            found=1
+            local since port_line local_port hostname_saved tunnel_name_saved
+            since=$(systemctl show cloudflared -p ActiveEnterTimestamp --value 2>/dev/null)
+            local_port=""
+            if [[ -f /etc/cloudflared/config.yml ]]; then
+                # url: ssh://localhost:<port>
+                local_port=$(sudo grep -oE 'localhost:[0-9]+' /etc/cloudflared/config.yml 2>/dev/null | head -1 | cut -d: -f2)
+            fi
+            # Best-effort: find which of our saved tunnel names has no
+            # fx_endpoint (i.e. is a Cloudflare tunnel) and a hostname, to
+            # show the connect-ready endpoint alongside the service status.
+            tunnel_name_saved=$(last_tunnel_used)
+            hostname_saved=""
+            [[ -n "$tunnel_name_saved" ]] && hostname_saved=$(tunnel_state_get "$tunnel_name_saved" hostname)
+
+            echo -e "${GREEN}●${NC} ${BOLD}cloudflared${NC} (systemd service)"
+            echo "    Provider : Cloudflare Tunnel"
+            echo "    Status   : active (running)"
+            [[ -n "$hostname_saved" ]] && echo "    Endpoint : $hostname_saved"
+            [[ -n "$local_port" ]] && echo "    Local port : $local_port"
+            [[ -n "$since" ]] && echo "    Active since : $since"
+            echo
+        fi
+    fi
+
+    # --- Source 2: fxtunnel-<name> systemd services ---------------------
+    if [[ -d /run/systemd/system ]]; then
+        local unit unit_name tname since local_port fx_endpoint
+        while IFS= read -r unit; do
+            [[ -z "$unit" ]] && continue
+            unit_name="${unit%.service}"
+            tname="${unit_name#fxtunnel-}"
+            if systemctl is-active --quiet "$unit_name" 2>/dev/null; then
+                found=1
+                since=$(systemctl show "$unit_name" -p ActiveEnterTimestamp --value 2>/dev/null)
+                local_port=$(systemctl show "$unit_name" -p ExecStart --value 2>/dev/null | grep -oE 'tcp [0-9]+' | awk '{print $2}')
+                fx_endpoint=$(tunnel_state_get "$tname" fx_endpoint)
+
+                echo -e "${GREEN}●${NC} ${BOLD}${unit_name}${NC} (systemd service)"
+                echo "    Provider : fxTunnel"
+                echo "    Status   : active (running)"
+                if [[ -n "$fx_endpoint" ]]; then
+                    echo "    Endpoint : $fx_endpoint"
+                else
+                    echo "    Endpoint : unknown (check: sudo journalctl -u $unit_name -n 50)"
+                fi
+                [[ -n "$local_port" ]] && echo "    Local port : $local_port"
+                [[ -n "$since" ]] && echo "    Active since : $since"
+                echo
+            fi
+        done < <(systemctl list-unit-files 'fxtunnel-*.service' --no-legend 2>/dev/null | awk '{print $1}')
+    fi
+
+    # --- Source 3: nohup'd background processes -------------------------
+    if [[ -d "${STATE_DIR}/tunnels" ]]; then
+        local tdir tname pid_file pid provider_saved local_port_saved endpoint_saved
+        for tdir in "${STATE_DIR}/tunnels"/*/; do
+            [[ -d "$tdir" ]] || continue
+            tname=$(basename "$tdir")
+            pid_file="${tdir}pid"
+            [[ -f "$pid_file" ]] || continue
+            pid=$(cat "$pid_file" 2>/dev/null)
+            [[ -z "$pid" ]] && continue
+
+            # Live check: a saved PID that no longer corresponds to a
+            # running process (reboot, manual kill, crash) is NOT reported
+            # as active. This is the whole point of doing this live rather
+            # than trusting the saved file.
+            if ! kill -0 "$pid" 2>/dev/null; then
+                continue
+            fi
+
+            # A systemd-managed instance for this same tunnel name would
+            # already have been reported by Source 1/2 above; avoid a
+            # duplicate listing if both a nohup PID file and a systemd unit
+            # somehow exist for the same name (e.g. user ran nohup mode,
+            # then later re-ran and chose systemd mode without the old
+            # nohup process ever being stopped).
+            if [[ -d /run/systemd/system ]] && systemctl is-active --quiet "fxtunnel-${tname}" 2>/dev/null; then
+                continue
+            fi
+
+            found=1
+            provider_saved=$(state_get provider)
+            [[ -z "$provider_saved" ]] && provider_saved="cloudflared"
+            endpoint_saved=""
+            if [[ "$provider_saved" == "fxtunnel" ]]; then
+                endpoint_saved=$(tunnel_state_get "$tname" fx_endpoint)
+            else
+                endpoint_saved=$(tunnel_state_get "$tname" hostname)
+            fi
+            local_port_saved=""
+            # Local port isn't saved directly, but process args carry it;
+            # best-effort read from /proc if available (Linux-only, which
+            # matches this script's Ubuntu/Debian-only scope).
+            if [[ -r "/proc/$pid/cmdline" ]]; then
+                local_port_saved=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -oE '(tcp|ssh://localhost:)[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+            fi
+            local etime=""
+            if command -v ps &>/dev/null; then
+                etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+            fi
+
+            echo -e "${GREEN}●${NC} ${BOLD}${tname}${NC} (background / nohup, PID: $pid)"
+            echo "    Provider : $([[ "$provider_saved" == "fxtunnel" ]] && echo "fxTunnel" || echo "Cloudflare Tunnel")"
+            echo "    Status   : active (running)"
+            if [[ -n "$endpoint_saved" ]]; then
+                echo "    Endpoint : $endpoint_saved"
+            else
+                echo "    Endpoint : unknown (check the saved log for this tunnel)"
+            fi
+            [[ -n "$local_port_saved" ]] && echo "    Local port : $local_port_saved"
+            [[ -n "$etime" ]] && echo "    Active for : $etime"
+            echo
+        done
+    fi
+
+    if [[ "$found" -eq 0 ]]; then
+        info "No active tunnel found (checked systemd services and background processes)."
+        info "Run this script and choose option 1, 4, or 5 to start one."
+    fi
+}
+
 banner
 info "Command details will also be logged to: $LOG_FILE"
+
 
 # ---------------------------------------------------------------------------
 # Step 0: Pre-flight checks
@@ -390,10 +566,11 @@ echo "  2) Install OpenSSH server only"
 echo "  3) Install cloudflared only (no tunnel configuration)"
 echo "  4) Create / configure a Cloudflare tunnel (cloudflared already installed)"
 echo "  5) Run an already configured tunnel"
-echo "  6) Quit"
+echo "  6) Show active tunnels (Cloudflare / fxTunnel)"
+echo "  7) Quit"
 echo
 
-MODE=$(ask "Choice (1-6)" "1")
+MODE=$(ask "Choice (1-7)" "1")
 
 case "$MODE" in
     1) DO_SSH=1; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=1 ;;
@@ -401,7 +578,8 @@ case "$MODE" in
     3) DO_SSH=0; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0 ;;
     4) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=0 ;;
     5) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=1 ;;
-    6) info "See you next time."; exit 0 ;;
+    6) title "Active tunnels"; list_active_tunnels; exit 0 ;;
+    7) info "See you next time."; exit 0 ;;
     *) error "Invalid choice."; exit 1 ;;
 esac
 
@@ -579,7 +757,15 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         # release asset, so it has no published checksum; require explicit
         # confirmation before running it as-is, consistent with how an
         # unverified cloudflared package is handled above.
-        warn "No published checksum is available for the install.sh script itself (only release binaries have checksums.txt); it will run with your current shell privileges."
+        # FIX (audit 6 - High #1): the previous wording described this only
+        # as an integrity/corruption risk ("no checksum available"), which
+        # understates it. Unlike the cloudflared .deb path below (verified
+        # against a published SHA-256 digest before install), this script is
+        # executed with NO verification at all: a compromised fxtun.dev, a
+        # DNS hijack, or a MITM'd response would run arbitrary code as the
+        # current user, with sudo available in this session. Made that
+        # explicit so the confirmation prompt is an informed one.
+        warn "SECURITY: this installer has NO checksum or signature to verify against (unlike cloudflared below). If fxtun.dev were compromised or the download tampered with, this would run ARBITRARY CODE as your current user, with sudo available in this session. This is a real trust boundary, not just a corruption risk."
         if ! confirm "Review $FX_INSTALLER_TMP now if you want, then proceed with running it?"; then
             error "Installation aborted by user (unverified installer script)."
             rm -f "$FX_INSTALLER_TMP"
@@ -972,7 +1158,19 @@ EOF
             RUN_MODE=2
         else
             info "Writing /etc/systemd/system/${UNIT_NAME}.service ..."
-            sudo tee "/etc/systemd/system/${UNIT_NAME}.service" > /dev/null <<EOF
+            # FIX (audit 6 - Medium #1): `sudo tee` creates the file with
+            # the process's default umask (typically world-readable, 644)
+            # and the file only becomes 600 on the *next* line, after
+            # `tee` has already returned. On a multi-user box, a local
+            # unprivileged user polling this path has a narrow window to
+            # read the token from Environment= before the chmod lands.
+            # Fixed by writing to a private-permission temp file first
+            # (created via mktemp, 600 by default) and moving it into
+            # place with `install`, so the token-bearing content is never
+            # exposed at the final path with loose permissions.
+            FX_UNIT_TMP=$(mktemp)
+            chmod 600 "$FX_UNIT_TMP"
+            cat > "$FX_UNIT_TMP" <<EOF
 [Unit]
 Description=fxTunnel (${TUNNEL_NAME}) - TCP tunnel for local port ${LOCAL_PORT}
 After=network-online.target
@@ -988,7 +1186,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-            sudo chmod 600 "/etc/systemd/system/${UNIT_NAME}.service"
+            sudo install -m 600 -o root -g root "$FX_UNIT_TMP" "/etc/systemd/system/${UNIT_NAME}.service"
+            rm -f "$FX_UNIT_TMP"
             if sudo systemctl daemon-reload 2>&1 | tee -a "$LOG_FILE" && \
                sudo systemctl enable --now "$UNIT_NAME" 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
@@ -1000,7 +1199,29 @@ EOF
                     # same as background mode, so the final summary can show
                     # a ready-to-use ssh command instead of just "check
                     # journalctl".
-                    FX_ENDPOINT=$(parse_fxtunnel_endpoint <(sudo journalctl -u "$UNIT_NAME" --no-pager -n 50) 5 1 || true)
+                    #
+                    # FIX (audit 6 - Medium #2): the original call passed a
+                    # process substitution (<(...)) as the "file" to parse.
+                    # A process substitution is a one-shot stream, not a
+                    # seekable file - once parse_fxtunnel_endpoint's first
+                    # grep call inside its retry loop consumed it, every
+                    # subsequent retry iteration read from an
+                    # already-drained/closed FD. In practice only the first
+                    # of the 5 retries could ever succeed, silently
+                    # defeating the retry logic (journalctl output can lag
+                    # briefly behind the service actually printing the
+                    # line). Fixed by re-running journalctl into a real,
+                    # re-readable temp file on each parse attempt via a
+                    # small wrapper loop, so every retry sees fresh output.
+                    FX_JOURNAL_TMP=$(mktemp "/tmp/fxtunnel-journal-XXXXXX.log")
+                    FX_ENDPOINT=""
+                    for _fx_try in 1 2 3 4 5; do
+                        sudo journalctl -u "$UNIT_NAME" --no-pager -n 50 > "$FX_JOURNAL_TMP" 2>/dev/null
+                        FX_ENDPOINT=$(parse_fxtunnel_endpoint "$FX_JOURNAL_TMP" 1 0 || true)
+                        [[ -n "$FX_ENDPOINT" ]] && break
+                        sleep 1
+                    done
+                    rm -f "$FX_JOURNAL_TMP"
                     if [[ -n "$FX_ENDPOINT" ]]; then
                         tunnel_state_set "$TUNNEL_NAME" fx_endpoint "$FX_ENDPOINT"
                     fi
