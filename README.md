@@ -21,7 +21,7 @@ Bash installers for remote access and temporary file sharing on Linux
 ## Usage
 
 ```bash
-./Install.sh                  # menu: full setup / SSH only / tunnel only / run
+./Install.sh                  # interactive menu; ./Install.sh --help for details
 ./fxtunnel-installer.sh       # asks for token, subdomain, UDP port
 ./share-file-v2.sh /path/to/folder
 ```

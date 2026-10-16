@@ -348,6 +348,34 @@ require_root_tools() {
 # world-writable /tmp is a symlink/TOCTOU risk (a local attacker could
 # pre-create the path before this script runs). mktemp allocates the file
 # atomically with a unique name and 0600 permissions.
+# --help: print usage and exit before creating any log/state.
+usage() {
+    cat <<'USAGE'
+setup-ssh-tunnel.sh — OpenSSH server + Cloudflare Tunnel / fxTunnel (SSH access via a domain)
+
+Usage:
+  ./Install.sh           Interactive menu (recommended)
+  ./Install.sh --help    This text
+
+Menu:
+  1) Full setup (SSH + tunnel client + tunnel + DNS route + run)
+  2) Install OpenSSH server only
+  3) Install the tunnel client only (cloudflared or fxTunnel)
+  4) Create / configure a tunnel
+  5) Run an already configured tunnel (pick from saved tunnels)
+  6) Manage tunnels (status / logs / stop / restart)
+  7) Quit
+
+State and saved tunnels live in ~/.setup-ssh-tunnel/ (permissions 700/600).
+Before the first change in a run, /etc/ssh/sshd_config is backed up to
+/etc/ssh/sshd_config.bak-<timestamp>.
+USAGE
+}
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
 LOG_FILE=$(mktemp "/tmp/setup-ssh-tunnel-$(date +%Y%m%d-%H%M%S)-XXXXXX.log" 2>/dev/null)
 if [[ -z "$LOG_FILE" ]] || ! touch "$LOG_FILE" 2>/dev/null; then
     error "Cannot create log file under /tmp."
@@ -389,6 +417,162 @@ tunnel_state_get() {
 }
 last_tunnel_used() { state_get "last_tunnel"; }
 
+# Lists tunnels saved under STATE_DIR/tunnels (one name per line).
+list_saved_tunnels() {
+    local d
+    [[ -d "${STATE_DIR}/tunnels" ]] || return 0
+    for d in "${STATE_DIR}/tunnels"/*/; do
+        [[ -d "$d" ]] || continue
+        basename "$d"
+    done
+}
+
+# Echoes the chosen saved tunnel name; prompts/lists go to stderr so the
+# result stays clean in $(...). Enter selects the last used tunnel.
+choose_saved_tunnel() {
+    local -a tunnels=()
+    mapfile -t tunnels < <(list_saved_tunnels)
+    ((${#tunnels[@]} > 0)) || return 1
+    if ((${#tunnels[@]} == 1)); then
+        printf '%s\n' "${tunnels[0]}"
+        return 0
+    fi
+    local i choice last
+    last=$(last_tunnel_used)
+    {
+        echo "Saved tunnels:"
+        for i in "${!tunnels[@]}"; do
+            printf '  %d) %s\n' "$((i + 1))" "${tunnels[$i]}"
+        done
+    } >&2
+    while true; do
+        choice=$(ask "Tunnel number (Enter = last used: ${last:-none})" "")
+        if [[ -z "$choice" && -n "$last" ]]; then
+            printf '%s\n' "$last"
+            return 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#tunnels[@]})); then
+            printf '%s\n' "${tunnels[$((10#$choice - 1))]}"
+            return 0
+        fi
+        error "Invalid selection: '$choice'." >&2
+    done
+}
+
+# Prints the runtime status of a saved tunnel.
+tunnel_runtime_status() {
+    local name="$1" svc pid
+    svc=$(tunnel_state_get "$name" service)
+    if [[ -n "$svc" ]] && command -v systemctl &>/dev/null && systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "running (systemd: $svc)"
+        return
+    fi
+    pid=$(tunnel_state_get "$name" pid)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "running (background, PID $pid)"
+        return
+    fi
+    echo "not running"
+}
+
+# Menu 6: inspect a saved tunnel, view logs, stop or restart it.
+manage_tunnels() {
+    title "Manage tunnels"
+
+    local -a tunnels=()
+    mapfile -t tunnels < <(list_saved_tunnels)
+    if ((${#tunnels[@]} == 0)); then
+        warn "No saved tunnels found under ${STATE_DIR}/tunnels."
+        return 0
+    fi
+
+    local name
+    name=$(choose_saved_tunnel) || return 0
+    if ! is_valid_tunnel_name "$name"; then
+        error "Invalid saved tunnel name: '$name'."
+        return 1
+    fi
+
+    local token host svc pid port log
+    token=$(tunnel_state_get "$name" token)
+    host=$(tunnel_state_get "$name" hostname)
+    svc=$(tunnel_state_get "$name" service)
+    pid=$(tunnel_state_get "$name" pid)
+    port=$(tunnel_state_get "$name" port)
+    log=$(tunnel_state_get "$name" log)
+
+    echo
+    echo "  Tunnel  : $name"
+    if [[ -n "$token" ]]; then
+        echo "  Provider: fxtunnel"
+    else
+        echo "  Provider: cloudflared"
+    fi
+    [[ -n "$host" ]] && echo "  Hostname: $host"
+    [[ -n "$port" ]] && echo "  Port    : $port"
+    echo "  Status  : $(tunnel_runtime_status "$name")"
+    echo
+    echo "  1) View logs"
+    echo "  2) Stop tunnel"
+    echo "  3) Restart tunnel"
+    echo "  4) Back"
+    local action
+    action=$(ask "Action (1-4)" "4")
+
+    case "$action" in
+        1)
+            if [[ -n "$log" && -f "$log" ]]; then
+                tail -n 50 -- "$log"
+            elif [[ -n "$svc" ]] && command -v systemctl &>/dev/null; then
+                sudo journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || warn "No journal entries found for $svc."
+            else
+                warn "No log file recorded for '$name'."
+            fi
+            ;;
+        2)
+            if confirm "Stop tunnel '$name'?"; then
+                if [[ -n "$svc" ]] && command -v systemctl &>/dev/null && systemctl is-active --quiet "$svc" 2>/dev/null; then
+                    sudo systemctl stop "$svc" 2>&1 | tee -a "$LOG_FILE" && ok "Service $svc stopped."
+                fi
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    kill "$pid" 2>/dev/null && ok "Background tunnel (PID $pid) stopped."
+                    rm -f -- "${STATE_DIR}/tunnels/$name/pid"
+                fi
+                info "Status now: $(tunnel_runtime_status "$name")"
+            fi
+            ;;
+        3)
+            if [[ -n "$svc" ]] && command -v systemctl &>/dev/null; then
+                sudo systemctl restart "$svc" 2>&1 | tee -a "$LOG_FILE" && ok "Service $svc restarted."
+            elif [[ -n "$port" ]]; then
+                [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+                sleep 1
+                local new_log
+                new_log=$(mktemp "/tmp/tunnel-${name}-XXXXXX.log")
+                if [[ -n "$token" ]]; then
+                    ensure_fxtunnel_path || true
+                    FXTUNNEL_TOKEN="$token" nohup fxtunnel tcp "$port" > "$new_log" 2>&1 &
+                else
+                    nohup cloudflared tunnel run --url "ssh://localhost:${port}" "$name" > "$new_log" 2>&1 &
+                fi
+                local new_pid=$!
+                sleep 2
+                if kill -0 "$new_pid" 2>/dev/null; then
+                    tunnel_state_set "$name" pid "$new_pid"
+                    tunnel_state_set "$name" log "$new_log"
+                    ok "Tunnel '$name' restarted in the background (PID $new_pid). Logs: $new_log"
+                else
+                    error "Tunnel '$name' failed to restart. Check: $new_log"
+                fi
+            else
+                warn "Cannot restart '$name' automatically (no systemd service or saved port). Use menu option 5 instead."
+            fi
+            ;;
+        *)
+            ;;
+    esac
+}
+
 banner
 info "Command details will also be logged to: $LOG_FILE"
 
@@ -421,18 +605,20 @@ echo "  2) Install OpenSSH server only"
 echo "  3) Install cloudflared only (no tunnel configuration)"
 echo "  4) Create / configure a Cloudflare tunnel (cloudflared already installed)"
 echo "  5) Run an already configured tunnel"
-echo "  6) Quit"
+echo "  6) Manage tunnels (status / logs / stop / restart)"
+echo "  7) Quit"
 echo
 
-MODE=$(ask "Choice (1-6)" "1")
+MODE=$(ask "Choice (1-7)" "1")
 
 case "$MODE" in
-    1) DO_SSH=1; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=1 ;;
-    2) DO_SSH=1; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0 ;;
-    3) DO_SSH=0; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0 ;;
-    4) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=0 ;;
-    5) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=1 ;;
-    6) info "See you next time."; exit 0 ;;
+    1) DO_SSH=1; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=1; DO_MANAGE=0 ;;
+    2) DO_SSH=1; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0 ;;
+    3) DO_SSH=0; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0 ;;
+    4) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=0; DO_MANAGE=0 ;;
+    5) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=1; DO_MANAGE=0 ;;
+    6) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=1 ;;
+    7) info "See you next time."; exit 0 ;;
     *) error "Invalid choice."; exit 1 ;;
 esac
 
@@ -885,10 +1071,8 @@ if [[ "$DO_RUN" -eq 1 ]]; then
     title "Running the tunnel"
 
     if [[ -z "${TUNNEL_NAME:-}" ]]; then
-        SAVED_NAME=$(last_tunnel_used)
-        if [[ -n "$SAVED_NAME" ]]; then
-            info "Using the last configured tunnel: $SAVED_NAME"
-            TUNNEL_NAME="$SAVED_NAME"
+        if TUNNEL_NAME=$(choose_saved_tunnel); then
+            info "Selected tunnel: $TUNNEL_NAME"
         else
             TUNNEL_NAME=$(ask_tunnel_name "Name of the tunnel to run" "ssh-sandbox")
         fi
@@ -985,6 +1169,7 @@ EOF
                sudo systemctl enable --now cloudflared 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet cloudflared; then
+                    tunnel_state_set "$TUNNEL_NAME" service "cloudflared"
                     ok "cloudflared installed and running as a systemd service."
                     info "Manage it with: sudo systemctl {status|restart|stop} cloudflared"
                     info "Logs: sudo journalctl -u cloudflared -f"
@@ -1032,6 +1217,7 @@ EOF
                sudo systemctl enable --now "$UNIT_NAME" 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet "$UNIT_NAME"; then
+                    tunnel_state_set "$TUNNEL_NAME" service "$UNIT_NAME"
                     ok "fxTunnel installed and running as a systemd service ($UNIT_NAME)."
                     info "Manage it with: sudo systemctl {status|restart|stop} $UNIT_NAME"
                     info "Logs: sudo journalctl -u $UNIT_NAME -f"
@@ -1071,6 +1257,7 @@ EOF
             # terminal, with no way to retrieve it in a later session.
             tunnel_state_set "$TUNNEL_NAME" pid "$TUNNEL_PID"
             tunnel_state_set "$TUNNEL_NAME" log "$NOHUP_LOG"
+            tunnel_state_set "$TUNNEL_NAME" port "$LOCAL_PORT"
             info "To stop it later: kill \$(cat \"${STATE_DIR}/tunnels/${TUNNEL_NAME}/pid\")"
             info "To view the logs: tail -f $NOHUP_LOG"
             if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
@@ -1080,6 +1267,14 @@ EOF
             error "The tunnel appears to have failed to start. Check: $NOHUP_LOG"
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# Step 7: Manage saved tunnels (terminal action - no summary afterwards)
+# ---------------------------------------------------------------------------
+if [[ "$DO_MANAGE" -eq 1 ]]; then
+    manage_tunnels
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------

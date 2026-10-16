@@ -460,3 +460,14 @@ validators, sshd_config backup, env-token passing, and the ZIP symlink case
 all PASS. Live runtime (real Cloudflare/fxTunnel execution as root) NOT RUN.
 
 STATUS: IMPLEMENTED — NOT FULLY VERIFIED (live runtime remains UNVERIFIED)
+
+## Addendum II — Install.sh improvements (post-audit, user-requested)
+
+- New menu 6) Manage tunnels: per-tunnel status (systemd service or
+  background PID), log tail, stop, and restart — using the per-tunnel
+  state saved under ~/.setup-ssh-tunnel/tunnels/<name>/. Run/start flows
+  now also record the service name and local port to make this possible.
+- Menu 5 now picks from saved tunnels (numbered, Enter = last used)
+  instead of relying on the last-used name alone.
+- `./Install.sh --help` / `-h` prints usage and exits before any side
+  effect (no log or state created).
