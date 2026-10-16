@@ -174,7 +174,8 @@ cmd_setup() {
   fi
 
   hdr "Mot de passe de la console"
-  if [ -n "$(env_value GUI_PASSWORD_HASH)" ] || [ -n "$(env_value GUI_PASSWORD)" ]; then
+  local pw_plain; pw_plain="$(env_value GUI_PASSWORD)"
+  if [ -n "$(env_value GUI_PASSWORD_HASH)" ] || { [ -n "${pw_plain}" ] && [ "${pw_plain}" != "change-me" ]; }; then
     ok "Un mot de passe est déjà configuré (change-le avec: ./manage.sh password)."
   elif [ -t 0 ]; then
     local pw1="" pw2=""
@@ -184,8 +185,9 @@ cmd_setup() {
     [ "${pw1}" = "${pw2}" ] || die "Les mots de passe ne correspondent pas."
     set_password_hash "${pw1}"
   else
-    warn "Pas de TTY : aucun mot de passe défini. Au premier démarrage, un mot de"
-    warn "passe aléatoire sera affiché dans les logs. Définis-en un : ./manage.sh password"
+    warn "Pas de TTY (ou mot de passe resté à 'change-me') : définis-en un vrai"
+    warn "avec ./manage.sh password — sinon un mot de passe aléatoire sera"
+    warn "affiché une fois dans les logs au premier démarrage."
   fi
 
   hdr "Build du frontend"
@@ -245,7 +247,12 @@ cmd_start() {
     [ -f "${GUI_DIR}/dist/index.html" ] || ( cd "${GUI_DIR}" && npm run build >/dev/null 2>&1 ) \
       || die "Build absent et impossible — lance: ./manage.sh setup"
     info "Démarrage en arrière-plan (logs: ${LOG_FILE})…"
-    ( cd "${GUI_DIR}" && nohup npm run start >> "${LOG_FILE}" 2>&1 & )
+    # Detach stdio completely: otherwise the intermediate shell keeps the
+    # caller's stdout pipe open and `sshjc start | ...` would hang forever.
+    (
+      cd "${GUI_DIR}" || exit 1
+      exec nohup npm run start
+    ) >> "${LOG_FILE}" 2>&1 < /dev/null &
     sleep 2
   fi
   local port; port="$(gui_port)"
