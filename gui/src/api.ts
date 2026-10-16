@@ -70,3 +70,30 @@ export async function stopTunnel(tunnelName: string): Promise<JobState> {
   });
   return parseJsonResponse<JobState>(res, `Failed to stop tunnel ${tunnelName}`);
 }
+
+export async function fetchSession(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/auth/session');
+    const data = await parseJsonResponse<{ authenticated: boolean }>(res, 'Failed to check session');
+    return Boolean(data?.authenticated);
+  } catch {
+    return false;
+  }
+}
+
+export async function login(password: string): Promise<void> {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password })
+  });
+  await parseJsonResponse<any>(res, 'Login failed');
+}
+
+export async function logout(): Promise<void> {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  } catch {
+    // Session cookie is cleared server-side on success; ignore transport errors.
+  }
+}

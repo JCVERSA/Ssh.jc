@@ -177,23 +177,23 @@ export const Drawer: React.FC<DrawerProps> = ({
                   </div>
                 )}
 
-                {/* 3. HARDWARE PORT 3000 SAFEGUARD */}
+                {/* 3. CONSOLE PORT SAFEGUARD */}
                 {category === 'safeguard' && (
                   <div className="space-y-4">
                     <div className="p-3.5 bg-[#ef4444]/15 border border-[#ef4444]/35 rounded space-y-2 text-[#ffdad6] backdrop-blur-md">
                       <div className="flex items-center gap-2 font-semibold text-[#ef4444]">
                         <PortGuardIcon size={16} />
-                        <span>PORT 3000 HARDWARE ISOLATION GATE</span>
+                        <span>PORT {data?.port ?? '—'} CONSOLE ISOLATION GATE</span>
                       </div>
                       <p className="text-[11px] leading-relaxed text-[#ffb4ab]">
-                        {data?.reason || 'Port 3000 is reserved for AI Studio and the active Cloudflare ingress. Reconfiguring or exposing port 3000 is strictly prohibited.'}
+                        {data?.reason || 'This port serves the SSH.JC Control Center. Reconfiguring or exposing it is strictly prohibited.'}
                       </p>
                     </div>
 
                     <div className="p-3 bg-[#071320] border border-[#1e334a] rounded space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-[#7891a8]">Locked Port:</span>
-                        <span className="text-[#ef4444] font-semibold">3000 (TCP)</span>
+                        <span className="text-[#ef4444] font-semibold">{data?.port ?? '—'} (TCP)</span>
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-[#7891a8]">Active Process:</span>
@@ -211,7 +211,7 @@ export const Drawer: React.FC<DrawerProps> = ({
 
                     <div className="p-3 bg-[#071320] border border-[#1e334a] rounded text-[11px] text-[#7891a8] space-y-1">
                       <span className="text-[#b5c7d8] font-medium block">Safeguard Guarantees:</span>
-                      <div>• Backend API returns HTTP 403 on any job attempting port 3000.</div>
+                      <div>• Backend API rejects any job attempting to use the console port.</div>
                       <div>• SSH daemon runs isolated on port 22.</div>
                       <div>• Existing ingress tunnels remain untouched and preserved.</div>
                     </div>

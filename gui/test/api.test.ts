@@ -1,6 +1,18 @@
 import assert from 'assert';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { redactSecrets } from '../server/systemService.js';
 import { jobManager } from '../server/jobManager.js';
+import { buildInvocation } from '../server/scriptService.js';
+import { hashPassword, verifyPassword } from '../server/auth.js';
+
+// Point the script driver at a harmless stub so tests never run Install.sh.
+const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sshjc-stub-'));
+const stubPath = path.join(stubDir, 'Install.sh');
+fs.writeFileSync(stubPath, '#!/bin/bash\necho "[INFO] stub Install.sh invoked: $*"\necho "[OK] stub completed"\nexit 0\n');
+fs.chmodSync(stubPath, 0o755);
+process.env.SSHJC_SCRIPT_PATH = stubPath;
 
 console.log('--- RUNNING SSH.JC CONTROL CENTER AUTOMATED TEST SUITE ---');
 
@@ -115,7 +127,40 @@ async function runTests() {
     }
   });
 
-  // 6. Binary Existence Guard
+  // 6. Script Driver (Install.sh single source of truth)
+  test('Script Driver: update_sshd_security maps to SSHJC_ACTION with env params', () => {
+    const inv = buildInvocation('update_sshd_security', { permitRootLogin: 'no', passwordAuthentication: 'no' });
+    assert.strictEqual(inv.env.SSHJC_ACTION, 'update_sshd_security');
+    assert.strictEqual(inv.env.SSHJC_PERMIT_ROOT_LOGIN, 'no');
+    assert.strictEqual(inv.env.SSHJC_PASSWORD_AUTHENTICATION, 'no');
+    assert.strictEqual(inv.env.SSHJC_NONINTERACTIVE, '1');
+    assert.deepStrictEqual(inv.stdinAnswers, []);
+    assert.strictEqual(inv.scriptPath, stubPath);
+  });
+
+  test('Script Driver: stop_tunnel answers menu 6 stop sequence', () => {
+    const inv = buildInvocation('stop_tunnel', { tunnelName: 'my-tunnel' });
+    assert.deepStrictEqual(inv.stdinAnswers, ['6', '2', 'y']);
+    assert.strictEqual(inv.env.SSHJC_TUNNEL_NAME, 'my-tunnel');
+  });
+
+  test('Script Driver: fx token never appears in the job summary', () => {
+    const inv = buildInvocation('configure_tunnel', { tunnelName: 't1', provider: 'fxtunnel', fxToken: 'sk_secret_123456' });
+    assert(!inv.summary.includes('sk_secret_123456'), 'Summary must not leak the token');
+    assert(inv.summary.includes('SSHJC_FX_TOKEN=***'));
+    assert.strictEqual(inv.env.SSHJC_FX_TOKEN, 'sk_secret_123456');
+  });
+
+  // 7. Password Auth
+  test('Auth: scrypt hash verifies the right password and rejects wrong ones', () => {
+    const hash = hashPassword('correct horse battery staple');
+    assert(hash.startsWith('scrypt$'));
+    assert.strictEqual(verifyPassword('correct horse battery staple', hash), true);
+    assert.strictEqual(verifyPassword('wrong password', hash), false);
+    assert.strictEqual(verifyPassword('anything', 'not-a-hash'), false);
+  });
+
+  // 8. Binary Existence Guard
   test('Binary Guard: hasBinary accurately detects installed vs missing system tools', () => {
     assert.strictEqual(jobManager.hasBinary('node') || jobManager.hasBinary('sh'), true, 'Should detect system binaries');
     assert.strictEqual(jobManager.hasBinary('nonexistent_fake_binary_xyz_123'), false, 'Should return false for non-existent binary');

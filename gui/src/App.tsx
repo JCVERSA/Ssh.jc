@@ -9,7 +9,8 @@ import { SshManager } from './components/SshManager';
 import { TunnelManager } from './components/TunnelManager';
 import { LogStreamViewer } from './components/LogStreamViewer';
 import { SystemStatusResponse, JobState } from './types';
-import { fetchSystemStatus, cancelJob, fetchJob } from './api';
+import { fetchSystemStatus, cancelJob, fetchJob, fetchSession, logout } from './api';
+import { Login } from './components/Login';
 import { AlertCircle, RotateCw } from 'lucide-react';
 import { Button } from './components/ui/Button';
 import { PortGuardIcon, CyberKeyholeIcon } from './components/ui/Icons';
@@ -21,6 +22,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
 
   // Drawer state
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -43,12 +45,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    fetchSession().then((ok) => setAuthenticated(ok));
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) return;
     loadStatus();
     const interval = setInterval(() => {
       loadStatus();
     }, 5000);
     return () => clearInterval(interval);
-  }, [loadStatus]);
+  }, [loadStatus, authenticated]);
+
+  const handleLogout = async () => {
+    await logout();
+    setStatus(null);
+    setAuthenticated(false);
+  };
 
   // Active job polling
   useEffect(() => {
@@ -90,7 +103,7 @@ export default function App() {
     const titles = {
       client: 'Remote Client Connection Directives',
       ingress: 'Ingress Cloud & Tunnel Parameters',
-      safeguard: 'Port 3000 Hardware Isolation Gate',
+      safeguard: 'Console Port Isolation Gate',
       daemon: 'OpenSSH Daemon Specifications'
     };
     setDrawerCategory(nodeType);
@@ -102,6 +115,29 @@ export default function App() {
   const handleOpenSafeguard = () => {
     handleOpenTopologyDrawer('safeguard', status?.protectedInfra);
   };
+
+  if (authenticated === null) {
+    return (
+      <div className="min-h-screen bg-[#030d18] flex items-center justify-center p-4">
+        <div className="flex flex-col items-center gap-3.5">
+          <div className="w-10 h-10 rounded-full border-2 border-[#00e5ff] border-t-transparent animate-spin shadow-[0_0_20px_rgba(0,229,255,0.4)]" />
+          <span className="font-mono text-xs text-[#b5c7d8] tracking-widest uppercase font-semibold">
+            Checking session...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <Login
+        onSuccess={() => {
+          setAuthenticated(true);
+        }}
+      />
+    );
+  }
 
   if (isLoading && !status) {
     return (
@@ -137,6 +173,8 @@ export default function App() {
           activeJob={status?.activeJob || null}
           onCancelJob={handleCancelJob}
           onOpenSafeguard={handleOpenSafeguard}
+          onLogout={handleLogout}
+          protectedPort={status?.protectedInfra?.port ?? 3000}
         />
 
         {/* Viewport Content */}
@@ -149,7 +187,7 @@ export default function App() {
             >
               <div className="flex items-center gap-2.5">
                 <AlertCircle className="w-4 h-4 text-[#ef4444] shrink-0" />
-                <span>{fetchError} (Check backend server on port 3000)</span>
+                <span>{fetchError} (Check that the backend server is running)</span>
               </div>
               <Button
                 variant="destructive"
@@ -224,7 +262,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2 text-[11px]">
             <PortGuardIcon size={13} className="text-[#10b981]" />
-            <span className="text-[#10b981] font-semibold">Port 3000 Ingress Shielded</span>
+            <span className="text-[#10b981] font-semibold">Port {status?.protectedInfra?.port ?? 3000} Console Shielded</span>
           </div>
         </footer>
       </div>

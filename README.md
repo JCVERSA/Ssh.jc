@@ -69,9 +69,11 @@ referenced in code comments.
 
 `gui/` contains the **SSH.JC Control Center** (React + Express): a web
 console for the operations above (dashboard, install wizard, SSH and
-tunnel management, logs). It is under active development — see
-`gui/DOCUMENTATION.md`. It is not a replacement for the scripts; the
-scripts remain the source of truth.
+tunnel management, logs). It is not a replacement for the scripts: every
+operation runs this `Install.sh` in its non-interactive GUI mode
+(`SSHJC_NONINTERACTIVE=1` + `SSHJC_*` env parameters), so the scripts
+remain the single source of truth. The console is password-protected
+(`GUI_PASSWORD`, see `gui/.env.example`) — see `gui/DOCUMENTATION.md`.
 
 ```bash
 cd gui && npm install && npm run dev   # http://localhost:3000

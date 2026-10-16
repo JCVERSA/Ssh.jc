@@ -65,9 +65,10 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
     setErrorMsg(null);
     const port = Number(targetPort);
 
-    // Safeguard check
-    if (port === 3000) {
-      setErrorMsg('CRITICAL SAFEGUARD: Port 3000 is reserved for AI Studio. Choose port 22 or another non-conflicting port.');
+    // Safeguard check: never tunnel the console's own port
+    const protectedPort = status?.protectedInfra?.port ?? 3000;
+    if (port === protectedPort) {
+      setErrorMsg(`CRITICAL SAFEGUARD: Port ${protectedPort} is reserved for this Control Center. Choose port 22 or another non-conflicting port.`);
       return;
     }
 

@@ -4,8 +4,16 @@ import path from 'path';
 import { getSystemInfo, getSshStatus, getTunnels, getRecentLogs, getProtectedInfra } from './systemService.js';
 import { jobManager } from './jobManager.js';
 import { JobType } from './types.js';
+import { handleLogin, handleLogout, handleSession, requireAuth } from './auth.js';
 
 export const apiRouter = Router();
+
+// Authentication (login/logout are open; everything else needs a session,
+// enforced by requireAuth, which lets /auth/* and /health through.)
+apiRouter.post('/auth/login', handleLogin);
+apiRouter.post('/auth/logout', handleLogout);
+apiRouter.get('/auth/session', handleSession);
+apiRouter.use(requireAuth);
 
 // 1. Full System and Service Status
 apiRouter.get('/system/status', (req: Request, res: Response) => {
@@ -60,14 +68,6 @@ apiRouter.post('/jobs/execute', async (req: Request, res: Response) => {
     return res.status(400).json({
       success: false,
       error: 'Job type is required.'
-    });
-  }
-
-  // Pre-validate port 3000 safeguard
-  if (parameters.localPort === 3000 || parameters.localPort === '3000') {
-    return res.status(403).json({
-      success: false,
-      error: 'SAFEGUARD DENIED: Port 3000 is reserved for AI Studio and the active Cloudflare ingress. You cannot configure or route a tunnel on port 3000.'
     });
   }
 

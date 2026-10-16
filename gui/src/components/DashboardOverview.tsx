@@ -374,7 +374,7 @@ export const DashboardOverview: React.FC<DashboardOverviewProps> = ({
               <div className="p-2.5 bg-[#071320] rounded border border-[#ef4444]/35 flex items-center justify-between shadow-sm">
                 <div className="flex items-center gap-1.5 text-[#ef4444]">
                   <PortGuardIcon size={13} />
-                  <span>Port 3000 Ingress</span>
+                  <span>Console Port {status.protectedInfra.port} Ingress</span>
                 </div>
                 <span className="text-[#ef4444] font-semibold tracking-wider">LOCKED</span>
               </div>

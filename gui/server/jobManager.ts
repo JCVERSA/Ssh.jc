@@ -1,11 +1,11 @@
 import { spawn, execSync, ChildProcess } from 'child_process';
-import fs from 'fs';
 import path from 'path';
-import { JobState, JobType, LogEntry } from './types.js';
+import { JobState, JobStatus, JobType, LogEntry } from './types.js';
 import { redactSecrets } from './systemService.js';
+import { buildInvocation, findInstallScript } from './scriptService.js';
+import { GUI_PORT } from './config.js';
 
-const HOME_DIR = process.env.HOME || '/root';
-const STATE_DIR = path.join(HOME_DIR, '.setup-ssh-tunnel');
+const JOB_TIMEOUT_MS = 15 * 60 * 1000;
 
 class JobManager {
   private currentJob: JobState | null = null;
@@ -40,27 +40,27 @@ class JobManager {
       id: `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       timestamp: new Date().toISOString(),
       level: entry.level,
-      source: entry.source || 'executor',
-      message: redactSecrets(entry.message)
+      source: entry.source || 'install.sh',
+      message: redactSecrets(entry.message),
     };
     this.currentJob.logs.push(log);
-    // Keep max 1000 logs in memory
     if (this.currentJob.logs.length > 1000) {
       this.currentJob.logs.shift();
     }
   }
 
   public validateParameters(type: JobType, params: Record<string, any>): { valid: boolean; error?: string } {
-    // 1. Port 3000 Protection & Range Check
+    // 1. Console port protection & range check. The port this Control Center
+    // listens on must never be exposed through a tunnel.
     if (params.localPort !== undefined && params.localPort !== null && params.localPort !== '') {
       const port = Number(params.localPort);
       if (isNaN(port) || port < 1 || port > 65535) {
         return { valid: false, error: 'Port must be a valid integer between 1 and 65535.' };
       }
-      if (port === 3000) {
+      if (port === GUI_PORT) {
         return {
           valid: false,
-          error: 'PROTECTED INFRASTRUCTURE: Port 3000 is reserved for AI Studio and the existing Cloudflare tunnel. Exposing or redirecting port 3000 is prohibited.'
+          error: `PROTECTED INFRASTRUCTURE: Port ${GUI_PORT} is reserved for this SSH.JC Control Center. Exposing or redirecting the console port is prohibited.`,
         };
       }
     }
@@ -86,7 +86,7 @@ class JobManager {
     }
 
     // 4. fxTunnel Token Validation
-    if (params.provider === 'fxtunnel' && type === 'configure_tunnel') {
+    if (params.provider === 'fxtunnel' && (type === 'configure_tunnel' || type === 'full_setup')) {
       if (!params.fxToken || typeof params.fxToken !== 'string' || !params.fxToken.startsWith('sk_')) {
         return { valid: false, error: 'fxTunnel requires a valid API token starting with "sk_".' };
       }
@@ -104,6 +104,20 @@ class JobManager {
       const validKeyRegex = /^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+[A-Za-z0-9+/]+={0,3}(\s+.*)?$/;
       if (!validKeyRegex.test(params.pubkey.trim())) {
         return { valid: false, error: 'Invalid SSH public key format. Expected OpenSSH key starting with ssh-rsa, ssh-ed25519, etc.' };
+      }
+    }
+
+    // 7. sshd security directive values
+    if (type === 'update_sshd_security') {
+      const rootValues = ['yes', 'no', 'prohibit-password', 'forced-commands-only'];
+      if (params.permitRootLogin !== undefined && !rootValues.includes(params.permitRootLogin)) {
+        return { valid: false, error: `permitRootLogin must be one of: ${rootValues.join(', ')}.` };
+      }
+      if (params.passwordAuthentication !== undefined && !['yes', 'no'].includes(params.passwordAuthentication)) {
+        return { valid: false, error: 'passwordAuthentication must be "yes" or "no".' };
+      }
+      if (params.permitRootLogin === undefined && params.passwordAuthentication === undefined) {
+        return { valid: false, error: 'Provide permitRootLogin and/or passwordAuthentication.' };
       }
     }
 
@@ -130,8 +144,12 @@ class JobManager {
       stop_tunnel: `Stop Tunnel (${params.tunnelName || 'Active Tunnel'})`,
       configure_admin_user: `Create Admin User (${params.username || 'admin'})`,
       update_sshd_security: 'Update SSH Security Directives',
-      toggle_sftp: 'Toggle SFTP Subsystem'
+      toggle_sftp: 'Toggle SFTP Subsystem',
     };
+
+    // Never keep secrets in the job record echoed back through the API.
+    const safeParams = { ...params };
+    if (safeParams.fxToken) safeParams.fxToken = '***';
 
     const job: JobState = {
       id,
@@ -140,463 +158,109 @@ class JobManager {
       status: 'preparing',
       startedAt: new Date().toISOString(),
       logs: [],
-      parameters: { ...params },
-      progressMessage: 'Validating environment and configuration...'
+      parameters: safeParams,
+      progressMessage: 'Validating environment and configuration...',
     };
 
     this.currentJob = job;
-
-    // Run execution asynchronously
-    this.runJobProcess(job).catch(err => {
-      job.status = 'failed';
-      job.errorMessage = err.message;
-      job.finishedAt = new Date().toISOString();
-      this.addLog({ level: 'error', message: `Execution failed: ${err.message}` });
-      this.finishJob();
+    this.runScriptJob(job, type, params).catch(err => {
+      console.error(`[SSH.JC] Job runner error (${job.id}):`, err);
     });
-
     return job;
   }
 
-  public cancelActiveJob(): boolean {
-    if (!this.currentJob || this.currentJob.status !== 'running') {
-      return false;
-    }
-    this.addLog({ level: 'warn', message: 'Received cancellation request from operator. Terminating process...' });
-    this.currentJob.status = 'cancelled';
-    this.currentJob.progressMessage = 'Operation cancelled by user';
-    this.currentJob.finishedAt = new Date().toISOString();
+  private async runScriptJob(job: JobState, type: JobType, params: Record<string, any>): Promise<void> {
+    const invocation = buildInvocation(type, params);
+    const scriptPath = invocation.scriptPath;
 
-    if (this.currentProcess) {
-      this.currentProcess.kill('SIGTERM');
-      setTimeout(() => {
-        if (this.currentProcess && !this.currentProcess.killed) {
-          this.currentProcess.kill('SIGKILL');
-        }
-      }, 3000);
-    }
-
-    this.finishJob();
-    return true;
-  }
-
-  private finishJob() {
-    if (this.currentJob) {
-      this.jobHistory.push(this.currentJob);
-      this.currentJob = null;
-    }
-    this.currentProcess = null;
-  }
-
-  private async runJobProcess(job: JobState): Promise<void> {
     job.status = 'running';
-    this.addLog({ level: 'info', message: `Starting task: ${job.title}` });
-
-    // Execute verified backend operations
-    switch (job.type) {
-      case 'install_openssh':
-        await this.executeInstallOpenSSH(job);
-        break;
-      case 'install_tunnel_client':
-        await this.executeInstallTunnelClient(job);
-        break;
-      case 'configure_tunnel':
-        await this.executeConfigureTunnel(job);
-        break;
-      case 'run_tunnel':
-        await this.executeRunTunnel(job);
-        break;
-      case 'stop_tunnel':
-        await this.executeStopTunnel(job);
-        break;
-      case 'configure_admin_user':
-        await this.executeConfigureAdminUser(job);
-        break;
-      case 'update_sshd_security':
-        await this.executeUpdateSshdSecurity(job);
-        break;
-      case 'toggle_sftp':
-        await this.executeToggleSftp(job);
-        break;
-      case 'full_setup':
-        await this.executeFullSetup(job);
-        break;
-      default:
-        throw new Error(`Unsupported operation type: ${job.type}`);
-    }
-
-    job.status = 'completed';
-    job.exitCode = 0;
-    job.finishedAt = new Date().toISOString();
-    job.progressMessage = 'Operation completed successfully.';
-    this.addLog({ level: 'ok', message: `${job.title} succeeded.` });
-    this.finishJob();
-  }
-
-  private async executeCommand(
-    command: string,
-    args: string[],
-    job: JobState,
-    env?: NodeJS.ProcessEnv
-  ): Promise<number> {
-    return new Promise((resolve, reject) => {
-      this.addLog({ level: 'info', message: `Executing: ${command} ${args.join(' ')}` });
-
-      const child = spawn(command, args, {
-        env: { ...process.env, ...env },
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-
-      this.currentProcess = child;
-
-      child.stdout.on('data', data => {
-        const lines = data.toString().split('\n').filter(Boolean);
-        for (const line of lines) {
-          this.addLog({ level: 'info', message: line, source: command });
-        }
-      });
-
-      child.stderr.on('data', data => {
-        const lines = data.toString().split('\n').filter(Boolean);
-        for (const line of lines) {
-          this.addLog({ level: 'warn', message: line, source: command });
-        }
-      });
-
-      child.on('error', err => {
-        this.addLog({ level: 'error', message: `Process error: ${err.message}` });
-        reject(err);
-      });
-
-      child.on('close', code => {
-        if (code === 0) {
-          resolve(0);
-        } else {
-          this.addLog({ level: 'error', message: `Process exited with code ${code}` });
-          reject(new Error(`Command ${command} exited with code ${code}`));
-        }
-      });
+    job.progressMessage = `Running Install.sh (${type})`;
+    this.addLog({
+      level: 'info',
+      message: `Executing Install.sh in non-interactive mode: ${invocation.summary}`,
     });
+
+    const proc = spawn('bash', [scriptPath], {
+      cwd: path.dirname(scriptPath),
+      env: { ...process.env, ...invocation.env },
+      detached: true, // own process group so cancel/timeout can kill children
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    this.currentProcess = proc;
+
+    if (invocation.stdinAnswers.length > 0) {
+      proc.stdin?.write(invocation.stdinAnswers.join('\n') + '\n');
+    }
+    proc.stdin?.end();
+
+    const handleChunk = (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      for (const rawLine of text.split('\n')) {
+        const line = rawLine.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').trim();
+        if (!line) continue;
+        let level: 'info' | 'ok' | 'warn' | 'error' = 'info';
+        if (line.includes('[OK]')) level = 'ok';
+        else if (line.includes('[WARNING]')) level = 'warn';
+        else if (line.includes('[ERROR]')) level = 'error';
+        this.addLog({ level, message: line });
+        if (level === 'error') job.errorMessage = line.replace('[ERROR]', '').trim();
+      }
+    };
+    proc.stdout?.on('data', handleChunk);
+    proc.stderr?.on('data', handleChunk);
+
+    const timeout = setTimeout(() => {
+      this.addLog({ level: 'error', message: 'Job timed out (15 minutes). Terminating Install.sh.' });
+      this.killProcessTree(proc);
+    }, JOB_TIMEOUT_MS);
+
+    const exitCode: number = await new Promise((resolve) => {
+      proc.on('error', () => resolve(-1));
+      proc.on('close', (code) => resolve(code ?? -1));
+    });
+    clearTimeout(timeout);
+    this.currentProcess = null;
+
+    job.finishedAt = new Date().toISOString();
+    job.exitCode = exitCode;
+    const statusNow = job.status as JobStatus;
+    if (statusNow !== 'cancelled') {
+      job.status = exitCode === 0 ? 'completed' : 'failed';
+    }
+    job.progressMessage = undefined;
+    this.addLog({
+      level: exitCode === 0 ? 'ok' : 'error',
+      message: `Install.sh finished with exit code ${exitCode}.`,
+    });
+
+    this.jobHistory.push({ ...job, logs: [...job.logs] });
+    if (this.jobHistory.length > 20) this.jobHistory.shift();
   }
 
-  private async executeInstallOpenSSH(job: JobState): Promise<void> {
-    job.progressMessage = 'Installing OpenSSH server package...';
+  private killProcessTree(proc: ChildProcess): void {
     try {
-      await this.executeCommand('apt-get', ['update', '-y'], job);
-      await this.executeCommand('apt-get', ['install', '-y', 'openssh-server'], job);
+      if (proc.pid) process.kill(-proc.pid, 'SIGTERM');
     } catch {
-      this.addLog({ level: 'warn', message: 'Apt install encountered an issue, checking existing sshd...' });
+      try { proc.kill('SIGTERM'); } catch { /* already gone */ }
     }
-
-    // Ensure /run/sshd exists
-    if (!fs.existsSync('/run/sshd')) {
-      fs.mkdirSync('/run/sshd', { recursive: true });
-    }
-
-    // Start sshd if not running
-    try {
-      if (fs.existsSync('/run/systemd/system')) {
-        await this.executeCommand('systemctl', ['enable', '--now', 'ssh'], job);
-      } else {
-        await this.executeCommand('/usr/sbin/sshd', [], job);
-      }
-    } catch {
-      this.addLog({ level: 'info', message: 'sshd start attempt completed or already active.' });
-    }
-  }
-
-  private async executeInstallTunnelClient(job: JobState): Promise<void> {
-    const provider = job.parameters.provider || 'cloudflared';
-    if (provider === 'fxtunnel') {
-      job.progressMessage = 'Downloading fxTunnel client...';
-      const tmpScript = path.join('/tmp', `fxtunnel-install-${Date.now()}.sh`);
-      await this.executeCommand('curl', ['-fsSL', 'https://fxtun.dev/install.sh', '-o', tmpScript], job);
-      await this.executeCommand('sh', [tmpScript], job);
-      try { fs.unlinkSync(tmpScript); } catch {}
-    } else {
-      job.progressMessage = 'Downloading cloudflared debian package...';
-      const arch = 'amd64';
-      const tmpDeb = path.join('/tmp', `cloudflared-${Date.now()}.deb`);
-      const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.deb`;
-      await this.executeCommand('curl', ['-fL', '-o', tmpDeb, url], job);
-      await this.executeCommand('dpkg', ['-i', tmpDeb], job);
-      try { fs.unlinkSync(tmpDeb); } catch {}
-    }
-
-    // Save provider to state
-    this.saveState('provider', provider);
-  }
-
-  private async executeConfigureTunnel(job: JobState): Promise<void> {
-    const { tunnelName, provider, fxToken, domain, subdomain } = job.parameters;
-    const resolvedTunnelName = tunnelName || 'ssh-sandbox';
-
-    if (provider === 'fxtunnel') {
-      job.progressMessage = `Saving fxTunnel configuration for ${resolvedTunnelName}...`;
-      this.saveTunnelState(resolvedTunnelName, 'name', resolvedTunnelName);
-      this.saveTunnelState(resolvedTunnelName, 'token', fxToken);
-      this.saveState('provider', 'fxtunnel');
-      this.addLog({ level: 'ok', message: `fxTunnel token registered for '${resolvedTunnelName}'.` });
-    } else {
-      job.progressMessage = `Configuring Cloudflare tunnel: ${resolvedTunnelName}...`;
+    setTimeout(() => {
       try {
-        await this.executeCommand('cloudflared', ['tunnel', 'create', resolvedTunnelName], job);
-      } catch (e) {
-        this.addLog({ level: 'warn', message: `Tunnel may already exist or required login: ${(e as Error).message}` });
+        if (proc.pid) process.kill(-proc.pid, 'SIGKILL');
+      } catch {
+        try { proc.kill('SIGKILL'); } catch { /* already gone */ }
       }
-
-      if (domain) {
-        const fullHost = subdomain ? `${subdomain}.${domain}` : domain;
-        job.progressMessage = `Routing DNS ${fullHost} -> ${resolvedTunnelName}...`;
-        try {
-          await this.executeCommand('cloudflared', ['tunnel', 'route', 'dns', resolvedTunnelName, fullHost], job);
-        } catch {
-          this.addLog({ level: 'warn', message: 'DNS route command logged; verify route existence in Cloudflare dashboard.' });
-        }
-        this.saveTunnelState(resolvedTunnelName, 'hostname', fullHost);
-        this.saveTunnelState(resolvedTunnelName, 'domain', domain);
-      }
-
-      this.saveTunnelState(resolvedTunnelName, 'name', resolvedTunnelName);
-      this.saveState('provider', 'cloudflared');
-    }
+    }, 3000);
   }
 
-  private async executeRunTunnel(job: JobState): Promise<void> {
-    const { tunnelName, localPort = 22, runMode = 'background', provider } = job.parameters;
-    const resolvedPort = Number(localPort);
-
-    // Hard safeguard check
-    if (resolvedPort === 3000) {
-      throw new Error('SAFEGUARD TRIGGERED: Port 3000 is strictly protected.');
-    }
-
-    const resolvedTunnelName = tunnelName || 'ssh-sandbox';
-    job.progressMessage = `Starting tunnel '${resolvedTunnelName}' targeting local port ${resolvedPort}...`;
-
-    if (runMode === 'systemd' && fs.existsSync('/run/systemd/system')) {
-      if (provider === 'fxtunnel') {
-        const unitName = `fxtunnel-${resolvedTunnelName}`;
-        await this.executeCommand('systemctl', ['enable', '--now', unitName], job);
-      } else {
-        await this.executeCommand('systemctl', ['enable', '--now', 'cloudflared'], job);
-      }
-      this.addLog({ level: 'ok', message: `Systemd service started for tunnel '${resolvedTunnelName}'.` });
-    } else {
-      // Background process
-      const logPath = `/tmp/tunnel-${resolvedTunnelName}-${Date.now()}.log`;
-      let cmd: string;
-      let args: string[];
-
-      if (provider === 'fxtunnel') {
-        const token = this.getTunnelState(resolvedTunnelName, 'token') || job.parameters.fxToken;
-        if (!token) {
-          throw new Error(`fxTunnel requires an account token. Please configure the tunnel with an API token first.`);
-        }
-        cmd = 'fxtunnel';
-        args = ['tcp', String(resolvedPort), '-t', token];
-      } else {
-        cmd = 'cloudflared';
-        args = ['tunnel', 'run', '--url', `ssh://localhost:${resolvedPort}`, resolvedTunnelName];
-      }
-
-      // Verify binary is actually installed before attempting to spawn
-      if (!this.hasBinary(cmd)) {
-        throw new Error(
-          `The tunnel client binary '${cmd}' is not installed on this system. Please install ${cmd} first (Wizard Option 3) before launching a tunnel.`
-        );
-      }
-
-      const logStream = fs.openSync(logPath, 'a');
-      await new Promise<void>((resolve, reject) => {
-        let spawned = false;
-        const child = spawn(cmd, args, {
-          detached: true,
-          stdio: ['ignore', logStream, logStream]
-        });
-
-        // Always handle 'error' event to prevent unhandled node exceptions (e.g. ENOENT)
-        child.on('error', (err) => {
-          this.addLog({ level: 'error', message: `Tunnel process failed to spawn: ${err.message}` });
-          reject(new Error(`Failed to spawn ${cmd}: ${err.message}`));
-        });
-
-        // Allow a brief settling delay to ensure spawn didn't error immediately
-        setTimeout(() => {
-          if (child.pid && !child.killed) {
-            spawned = true;
-            child.unref();
-            this.saveTunnelState(resolvedTunnelName, 'pid', String(child.pid));
-            this.saveTunnelState(resolvedTunnelName, 'log', logPath);
-            this.addLog({ level: 'ok', message: `Tunnel started in background (PID: ${child.pid}). Log: ${logPath}` });
-            resolve();
-          } else if (!spawned) {
-            resolve();
-          }
-        }, 150);
-      });
-    }
-  }
-
-  private async executeStopTunnel(job: JobState): Promise<void> {
-    const { tunnelName } = job.parameters;
-    const pidStr = this.getTunnelState(tunnelName, 'pid');
-    if (pidStr) {
-      const pid = parseInt(pidStr, 10);
-      try {
-        process.kill(pid, 'SIGTERM');
-        this.addLog({ level: 'ok', message: `Stopped tunnel process (PID: ${pid}).` });
-      } catch (e) {
-        this.addLog({ level: 'warn', message: `Could not terminate PID ${pid}: ${(e as Error).message}` });
-      }
-    }
-
-    if (fs.existsSync('/run/systemd/system')) {
-      try {
-        await this.executeCommand('systemctl', ['stop', `fxtunnel-${tunnelName}`], job);
-      } catch {}
-      try {
-        await this.executeCommand('systemctl', ['stop', 'cloudflared'], job);
-      } catch {}
-    }
-  }
-
-  private async executeConfigureAdminUser(job: JobState): Promise<void> {
-    const { username = 'admin', pubkey, disablePasswordAuth } = job.parameters;
-
-    job.progressMessage = `Creating administrative user '${username}'...`;
-    try {
-      await this.executeCommand('useradd', ['-m', '-s', '/bin/bash', '-G', 'sudo', username], job);
-    } catch {
-      this.addLog({ level: 'info', message: `User '${username}' already exists or was updated.` });
-    }
-
-    if (pubkey) {
-      const userSshDir = path.join('/home', username, '.ssh');
-      const authKeysPath = path.join(userSshDir, 'authorized_keys');
-
-      if (!fs.existsSync(userSshDir)) {
-        fs.mkdirSync(userSshDir, { recursive: true, mode: 0o700 });
-      }
-
-      // Key deduplication logic from Install.sh
-      let existingKeys = '';
-      if (fs.existsSync(authKeysPath)) {
-        existingKeys = fs.readFileSync(authKeysPath, 'utf8');
-      }
-
-      if (!existingKeys.includes(pubkey.trim())) {
-        fs.appendFileSync(authKeysPath, `${pubkey.trim()}\n`, { mode: 0o600 });
-        this.addLog({ level: 'ok', message: `Appended public key to ${authKeysPath}` });
-      } else {
-        this.addLog({ level: 'info', message: `Public key already present in ${authKeysPath}, skipped duplicate.` });
-      }
-    }
-
-    if (disablePasswordAuth) {
-      await this.executeUpdateSshdSecurity(job, { passwordAuth: 'no' });
-    }
-
-    this.saveState('user', username);
-  }
-
-  private async executeUpdateSshdSecurity(job: JobState, overrideOpts?: { passwordAuth?: string; permitRoot?: string }): Promise<void> {
-    const sshdConfig = '/etc/ssh/sshd_config';
-    if (!fs.existsSync(sshdConfig)) {
-      this.addLog({ level: 'warn', message: 'sshd_config not present, skipping modification.' });
-      return;
-    }
-
-    // Always create a backup first
-    const backupPath = `/etc/ssh/sshd_config.bak.${Date.now()}`;
-    fs.copyFileSync(sshdConfig, backupPath);
-    this.addLog({ level: 'info', message: `Created backup at ${backupPath}` });
-
-    let content = fs.readFileSync(sshdConfig, 'utf8');
-
-    const passAuth = overrideOpts?.passwordAuth || job.parameters.passwordAuthentication;
-    if (passAuth === 'no' || passAuth === 'yes') {
-      content = content.replace(/^#?\s*PasswordAuthentication\s+.*$/m, `PasswordAuthentication ${passAuth}`);
-      this.addLog({ level: 'ok', message: `Set PasswordAuthentication to '${passAuth}'.` });
-    }
-
-    const permitRoot = overrideOpts?.permitRoot || job.parameters.permitRootLogin;
-    if (permitRoot) {
-      content = content.replace(/^#?\s*PermitRootLogin\s+.*$/m, `PermitRootLogin ${permitRoot}`);
-      this.addLog({ level: 'ok', message: `Set PermitRootLogin to '${permitRoot}'.` });
-    }
-
-    fs.writeFileSync(sshdConfig, content, 'utf8');
-
-    // Validate syntax with sshd -t
-    try {
-      await this.executeCommand('sshd', ['-t'], job);
-      this.addLog({ level: 'ok', message: 'sshd_config syntax validated successfully (sshd -t).' });
-    } catch {
-      this.addLog({ level: 'error', message: 'Syntax error detected in sshd_config! Restoring backup...' });
-      fs.copyFileSync(backupPath, sshdConfig);
-      throw new Error('sshd_config syntax validation failed; restored original configuration.');
-    }
-  }
-
-  private async executeToggleSftp(job: JobState): Promise<void> {
-    const sshdConfig = '/etc/ssh/sshd_config';
-    if (!fs.existsSync(sshdConfig)) return;
-
-    let content = fs.readFileSync(sshdConfig, 'utf8');
-    const sftpCandidate = '/usr/lib/openssh/sftp-server';
-
-    if (!/Subsystem\s+sftp/i.test(content)) {
-      content += `\nSubsystem sftp ${sftpCandidate}\n`;
-      fs.writeFileSync(sshdConfig, content, 'utf8');
-      this.addLog({ level: 'ok', message: 'SFTP subsystem directive added to sshd_config.' });
-    } else {
-      this.addLog({ level: 'info', message: 'SFTP subsystem already active.' });
-    }
-  }
-
-  private async executeFullSetup(job: JobState): Promise<void> {
-    job.progressMessage = 'Step 1/5: Installing and starting OpenSSH server...';
-    await this.executeInstallOpenSSH(job);
-
-    if (job.parameters.username) {
-      job.progressMessage = 'Step 2/5: Configuring administrative SSH user...';
-      await this.executeConfigureAdminUser(job);
-    }
-
-    job.progressMessage = 'Step 3/5: Installing tunnel client...';
-    await this.executeInstallTunnelClient(job);
-
-    job.progressMessage = 'Step 4/5: Configuring tunnel and routing...';
-    await this.executeConfigureTunnel(job);
-
-    job.progressMessage = 'Step 5/5: Launching tunnel service...';
-    await this.executeRunTunnel(job);
-  }
-
-  private saveState(key: string, val: string) {
-    try {
-      fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(STATE_DIR, key), val, { mode: 0o600 });
-    } catch {}
-  }
-
-  private saveTunnelState(tunnel: string, key: string, val: string) {
-    try {
-      const dir = path.join(STATE_DIR, 'tunnels', tunnel);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(dir, key), val, { mode: 0o600 });
-      fs.writeFileSync(path.join(STATE_DIR, 'last_tunnel'), tunnel, { mode: 0o600 });
-    } catch {}
-  }
-
-  private getTunnelState(tunnel: string, key: string): string | null {
-    try {
-      const p = path.join(STATE_DIR, 'tunnels', tunnel, key);
-      if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8').trim();
-    } catch {}
-    return null;
+  public cancelActiveJob(): boolean {
+    if (!this.currentJob || !this.currentProcess) return false;
+    if (this.currentJob.status !== 'running' && this.currentJob.status !== 'preparing') return false;
+    this.currentJob.status = 'cancelled';
+    this.addLog({ level: 'warn', message: 'Job cancelled by operator. Terminating Install.sh.' });
+    this.killProcessTree(this.currentProcess);
+    return true;
   }
 }
 
 export const jobManager = new JobManager();
+export { findInstallScript };

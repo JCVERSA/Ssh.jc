@@ -57,10 +57,10 @@ export const Navbar: React.FC<NavbarProps> = ({
         <div className="flex items-center gap-3 shrink-0">
           <div
             className="flex items-center gap-1.5 px-2.5 py-1 bg-[#010f1f] border border-[#273647] rounded text-xs font-mono text-[#849396]"
-            title="Container Port 3000 is protected from tunnel conflicts"
+            title="Console port is protected from tunnel conflicts"
           >
             <Lock className="w-3.5 h-3.5 text-[#00e5ff]" />
-            <span className="hidden lg:inline text-[#bac9cc]">Port 3000</span>
+            <span className="hidden lg:inline text-[#bac9cc]">Console Port</span>
             <span className="text-[#00e5ff] font-semibold">LOCKED</span>
           </div>
         </div>

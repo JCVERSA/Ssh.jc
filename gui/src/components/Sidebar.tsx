@@ -161,11 +161,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             animate={{ opacity: 1 }}
             className="space-y-1.5 font-mono text-[11px]"
           >
-            {/* Port 3000 Shield */}
+            {/* Console Port Shield */}
             <div className="p-2 bg-[#0c1b2c]/90 border border-[#ef4444]/35 rounded flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-1.5 text-[#ef4444]">
                 <PortGuardIcon size={14} />
-                <span>Port 3000</span>
+                <span>Port {status?.protectedInfra?.port ?? 3000}</span>
               </div>
               <span className="text-[10px] text-[#ef4444] font-semibold tracking-wider">
                 LOCKED

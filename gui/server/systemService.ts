@@ -3,8 +3,9 @@ import path from 'path';
 import { execSync } from 'child_process';
 import os from 'os';
 import { SystemInfo, SshStatus, TunnelInstance, ProtectedInfrastructure, LogEntry } from './types.js';
+import { GUI_PORT, HOME_DIR as CONFIG_HOME_DIR } from './config.js';
 
-const HOME_DIR = process.env.HOME || '/root';
+const HOME_DIR = CONFIG_HOME_DIR;
 const STATE_DIR = path.join(HOME_DIR, '.setup-ssh-tunnel');
 
 function safeExec(command: string): string {
@@ -24,26 +25,14 @@ export function redactSecrets(text: string): string {
 }
 
 export function getProtectedInfra(): ProtectedInfrastructure {
-  let pid: number | undefined;
-  try {
-    // Find node or vite process on port 3000
-    const psOut = safeExec("ps aux | grep -E 'vite|server\\.ts' | grep -v grep | head -n 1");
-    if (psOut) {
-      const parts = psOut.trim().split(/\s+/);
-      if (parts[1]) pid = parseInt(parts[1], 10);
-    }
-  } catch {
-    // ignore
-  }
-
   return {
-    port: 3000,
-    process: 'Node.js / Vite & Express Control Plane',
-    pid: pid || process.pid,
+    port: GUI_PORT,
+    process: 'SSH.JC Control Center (Node.js / Express)',
+    pid: process.pid,
     isLocked: true,
-    reason: 'Host container port 3000 is dedicated to the AI Studio preview environment and existing Cloudflare ingress. Repurposing or tunneling over this port will sever application connectivity.',
-    allowedOrigins: ['localhost:3000', '127.0.0.1:3000'],
-    alertMessage: 'Protected: Port 3000 is locked by system safeguard. SSH.JC tunnels must select port 22 or custom non-conflicting ports.'
+    reason: `Port ${GUI_PORT} serves this SSH.JC Control Center. Exposing the console itself through a tunnel would publish the management interface (which can run installers) to the internet, so tunnels targeting the console port are rejected.`,
+    allowedOrigins: [`localhost:${GUI_PORT}`, `127.0.0.1:${GUI_PORT}`],
+    alertMessage: `Protected: Port ${GUI_PORT} is locked by the Control Center safeguard. SSH.JC tunnels must select port 22 or another non-conflicting port.`
   };
 }
 

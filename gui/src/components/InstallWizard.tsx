@@ -63,13 +63,14 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
 
   // If there's an active job running, lock to running view
   const isJobRunning = activeJob && (activeJob.status === 'running' || activeJob.status === 'preparing');
+  const protectedPort = status?.protectedInfra?.port ?? 3000;
 
   const handleNextToReview = () => {
     setValidationError(null);
 
-    // Safeguard check for port 3000
-    if (Number(localPort) === 3000) {
-      setValidationError('CRITICAL SAFEGUARD: Port 3000 is reserved for AI Studio and the existing tunnel. Please choose port 22 or another non-conflicting port.');
+    // Safeguard check: never tunnel the console's own port
+    if (Number(localPort) === protectedPort) {
+      setValidationError(`CRITICAL SAFEGUARD: Port ${protectedPort} is reserved for this Control Center. Please choose port 22 or another non-conflicting port.`);
       return;
     }
 
@@ -236,7 +237,7 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
               <span className="font-mono text-xs text-[#00e5ff] font-semibold">OPTION 5</span>
               <h3 className="text-sm font-semibold text-[#e6f1fc] mt-2">Run Configured Tunnel</h3>
               <p className="text-xs text-[#b5c7d8] mt-1 leading-relaxed">
-                Launches configured tunnel in background (nohup) or systemd service, guarding port 3000.
+                Launches configured tunnel in background (nohup) or as a systemd service, guarding the console port.
               </p>
             </GlassCard>
           </div>
@@ -356,10 +357,10 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
                 onChange={(e) => setLocalPort(e.target.value)}
                 className="w-full px-3.5 py-2 bg-[#0c1b2c] border border-[#1e334a] focus:border-[#00e5ff] rounded text-xs font-mono text-[#e6f1fc] outline-none"
               />
-              {Number(localPort) === 3000 && (
+              {Number(localPort) === protectedPort && (
                 <div className="text-xs text-[#ef4444] font-mono flex items-center gap-1.5 mt-1">
                   <PortGuardIcon size={12} />
-                  <span>PORT 3000 LOCKED: AI Studio preview server is running on this port.</span>
+                  <span>PORT {protectedPort} LOCKED: this Control Center is running on this port.</span>
                 </div>
               )}
             </div>
@@ -442,7 +443,7 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
 
             <div className="p-3 bg-[#071320] rounded border border-[#1e334a] space-y-1">
               <div className="text-[#7891a8]">TARGET PORT:</div>
-              <div className="text-[#10b981] font-semibold">{localPort} (TCP) — Port 3000 Shielded</div>
+              <div className="text-[#10b981] font-semibold">{localPort} (TCP) — Console Port {protectedPort} Shielded</div>
             </div>
 
             {domain && (
@@ -463,7 +464,7 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
             <ul className="list-disc pl-4 space-y-0.5 text-[11px] text-[#b5c7d8]">
               <li>sshd_config is backed up automatically before any directive update.</li>
               <li>Syntax validation is tested via `sshd -t` prior to reloading services.</li>
-              <li>Existing port 3000 process is protected from conflict or override.</li>
+              <li>The console port ({protectedPort}) is protected from conflict or override.</li>
             </ul>
           </div>
 

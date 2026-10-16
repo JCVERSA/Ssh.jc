@@ -39,11 +39,36 @@ banner() {
     echo -e "${NC}"
 }
 
+# GUI / non-interactive mode (used by the SSH.JC Control Center backend):
+# with SSHJC_NONINTERACTIVE=1, prompts are answered from stdin and semantic
+# SSHJC_* env vars, EOF fails fast instead of hanging forever, and
+# interactive-only operations are refused rather than blocking on a TTY.
+gui_mode() { [[ "${SSHJC_NONINTERACTIVE:-}" == "1" ]]; }
+gui_env() {
+    # gui_env VARNAME -> prints its value when set in GUI mode
+    if gui_mode && [[ -n "${!1:-}" ]]; then
+        printf '%s\n' "${!1}"
+        return 0
+    fi
+    return 1
+}
+
 ask() {
     # ask "question" "default_value"
     local question="$1"
     local default="${2:-}"
     local answer
+    if gui_mode; then
+        if ! IFS= read -r answer; then
+            echo "ERROR: non-interactive mode ran out of answers for: $question" >&2
+            # ask() usually runs inside $(...): a plain exit would only kill
+            # the subshell and retry loops would spin forever on EOF.
+            kill -TERM $$ 2>/dev/null
+            exit 1
+        fi
+        echo "${answer:-$default}"
+        return
+    fi
     if [[ -n "$default" ]]; then
         read -rp "$(echo -e "${BOLD}${question}${NC} [${default}]: ")" answer
         echo "${answer:-$default}"
@@ -57,6 +82,12 @@ confirm() {
     # confirm "question" -> returns 0 (yes) or 1 (no)
     local question="$1"
     local answer
+    if gui_mode; then
+        # EOF in GUI mode safely means "no" (never enable by default).
+        IFS= read -r answer || return 1
+        [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]
+        return
+    fi
     read -rp "$(echo -e "${BOLD}${question}${NC} [y/N]: ")" answer
     [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]
 }
@@ -132,6 +163,14 @@ is_valid_tunnel_name() {
 
 # Asks for a tunnel name until a valid one is entered (see above).
 ask_tunnel_name() {
+    if gui_mode && [[ -n "${SSHJC_TUNNEL_NAME:-}" ]]; then
+        if is_valid_tunnel_name "$SSHJC_TUNNEL_NAME"; then
+            printf '%s\n' "$SSHJC_TUNNEL_NAME"
+            return 0
+        fi
+        error "Invalid SSHJC_TUNNEL_NAME: '$SSHJC_TUNNEL_NAME'." >&2
+        exit 1
+    fi
     local name
     while true; do
         name=$(ask "$1" "$2")
@@ -156,8 +195,21 @@ backup_sshd_config_once() {
         sudo chmod 600 "$backup" 2>/dev/null || true
         ok "Backup of sshd_config saved to $backup (restore: sudo cp -a $backup /etc/ssh/sshd_config)"
         SSHD_BACKUP_DONE=1
+        SSHD_LAST_BACKUP="$backup"
     else
         warn "Could not back up /etc/ssh/sshd_config before editing it."
+    fi
+}
+
+# Sets one sshd_config directive (replacing a commented or active line, or
+# appending it), after a one-time backup. Used by the GUI SSHJC_ACTION mode.
+apply_sshd_directive() {
+    local directive="$1" value="$2"
+    backup_sshd_config_once
+    if grep -q "^#\?${directive}[[:space:]]" /etc/ssh/sshd_config; then
+        sudo sed -i "s/^#\?${directive}.*/${directive} ${value}/" /etc/ssh/sshd_config
+    else
+        echo "${directive} ${value}" | sudo tee -a /etc/ssh/sshd_config > /dev/null
     fi
 }
 
@@ -177,7 +229,11 @@ ensure_sftp_enabled() {
     fi
 
     warn "The SFTP subsystem is not active in the current sshd configuration."
-    if ! confirm "Enable SFTP now (adds a 'Subsystem sftp' line to /etc/ssh/sshd_config)?"; then
+    if gui_mode && [[ "${SSHJC_ENABLE_SFTP:-0}" != "1" ]]; then
+        info "SFTP left disabled (GUI mode: use the SFTP toggle action to enable it)."
+        return 0
+    fi
+    if ! gui_mode && ! confirm "Enable SFTP now (adds a 'Subsystem sftp' line to /etc/ssh/sshd_config)?"; then
         info "SFTP left disabled."
         return 0
     fi
@@ -276,7 +332,14 @@ ensure_fxtunnel_path() {
 
 create_admin_user() {
     local username pubkey
-    while true; do
+    if [[ -n "${SSHJC_USERNAME:-}" ]] && gui_mode; then
+        username="$SSHJC_USERNAME"
+        if ! is_valid_username "$username"; then
+            error "Invalid SSHJC_USERNAME: '$username'."
+            return 1
+        fi
+    fi
+    while [[ -z "${username:-}" ]]; do
         username=$(ask "Username for the new admin account" "admin")
         if is_valid_username "$username"; then
             break
@@ -296,7 +359,11 @@ create_admin_user() {
         fi
     fi
 
-    pubkey=$(ask "Paste the SSH public key for '$username' (contents of your .pub key)" "")
+    if gui_mode && [[ -v SSHJC_PUBKEY ]]; then
+        pubkey="$SSHJC_PUBKEY"
+    else
+        pubkey=$(ask "Paste the SSH public key for '$username' (contents of your .pub key)" "")
+    fi
     if [[ -n "$pubkey" ]]; then
         if ! is_valid_pubkey "$pubkey"; then
             warn "This doesn't look like a standard SSH public key format. Adding it anyway, but double-check it works before closing this session."
@@ -433,6 +500,16 @@ choose_saved_tunnel() {
     local -a tunnels=()
     mapfile -t tunnels < <(list_saved_tunnels)
     ((${#tunnels[@]} > 0)) || return 1
+    if gui_mode && [[ -n "${SSHJC_TUNNEL_NAME:-}" ]]; then
+        local _t
+        for _t in "${tunnels[@]}"; do
+            if [[ "$_t" == "$SSHJC_TUNNEL_NAME" ]]; then
+                printf '%s\n' "$_t"
+                return 0
+            fi
+        done
+        return 1
+    fi
     if ((${#tunnels[@]} == 1)); then
         printf '%s\n' "${tunnels[0]}"
         return 0
@@ -596,6 +673,57 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Non-interactive action mode (SSH.JC Control Center backend). Runs one
+# function-backed operation with env-provided parameters, then exits.
+# ---------------------------------------------------------------------------
+if [[ -n "${SSHJC_ACTION:-}" ]]; then
+    case "$SSHJC_ACTION" in
+        update_sshd_security)
+            UPDATED=0
+            if [[ -n "${SSHJC_PERMIT_ROOT_LOGIN:-}" ]]; then
+                case "$SSHJC_PERMIT_ROOT_LOGIN" in
+                    yes|no|prohibit-password|forced-commands-only) ;;
+                    *) error "Invalid SSHJC_PERMIT_ROOT_LOGIN: '$SSHJC_PERMIT_ROOT_LOGIN'."; exit 1 ;;
+                esac
+                apply_sshd_directive "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN"
+                UPDATED=1
+            fi
+            if [[ -n "${SSHJC_PASSWORD_AUTHENTICATION:-}" ]]; then
+                case "$SSHJC_PASSWORD_AUTHENTICATION" in
+                    yes|no) ;;
+                    *) error "Invalid SSHJC_PASSWORD_AUTHENTICATION: '$SSHJC_PASSWORD_AUTHENTICATION'."; exit 1 ;;
+                esac
+                apply_sshd_directive "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION"
+                UPDATED=1
+            fi
+            if [[ "$UPDATED" -eq 0 ]]; then
+                error "SSHJC_ACTION=update_sshd_security needs SSHJC_PERMIT_ROOT_LOGIN and/or SSHJC_PASSWORD_AUTHENTICATION."
+                exit 1
+            fi
+            if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+                error "sshd_config invalid after update; restoring backup."
+                if [[ -n "${SSHD_LAST_BACKUP:-}" && -f "${SSHD_LAST_BACKUP:-}" ]]; then
+                    sudo cp -a "$SSHD_LAST_BACKUP" /etc/ssh/sshd_config
+                fi
+                exit 1
+            fi
+            [[ -n "${SSHJC_PERMIT_ROOT_LOGIN:-}" ]] && check_sshd_setting "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN"
+            [[ -n "${SSHJC_PASSWORD_AUTHENTICATION:-}" ]] && check_sshd_setting "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION"
+            ok "sshd security directives updated."
+            exit 0
+            ;;
+        toggle_sftp)
+            SSHJC_ENABLE_SFTP=1 ensure_sftp_enabled
+            exit 0
+            ;;
+        *)
+            error "Unknown SSHJC_ACTION: '$SSHJC_ACTION'."
+            exit 1
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 title "What do you want to do?"
@@ -681,7 +809,7 @@ if [[ "$DO_SSH" -eq 1 ]]; then
     echo "  1) Create a dedicated admin user with an SSH key (recommended)"
     echo "  2) Configure root access (password and/or key) - legacy, less secure"
     echo "  3) Skip user/access configuration for now"
-    ACCESS_MODE=$(ask "Choice (1-3)" "1")
+    ACCESS_MODE=$(gui_env SSHJC_ACCESS_MODE || ask "Choice (1-3)" "1")
 
     case "$ACCESS_MODE" in
         1)
@@ -690,6 +818,10 @@ if [[ "$DO_SSH" -eq 1 ]]; then
         2)
             if confirm "Are you sure you want to enable root SSH access? A dedicated user (option 1) is safer."; then
                 if confirm "Do you want to set/change the root password now?"; then
+                    if gui_mode; then
+                        error "GUI mode: setting the root password interactively is not supported. Add an SSH key instead."
+                        exit 1
+                    fi
                     sudo passwd root
                     if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
                         backup_sshd_config_once
@@ -767,9 +899,9 @@ if [[ "$DO_INSTALL_CF" -eq 1 ]]; then
 
     echo "  1) Cloudflare Tunnel (cloudflared)"
     echo "  2) fxTunnel (fxtun.dev - SaaS, TCP tunnel with a token)"
-    TUNNEL_PROVIDER_CHOICE=$(ask "Choice (1-2)" "1")
+    TUNNEL_PROVIDER_CHOICE=$(gui_env SSHJC_PROVIDER || ask "Choice (1-2)" "1")
     case "$TUNNEL_PROVIDER_CHOICE" in
-        2) TUNNEL_PROVIDER="fxtunnel" ;;
+        fxtunnel|2) TUNNEL_PROVIDER="fxtunnel" ;;
         *) TUNNEL_PROVIDER="cloudflared" ;;
     esac
     # Remembered so later steps (run) know which provider was set up in
@@ -846,7 +978,11 @@ else
         # silently pull different cloudflared versions). Let the user pin a
         # specific tag; default to latest to keep the previous behavior for
         # anyone who just wants the newest release.
-        CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
+        if gui_mode; then
+            CF_VERSION=""
+        else
+            CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
+        fi
         if [[ -n "$CF_VERSION" ]]; then
             URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/${ASSET_NAME}"
         else
@@ -919,13 +1055,17 @@ fi
 if [[ "$DO_CREATE_TUNNEL" -eq 1 ]]; then
 
     if [[ -z "${TUNNEL_PROVIDER:-}" ]]; then
-        TUNNEL_PROVIDER=$(state_get provider)
+        if gui_mode && [[ -n "${SSHJC_PROVIDER:-}" ]]; then
+            TUNNEL_PROVIDER="$SSHJC_PROVIDER"
+        else
+            TUNNEL_PROVIDER=$(state_get provider)
+        fi
         if [[ -z "$TUNNEL_PROVIDER" ]]; then
             echo "  1) Cloudflare Tunnel (cloudflared)"
             echo "  2) fxTunnel (fxtun.dev - SaaS, TCP tunnel with a token)"
-            TUNNEL_PROVIDER_CHOICE=$(ask "Which provider is this for? (1-2)" "1")
+            TUNNEL_PROVIDER_CHOICE=$(gui_env SSHJC_PROVIDER || ask "Which provider is this for? (1-2)" "1")
             case "$TUNNEL_PROVIDER_CHOICE" in
-                2) TUNNEL_PROVIDER="fxtunnel" ;;
+                fxtunnel|2) TUNNEL_PROVIDER="fxtunnel" ;;
                 *) TUNNEL_PROVIDER="cloudflared" ;;
             esac
             state_set provider "$TUNNEL_PROVIDER"
@@ -937,7 +1077,10 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
 
     info "Generate a token from your fxtun.dev dashboard (sign up / log in, then create an API token)."
     FX_TOKEN=""
-    while true; do
+    if gui_mode && [[ -n "${SSHJC_FX_TOKEN:-}" ]]; then
+        FX_TOKEN="$SSHJC_FX_TOKEN"
+    fi
+    while [[ -z "$FX_TOKEN" ]]; do
         FX_TOKEN=$(ask "fxTunnel token (starts with sk_)" "")
         if [[ -z "$FX_TOKEN" ]]; then
             error "A token is required to use fxTunnel."
@@ -958,11 +1101,16 @@ else
     CERT_PATH="$HOME/.cloudflared/cert.pem"
     if [[ -f "$CERT_PATH" ]]; then
         ok "A certificate already exists ($CERT_PATH)."
-        if ! confirm "Do you want to log in again anyway (new login)?"; then
+        if gui_mode; then
+            info "Using the existing certificate (GUI mode)."
+        elif ! confirm "Do you want to log in again anyway (new login)?"; then
             info "Using the existing certificate."
         else
             cloudflared tunnel login
         fi
+    elif gui_mode; then
+        error "GUI mode: no Cloudflare certificate found. Run 'cloudflared tunnel login' once from a terminal, then retry."
+        exit 1
     else
         info "No certificate found. Starting login."
         info "A URL will be shown: open it in a browser, log in, and authorize your domain."
@@ -994,7 +1142,10 @@ else
 
     if [[ -n "$EXISTING_ID" ]]; then
         warn "A tunnel named '$TUNNEL_NAME' already exists (ID: $EXISTING_ID)."
-        if confirm "Reuse it?"; then
+        if gui_mode; then
+            info "Reusing the existing tunnel (GUI mode)."
+            TUNNEL_ID="$EXISTING_ID"
+        elif confirm "Reuse it?"; then
             TUNNEL_ID="$EXISTING_ID"
         else
             TUNNEL_NAME=$(ask_tunnel_name "New tunnel name" "${TUNNEL_NAME}-2")
@@ -1026,7 +1177,7 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]] && [[ "${TUNNEL_PROVIDER:-cloudflared}" != "fxtun
     echo
 
     while true; do
-        DOMAIN=$(ask "Your domain (already added to Cloudflare, e.g. jcversanb.dpdns.org)" "")
+        DOMAIN=$(gui_env SSHJC_DOMAIN || ask "Your domain (already added to Cloudflare, e.g. jcversanb.dpdns.org)" "")
         if [[ -z "$DOMAIN" ]]; then
             error "A domain is required to create the DNS route."
         else
@@ -1034,7 +1185,7 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]] && [[ "${TUNNEL_PROVIDER:-cloudflared}" != "fxtun
         fi
     done
 
-    SUBDOMAIN=$(ask "Subdomain name to use (e.g. ssh)" "ssh")
+    SUBDOMAIN=$(gui_env SSHJC_SUBDOMAIN || ask "Subdomain name to use (e.g. ssh)" "ssh")
 
     # Build the final hostname, avoiding a duplicated dot if the user left
     # the subdomain empty (in which case the root domain is routed).
@@ -1046,7 +1197,9 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]] && [[ "${TUNNEL_PROVIDER:-cloudflared}" != "fxtun
 
     echo
     info "Final hostname: ${BOLD}${SSH_HOSTNAME}${NC}"
-    if ! confirm "Is this correct?"; then
+    if gui_mode; then
+        info "Hostname confirmed (GUI mode)."
+    elif ! confirm "Is this correct?"; then
         SSH_HOSTNAME=$(ask "Enter the full hostname you want directly" "$SSH_HOSTNAME")
     fi
 
@@ -1095,7 +1248,14 @@ if [[ "$DO_RUN" -eq 1 ]]; then
 
     # FIX (Low #13 - audit 2): the port was previously accepted as-is with no
     # validation, so a typo would silently produce a broken tunnel URL.
-    while true; do
+    if gui_mode && [[ -n "${SSHJC_LOCAL_PORT:-}" ]]; then
+        LOCAL_PORT="$SSHJC_LOCAL_PORT"
+        if ! [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] || ! ((10#$LOCAL_PORT >= 1 && 10#$LOCAL_PORT <= 65535)); then
+            error "Invalid SSHJC_LOCAL_PORT: '$LOCAL_PORT'."
+            exit 1
+        fi
+    fi
+    while [[ -z "${LOCAL_PORT:-}" ]]; do
         LOCAL_PORT=$(ask "Local port to expose (SSH = 22)" "22")
         # FIX (Low #17 - audit 3): bash arithmetic treats a leading-zero
         # numeral (e.g. "022") as octal, which could validate/reject a port
@@ -1111,10 +1271,10 @@ if [[ "$DO_RUN" -eq 1 ]]; then
     echo "  2) Run in the background (nohup - stops on reboot)"
     if [[ -d /run/systemd/system ]]; then
         echo "  3) Install as a systemd service (recommended - survives reboots)"
-        RUN_MODE=$(ask "Run mode (1-3)" "3")
+        RUN_MODE=$(gui_env SSHJC_RUN_MODE || ask "Run mode (1-3)" "3")
     else
         warn "systemd not available here: option 3 won't work on this system."
-        RUN_MODE=$(ask "Run mode (1-2)" "2")
+        RUN_MODE=$(gui_env SSHJC_RUN_MODE || ask "Run mode (1-2)" "2")
     fi
 
     SERVICE_LABEL="cloudflared"

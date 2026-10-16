@@ -4,7 +4,8 @@ import {
   RotateCw,
   ChevronRight,
   Activity,
-  XOctagon
+  XOctagon,
+  LogOut
 } from 'lucide-react';
 import { SystemStatusResponse, JobState } from '../types';
 import { Button } from './ui/Button';
@@ -18,6 +19,8 @@ interface HeaderProps {
   activeJob: JobState | null;
   onCancelJob: (id: string) => void;
   onOpenSafeguard: () => void;
+  onLogout: () => void;
+  protectedPort: number;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -26,7 +29,9 @@ export const Header: React.FC<HeaderProps> = ({
   isRefreshing,
   activeJob,
   onCancelJob,
-  onOpenSafeguard
+  onOpenSafeguard,
+  onLogout,
+  protectedPort
 }) => {
   const tabTitles: Record<string, string> = {
     dashboard: 'Live Ingress Topology',
@@ -76,16 +81,16 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Action Controls */}
       <div className="flex items-center gap-2.5">
-        {/* Port 3000 Hardware Lock Badge Button */}
+        {/* Console Port Lock Badge Button */}
         <button
           onClick={onOpenSafeguard}
-          title="Click to view Port 3000 container isolation specs"
+          title="Click to view console-port isolation specs"
           className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#ef4444] rounded cursor-pointer transition-transform hover:scale-105"
         >
           <Badge variant="locked" pulse={true}>
             <span className="flex items-center gap-1.5">
               <PortGuardIcon size={12} />
-              <span>Port 3000 Locked</span>
+              <span>Port {protectedPort} Locked</span>
             </span>
           </Badge>
         </button>
@@ -100,6 +105,16 @@ export const Header: React.FC<HeaderProps> = ({
           title="Sync Host Telemetry"
         >
           <RotateCw className="w-3.5 h-3.5" />
+        </Button>
+
+        {/* Sign Out */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={onLogout}
+          title="Sign out of the Control Center"
+        >
+          <LogOut className="w-3.5 h-3.5" />
         </Button>
       </div>
     </header>

@@ -65,7 +65,7 @@ export const TopologyMap: React.FC<TopologyMapProps> = ({ status, onSelectNode }
           </div>
           <div className="flex items-center gap-1.5 text-[#ef4444]">
             <PortGuardIcon size={14} />
-            <span className="font-semibold">Port 3000 Locked</span>
+            <span className="font-semibold">Port {status.protectedInfra.port} Locked</span>
           </div>
         </div>
       </div>
@@ -193,7 +193,7 @@ export const TopologyMap: React.FC<TopologyMapProps> = ({ status, onSelectNode }
               </div>
               <div className="space-y-1.5 text-xs font-mono">
                 <div className="flex items-center justify-between text-[#ef4444]">
-                  <span>Port 3000:</span>
+                  <span>Port {status.protectedInfra.port}:</span>
                   <span className="font-semibold text-[10px] px-1.5 py-0.2 bg-[#ef4444]/15 rounded border border-[#ef4444]/30">LOCKED</span>
                 </div>
                 <div className="flex items-center justify-between text-[#10b981]">

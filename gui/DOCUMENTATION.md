@@ -1,99 +1,112 @@
 # SSH.JC Control Center — Architecture & Operations Guide
 
 ## 1. Executive Summary
-**SSH.JC Control Center** is a production-ready web management console for OpenSSH servers, Cloudflare Tunnels (`cloudflared`), and fxTunnel SaaS endpoints. It faithfully implements the operations defined in the official [JCVERSA/Ssh.jc](https://raw.githubusercontent.com/JCVERSA/Ssh.jc/refs/heads/main/Install.sh) installer while enforcing strict system safeguards to protect existing host infrastructure.
+**SSH.JC Control Center** is a web management console for OpenSSH servers, Cloudflare Tunnels (`cloudflared`), and fxTunnel SaaS endpoints. As of Phase 2, it no longer re-implements installer logic: every mutating operation executes the repository's own [`Install.sh`](../Install.sh) in its non-interactive GUI mode, keeping the script as the single source of truth. The console adds password authentication, parameter validation, live job logs, and a safeguard that prevents tunnels from targeting the console's own port.
 
 ---
 
 ## 2. Protected Infrastructure & Safeguard Architecture
 
-### Critical Protection: Host Port 3000
-The runtime environment already runs a protected Cloudflare tunnel and Node.js process on **port 3000** for the AI Studio preview environment.
-- **Port Locking**: Both frontend validation and server-side middleware strictly prohibit binding, tunneling, or redirecting port `3000`.
-- **Pre-Flight Safeguard**: Any job attempting `localPort: 3000` is immediately rejected with HTTP 403 (`SAFEGUARD DENIED`).
-- **Isolation**: SSH operations default to port `22` (or operator-configured ports like `2222`), preserving port `3000` unharmed.
+### Critical Protection: the console port
+The Control Center protects **its own listening port** (`GUI_PORT`, default `3000`): exposing the console through a tunnel would publish a management interface that can run installers.
+- **Port Locking**: Frontend validation and the backend job validator reject any job whose `localPort` equals the console port.
+- **Isolation**: SSH operations default to port `22` (or operator-configured ports like `2222`), preserving the console port unharmed.
+- The safeguard follows `GUI_PORT` if the console is moved to another port; it is not tied to a specific number or hosting environment.
 
 ---
 
 ## 3. Direct Mapping to Official `Install.sh` Capabilities
 
-| Script Menu Option | Control Center Feature | Backend Subprocess / API |
+All jobs spawn `bash Install.sh` (located via `SSHJC_SCRIPT_PATH`, default `../Install.sh`) with `SSHJC_NONINTERACTIVE=1`. Parameters travel in `SSHJC_*` environment variables; the few prompts remaining in GUI mode are answered, in order, on stdin.
+
+| Job type | Control Center feature | Script entry |
 | :--- | :--- | :--- |
-| **1) Full setup** | **Install Wizard (Option 1)** | `apt-get install openssh-server` + `cloudflared/fxtunnel` + DNS Route + Run |
-| **2) OpenSSH server only** | **SSH Management / Wizard (Option 2)** | `apt-get install openssh-server`, start `sshd`, create admin user, authorized_keys dedup |
-| **3) Install tunnel client only** | **Install Wizard (Option 3)** | Downloads `cloudflared-linux-{arch}.deb` with sha256 check or `fxtun.dev/install.sh` |
-| **4) Create / configure tunnel** | **Install Wizard (Option 4)** | `cloudflared tunnel create`, `cloudflared tunnel route dns`, or fxTunnel token storage |
-| **5) Run configured tunnel** | **Tunnel Manager / Wizard (Option 5)** | Runs background `nohup` or `systemd` unit with port validation |
-| **6) Stop / Status** | **Tunnel Manager & Dashboard** | Graceful process termination (`SIGTERM`) or `systemctl stop` |
+| `full_setup` | Install Wizard (Option 1) | Menu 1 (+ SSH access mode via `SSHJC_ACCESS_MODE`) |
+| `install_openssh` | SSH Management / Wizard (Option 2) | Menu 2 (access configuration skipped) |
+| `configure_admin_user` | SSH Management | Menu 2 with `SSHJC_USERNAME` / `SSHJC_PUBKEY` |
+| `install_tunnel_client` | Install Wizard (Option 3) | Menu 3 |
+| `configure_tunnel` | Install Wizard (Option 4) | Menu 4 (+ `SSHJC_DOMAIN` / `SSHJC_SUBDOMAIN` / `SSHJC_FX_TOKEN`) |
+| `run_tunnel` | Tunnel Manager / Wizard (Option 5) | Menu 5 (+ `SSHJC_RUN_MODE`) |
+| `stop_tunnel` | Tunnel Manager & Dashboard | Menu 6 → stop action for `SSHJC_TUNNEL_NAME` |
+| `update_sshd_security` | SSH Management | `SSHJC_ACTION=update_sshd_security` (+ directive env vars) |
+| `toggle_sftp` | SSH Management | `SSHJC_ACTION=toggle_sftp` |
+
+GUI-mode contract in `Install.sh`: prompts read answers from stdin and fail fast on EOF (never block on a TTY); interactive-only actions (root password change, browser-based `cloudflared tunnel login`) are refused with a clear error; `update_sshd_security` validates with `sshd -t` and restores the timestamped backup on failure.
 
 ---
 
 ## 4. Security & Safety Controls
 
-1. **Anti-Command Injection**: Zero arbitrary shell commands are accepted from the browser. Operations use fixed allowlisted handlers and argument arrays (`spawn`).
-2. **Secret Redaction**: API tokens (`sk_...`), private keys, and credentials are automatically scrubbed from stdout/stderr, log files, and API responses.
-3. **Concurrency Locking**: A global mutex ensures that conflicting installation or tunnel operations cannot run concurrently.
-4. **Configuration Preservation & Backups**: Any update to `/etc/ssh/sshd_config` creates an atomic timestamped backup (`sshd_config.bak.<timestamp>`) and executes syntax verification (`sshd -t`) before applying.
-5. **Authorized Keys Deduplication**: Public keys submitted are validated for standard OpenSSH format and checked with `grep -qF` before appending to prevent file corruption.
+1. **Authentication**: All API routes except `/api/health` and `/api/auth/*` require a session. Passwords are scrypt-hashed (see §6), compared in constant time, and login is rate-limited per IP. Session cookies are `HttpOnly`, `SameSite=Lax` (+ `Secure` behind HTTPS).
+2. **Anti-Command Injection**: No arbitrary shell commands are accepted from the browser. Jobs run a fixed script with an allowlisted environment and no shell interpolation of user input.
+3. **Secret Redaction**: API tokens (`sk_...`), private keys, and credentials are scrubbed from stdout/stderr, log files, and API responses; the fx token never appears in job records (stored as `***`).
+4. **Concurrency Locking**: A global mutex ensures conflicting operations cannot run concurrently. Jobs run in their own process group with a 15-minute timeout; cancel terminates the whole tree.
+5. **Configuration Preservation & Backups**: `sshd_config` updates create a timestamped backup (`sshd_config.bak-<timestamp>`) and are verified with `sshd -t`/`sshd -T` before the job reports success (handled inside `Install.sh`).
 
 ---
 
 ## 5. API Reference
 
-### System & Health
-- `GET /api/health`: Returns server status, uptime, and timestamp.
-- `GET /api/system/status`: Returns comprehensive system info, OpenSSH status, tunnels, and port 3000 safeguard metadata.
-- `GET /api/system/safeguards`: Returns protection specifications for locked port 3000.
+### Authentication & Health
+- `GET /api/health`: Open. Returns server status, uptime, and timestamp.
+- `POST /api/auth/login`: Body `{ password }`. Sets the session cookie.
+- `POST /api/auth/logout`: Clears the session.
+- `GET /api/auth/session`: Returns `{ authenticated: boolean }`.
+- All other routes return `401` without a valid session.
+
+### System
+- `GET /api/system/status`: System info, OpenSSH status, tunnels, safeguard metadata, active job.
+- `GET /api/system/safeguards`: Protection specifications for the console port.
 - `GET /api/system/logs?limit=100`: Aggregated system log stream with level tags (`info`, `ok`, `warn`, `error`).
 
 ### Operations & Jobs
-- `POST /api/jobs/execute`: Starts an asynchronous allowlisted job.
-  - Body: `{ type: "full_setup" | "install_openssh" | "install_tunnel_client" | "configure_tunnel" | "run_tunnel" | "stop_tunnel" | "configure_admin_user" | "update_sshd_security" | "toggle_sftp", parameters: {...}, dryRun: boolean }`
-- `GET /api/jobs/active`: Polls currently executing job.
-- `GET /api/jobs/history`: Returns list of recently executed jobs.
-- `GET /api/jobs/:id`: Returns specific job status, exit code, and live logs.
-- `POST /api/jobs/:id/cancel`: Gracefully stops the running job process via `SIGTERM`.
+- `POST /api/jobs/execute`: Starts an asynchronous job.
+  - Body: `{ type: "full_setup" | "install_openssh" | "install_tunnel_client" | "configure_tunnel" | "run_tunnel" | "stop_tunnel" | "configure_admin_user" | "update_sshd_security" | "toggle_sftp", parameters: {...} }`
+- `GET /api/jobs/active`: Currently executing job.
+- `GET /api/jobs/history`: Recently executed jobs.
+- `GET /api/jobs/:id`: Job status, exit code, and live logs.
+- `POST /api/jobs/:id/cancel`: Terminates the running job's process group.
 
 ### SSH & Tunnels
-- `GET /api/ssh/config`: Inspects `/etc/ssh/sshd_config` and list of recovery backups.
-- `POST /api/tunnels/stop`: Terminate an active tunnel by name.
+- `GET /api/ssh/config`: Inspects `/etc/ssh/sshd_config` and lists recovery backups.
+- `POST /api/tunnels/stop`: Stops an active tunnel by name (script menu 6).
 
 ---
 
 ## 6. Installation & Launch Instructions
 
+### Configuration (`.env` or environment)
+```bash
+GUI_PORT=3000                 # console port (protected from tunnels)
+GUI_PASSWORD=change-me        # console password (plaintext), OR:
+# GUI_PASSWORD_HASH=...       # preferred: npm run set-password -- 'your-password'
+# SSHJC_SCRIPT_PATH=/path/to/Install.sh   # optional override
+```
+Without `GUI_PASSWORD`/`GUI_PASSWORD_HASH`, a random password is generated and printed once in the server log.
+
 ### Development & Local Testing
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Run automated test suite
-npm test
-
-# 3. Start full-stack application (Express API on port 3000 with Vite middleware)
-npm run dev
+npm test          # automated suite (uses a stub script; never runs Install.sh)
+npm run dev       # Express API + Vite middleware on GUI_PORT
 ```
 
-### Production Build & Container Deployment
+### Production
 ```bash
-# 1. Build frontend bundle
 npm run build
-
-# 2. Start production server
 NODE_ENV=production npm start
 ```
 
-### Target Container Deployment
-To deploy into a dedicated VPS or container:
-1. Transfer files or clone the repository into `/opt/ssh-jc-control-center`.
-2. Ensure Node.js 18+ and `tsx` or standard node are installed.
-3. Configure `PORT=3000` (or custom environment variable).
-4. Run as an administrative or sudo-capable user to manage `sshd` and `/etc/ssh/sshd_config`.
+### Target Deployment (same VPS as Install.sh)
+1. Clone `JCVERSA/Ssh.jc` on the VPS; the console lives in `gui/` and finds `../Install.sh` automatically.
+2. Install Node.js 20+ and run `npm install` inside `gui/`.
+3. Set `GUI_PASSWORD` (or a hash) in the environment; run as a sudo-capable user so jobs can manage `sshd` and `/etc/ssh/sshd_config`.
+4. Reach the console over SSH port-forwarding or a **separate, access-controlled** tunnel — never a public tunnel on the console port (the safeguard only blocks tunnel *jobs*, not your own ingress choices).
 
 ---
 
 ## 7. Automated Test Results
-Executed via `npm test` (`tsx test/api.test.ts`):
+Executed via `npm test` (`tsx test/api.test.ts`) — job execution is pointed at a stub via `SSHJC_SCRIPT_PATH`, so tests never invoke the real installer:
 - `Secret Redaction: masks fxTunnel API tokens (sk_...)`: **PASSED**
 - `Secret Redaction: masks OpenSSH private keys`: **PASSED**
 - `Safeguard: rejects operations targeting protected Port 3000`: **PASSED**
@@ -103,5 +116,10 @@ Executed via `npm test` (`tsx test/api.test.ts`):
 - `Validation: accepts standard OpenSSH public keys (RSA, Ed25519, ECDSA)`: **PASSED**
 - `Validation: rejects corrupted or invalid public keys`: **PASSED**
 - `Concurrency Lock: blocks concurrent overlapping execution jobs`: **PASSED**
+- `Script Driver: update_sshd_security maps to SSHJC_ACTION with env params`: **PASSED**
+- `Script Driver: stop_tunnel answers menu 6 stop sequence`: **PASSED**
+- `Script Driver: fx token never appears in the job summary`: **PASSED**
+- `Auth: scrypt hash verifies the right password and rejects wrong ones`: **PASSED**
+- `Binary Guard: hasBinary accurately detects installed vs missing system tools`: **PASSED**
 
-**Overall Test Suite: 9 Passed, 0 Failed.**
+**Overall Test Suite: 14 Passed, 0 Failed.**
