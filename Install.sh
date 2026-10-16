@@ -317,6 +317,12 @@ disable_password_auth_confirmed() {
 # this already-running shell never sees it, which used to fail the
 # post-install check below even after a successful install. Look in the
 # known install locations and add the directory to this session's PATH.
+# First version-looking line of `fxtunnel --version` (the client may print
+# its usage text first, which is not a version).
+fx_version() {
+    fxtunnel --version 2>&1 | grep -im1 -E 'version|v[0-9]+\.[0-9]+' || echo "version not reported"
+}
+
 ensure_fxtunnel_path() {
     command -v fxtunnel &>/dev/null && return 0
     local fx_dir
@@ -913,7 +919,7 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
 
     ensure_fxtunnel_path || true
     if command -v fxtunnel &>/dev/null; then
-        ok "fxTunnel is already installed ($(fxtunnel --version 2>&1 | head -1))."
+        ok "fxTunnel is already installed ($(fx_version))."
     else
         info "Downloading the fxTunnel installer from https://fxtun.dev/install.sh ..."
         FX_INSTALLER_TMP=$(mktemp "/tmp/fxtunnel-install-XXXXXX.sh")
@@ -951,7 +957,7 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
 
     ensure_fxtunnel_path || true
     if command -v fxtunnel &>/dev/null; then
-        ok "fxTunnel installed: $(fxtunnel --version 2>&1 | head -1)"
+        ok "fxTunnel installed: $(fx_version)"
     else
         error "fxtunnel does not appear to be installed correctly (not found in PATH)."
         warn "If install.sh placed it under ~/.local/bin, open a new shell or run: export PATH=\$PATH:\$HOME/.local/bin"
