@@ -17,9 +17,34 @@ non-interactive GUI mode.
 
 ## 2. Install
 
+### Fast install (recommended)
+
+On a fresh Debian/Ubuntu VPS, run as root:
+
 ```bash
-sudo git clone https://github.com/JCVERSA/Ssh.jc.git /opt/Ssh.jc
-# (or: cd /opt/Ssh.jc && sudo git pull)
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/scripts/install.sh)"
+```
+
+This clones the repository to `/opt/Ssh.jc`, installs Node.js if needed,
+runs `manage.sh setup` (dependencies, `.env`, console password, build,
+systemd service), and installs a global **`sshjc`** command:
+
+```bash
+sshjc status     # service + API health
+sshjc logs       # last 100 log lines
+sshjc password   # set/change the console password
+sshjc update     # git pull + rebuild + restart
+sshjc stop|start|restart
+```
+
+Already have a clone somewhere else? Point the installer at it:
+`bash scripts/install.sh --dir /path/to/Ssh.jc` (idempotent — it updates
+in place and never overwrites local modifications).
+
+### Manual install
+
+```bash
+sudo git clone -b arena/e89a71aa-ssh-jc https://github.com/JCVERSA/Ssh.jc.git /opt/Ssh.jc
 cd /opt/Ssh.jc/gui
 sudo npm ci          # full install (tsx is needed at runtime)
 npm test             # optional sanity check — never touches the system

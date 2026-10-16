@@ -75,9 +75,15 @@ operation runs this `Install.sh` in its non-interactive GUI mode
 remain the single source of truth. The console is password-protected
 (`GUI_PASSWORD`, see `gui/.env.example`) — see `gui/DOCUMENTATION.md`.
 
+**Rapid install on a VPS** (one line, then manage everything with `sshjc`):
+
 ```bash
-cd gui && npm install && npm run dev   # http://localhost:3000
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/scripts/install.sh)"
+# then: sshjc status | sshjc logs | sshjc update | sshjc password
 ```
+
+Manual alternative: `cd gui && npm install && npm run dev` — see
+`gui/DEPLOYMENT.md` for the full walkthrough.
 
 ## Licence
 
