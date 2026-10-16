@@ -75,6 +75,8 @@ GUI-mode contract in `Install.sh`: prompts read answers from stdin and fail fast
 
 ## 6. Installation & Launch Instructions
 
+> Full VPS walkthrough (systemd unit, updates, troubleshooting): see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ### Configuration (`.env` or environment)
 ```bash
 GUI_PORT=3000                 # console port (protected from tunnels)
