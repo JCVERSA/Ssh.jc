@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-base: #030d18;
+    --surface-dim: #051424;
+    --surface-card: #0c1b2c;
+    --surface-container: #112234;
+    --surface-elevated: #182c42;
+    --surface-highest: #243a52;
+    --border-subtle: #1e334a;
+    --border-highlight: #2f4d6d;
+    --text-primary: #e6f1fc;
+    --text-secondary: #b5c7d8;
+    --text-muted: #7891a8;
+    --cyan: #00e5ff;
+    --cyan-dim: #008899;
+    --emerald: #10b981;
+    --amber: #f59e0b;
+    --crimson: #ef4444;
+  }
+
+  body {
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    font-family: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow-x: hidden;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-feature-settings: "tnum" 1;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Glass & Cybernetic Utilities */
+.glass-panel {
+  background: rgba(12, 27, 44, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(36, 58, 82, 0.6);
+}
+
+.glass-panel-elevated {
+  background: rgba(17, 34, 52, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(47, 77, 109, 0.7);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+}
+
+.glow-cyan {
+  box-shadow: 0 0 20px -3px rgba(0, 229, 255, 0.25);
+}
+
+.glow-cyan-sm {
+  box-shadow: 0 0 10px -2px rgba(0, 229, 255, 0.2);
+}
+
+.glow-emerald {
+  box-shadow: 0 0 20px -3px rgba(16, 185, 129, 0.25);
+}
+
+.glow-crimson {
+  box-shadow: 0 0 20px -3px rgba(239, 68, 68, 0.25);
+}
+
+/* Custom terminal scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #030d18;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e334a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2f4d6d;
+}
+
+/* Kinetic Telemetry Animations */
+@keyframes flowDash {
+  to {
+    stroke-dashoffset: -32;
+  }
+}
+
+.animate-flow-dash {
+  stroke-dasharray: 6 6;
+  animation: flowDash 1s linear infinite;
+}
+
+@keyframes pulseTelemetry {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+}
+
+.animate-pulse-telemetry {
+  animation: pulseTelemetry 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+@keyframes conduitGlow {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.animate-conduit-glow {
+  animation: conduitGlow 3s ease-in-out infinite;
+}

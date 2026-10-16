@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SSH.JC Control Center</title>
+    <meta name="description" content="Production-ready management console for OpenSSH, Cloudflare and fxTunnel endpoints, and protected infrastructure." />
+    <meta property="og:title" content="SSH.JC Control Center" />
+    <meta property="og:description" content="Production-ready management console for OpenSSH, Cloudflare and fxTunnel endpoints, and protected infrastructure." />
+    <meta property="og:type" content="website" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' fill='none'%3E%3Cpolygon points='32,4 56,18 56,46 32,60 8,46 8,18' stroke='%2300e5ff' stroke-width='3' stroke-linejoin='round'/%3E%3Ccircle cx='32' cy='26' r='7' fill='%23030d18' stroke='%2300e5ff' stroke-width='2'/%3E%3Cpath d='M27.5 30 L26 43 L38 43 L36.5 30 Z' fill='%23030d18' stroke='%2300e5ff' stroke-width='2'/%3E%3Ccircle cx='32' cy='26' r='3' fill='%2300e5ff'/%3E%3Cpath d='M32 30 V41 M32 35 H35 M32 38.5 H36' stroke='%2300e5ff' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='32' cy='4' r='2' fill='%2300e5ff'/%3E%3Ccircle cx='32' cy='60' r='2' fill='%2300e5ff'/%3E%3C/svg%3E" />
+    <script>
+      // Gracefully prevent unhandled WebSocket/HMR disconnect rejections in sandboxed iframe runtime
+      (function() {
+        function isViteHmr(val) {
+          if (!val) return false;
+          var str = typeof val === 'string' ? val : (val.message || val.stack || String(val));
+          return (
+            str.indexOf('WebSocket') !== -1 ||
+            str.indexOf('createWebSocketModuleRunnerTransport') !== -1 ||
+            str.indexOf('@vite/client') !== -1
+          );
+        }
+        window.addEventListener('unhandledrejection', function(event) {
+          if (isViteHmr(event.reason)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+        window.addEventListener('error', function(event) {
+          if (isViteHmr(event.message) || isViteHmr(event.filename)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-[#051424] text-[#d4e4fa] antialiased selection:bg-[#00e5ff]/20 selection:text-[#c3f5ff] min-h-screen">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+{
+  "name": "SSH.JC Control Center",
+  "description": "Production-ready management console for OpenSSH, Cloudflare and fxTunnel endpoints, and protected infrastructure.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

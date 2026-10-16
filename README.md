@@ -65,6 +65,18 @@ See `AUDIT-2026-10-16-fullstack-v2.1.md` for the security/quality audit
 these scripts were hardened against, including finding IDs (F-01…F-11)
 referenced in code comments.
 
+## Web GUI (optional)
+
+`gui/` contains the **SSH.JC Control Center** (React + Express): a web
+console for the operations above (dashboard, install wizard, SSH and
+tunnel management, logs). It is under active development — see
+`gui/DOCUMENTATION.md`. It is not a replacement for the scripts; the
+scripts remain the source of truth.
+
+```bash
+cd gui && npm install && npm run dev   # http://localhost:3000
+```
+
 ## Licence
 
 No licence specified yet.
