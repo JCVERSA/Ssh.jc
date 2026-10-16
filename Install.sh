@@ -256,6 +256,24 @@ disable_password_auth_confirmed() {
     fi
 }
 
+# The vendor installer puts the fxtunnel binary in ~/.local/bin but only
+# arranges for FUTURE shells to have it on PATH (via .bashrc/.profile);
+# this already-running shell never sees it, which used to fail the
+# post-install check below even after a successful install. Look in the
+# known install locations and add the directory to this session's PATH.
+ensure_fxtunnel_path() {
+    command -v fxtunnel &>/dev/null && return 0
+    local fx_dir
+    for fx_dir in "$HOME/.local/bin" "/usr/local/bin"; do
+        if [[ -x "${fx_dir}/fxtunnel" ]]; then
+            export PATH="${fx_dir}:${PATH}"
+            info "Added ${fx_dir} to PATH for this session (fxtunnel found there)."
+            return 0
+        fi
+    done
+    return 1
+}
+
 create_admin_user() {
     local username pubkey
     while true; do
@@ -575,6 +593,7 @@ if [[ "$DO_INSTALL_CF" -eq 1 ]]; then
 if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
     title "Installing fxTunnel"
 
+    ensure_fxtunnel_path || true
     if command -v fxtunnel &>/dev/null; then
         ok "fxTunnel is already installed ($(fxtunnel --version 2>&1 | head -1))."
     else
@@ -612,6 +631,7 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         rm -f "$FX_INSTALLER_TMP"
     fi
 
+    ensure_fxtunnel_path || true
     if command -v fxtunnel &>/dev/null; then
         ok "fxTunnel installed: $(fxtunnel --version 2>&1 | head -1)"
     else
@@ -928,6 +948,7 @@ if [[ "$DO_RUN" -eq 1 ]]; then
         # in argv, visible to every local user in `ps aux` for the whole
         # life of the tunnel. The client reads FXTUNNEL_TOKEN from its
         # environment instead (vendor-documented), so keep it out of argv.
+        ensure_fxtunnel_path || true
         CMD_ARR=(fxtunnel tcp "${LOCAL_PORT}")
     else
         CMD_ARR=(cloudflared tunnel run --url "ssh://localhost:${LOCAL_PORT}" "${TUNNEL_NAME}")

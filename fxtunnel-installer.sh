@@ -66,6 +66,20 @@ else
     rm -f "$FX_INSTALLER_TMP"
 fi
 
+# L'installeur officiel place le binaire dans ~/.local/bin mais ne met à
+# jour que les FUTURS shells (.bashrc/.profile) : ce shell-ci ne le voit
+# pas, ce qui faisait échouer la vérification ci-dessous même après une
+# installation réussie. On ajoute nous-mêmes le dossier au PATH.
+if ! command -v fxtunnel >/dev/null 2>&1; then
+    for fx_dir in "$HOME/.local/bin" "/usr/local/bin"; do
+        if [[ -x "${fx_dir}/fxtunnel" ]]; then
+            export PATH="${fx_dir}:$PATH"
+            echo -e "${GREEN}${fx_dir} ajouté au PATH pour cette session (fxtunnel trouvé).${NC}"
+            break
+        fi
+    done
+fi
+
 if ! command -v fxtunnel >/dev/null 2>&1; then
     echo -e "${RED}Erreur : fxtunnel n'a pas été trouvé après installation.${NC}"
     echo -e "${RED}Vérifie que /usr/local/bin est dans ton PATH.${NC}"
