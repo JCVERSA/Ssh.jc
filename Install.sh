@@ -1219,6 +1219,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 6: Run the tunnel
+TUNNEL_START_FAILED=0
 # ---------------------------------------------------------------------------
 if [[ "$DO_RUN" -eq 1 ]]; then
     title "Running the tunnel"
@@ -1335,6 +1336,7 @@ EOF
                     info "Logs: sudo journalctl -u cloudflared -f"
                 else
                     error "The cloudflared service does not look active. Check: sudo journalctl -u cloudflared -e"
+                    TUNNEL_START_FAILED=1
                 fi
             else
                 error "Failed to install/start the cloudflared systemd service."
@@ -1383,6 +1385,7 @@ EOF
                     info "Logs: sudo journalctl -u $UNIT_NAME -f"
                 else
                     error "The $UNIT_NAME service does not look active. Check: sudo journalctl -u $UNIT_NAME -e"
+                    TUNNEL_START_FAILED=1
                 fi
             else
                 error "Failed to install/start the $UNIT_NAME systemd service."
@@ -1425,6 +1428,7 @@ EOF
             fi
         else
             error "The tunnel appears to have failed to start. Check: $NOHUP_LOG"
+            TUNNEL_START_FAILED=1
         fi
     fi
 fi
@@ -1507,3 +1511,10 @@ else
 fi
 
 ok "Done. Full log available at: $LOG_FILE"
+
+# In GUI mode a tunnel that failed to start must fail the job: exiting 0
+# after the summary would make the console report a false success.
+if gui_mode && [[ "${TUNNEL_START_FAILED:-0}" -eq 1 ]]; then
+    error "Tunnel failed to start (GUI mode: exiting with a failure status)."
+    exit 1
+fi

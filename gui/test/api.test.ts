@@ -47,6 +47,12 @@ async function runTests() {
     assert(redacted.includes('[***PRIVATE KEY REDACTED***]'), 'Did not insert key redacted token');
   });
 
+  test('Secret Redaction: masks password= values but not plain sentences', () => {
+    assert(redactSecrets('connect with password=Sup3rSecret now').includes('password=***REDACTED***'));
+    const sentence = 'Configure root access (password and/or key) - password can still log in';
+    assert.strictEqual(redactSecrets(sentence), sentence, 'Plain sentences must not be mangled');
+  });
+
   // 2. Protected Infrastructure & Safeguard Tests
   test('Safeguard: rejects operations targeting protected Port 3000', () => {
     const validation = jobManager.validateParameters('run_tunnel', {

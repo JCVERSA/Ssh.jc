@@ -21,7 +21,7 @@ export function redactSecrets(text: string): string {
   return text
     .replace(/(sk_[a-zA-Z0-9_\-]{8,})/g, 'sk_***REDACTED***')
     .replace(/(-----BEGIN [A-Z\s]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z\s]+ PRIVATE KEY-----)/g, '[***PRIVATE KEY REDACTED***]')
-    .replace(/(password[=:\s]+)([^\s,;]+)/gi, '$1***REDACTED***');
+    .replace(/(password\s*[=:]\s*)(\S+)/gi, '$1***REDACTED***');
 }
 
 export function getProtectedInfra(): ProtectedInfrastructure {
