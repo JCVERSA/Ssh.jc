@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check (bash -n)
+        run: |
+          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh; do
+            echo "== $f"
+            bash -n "$f"
+          done
+
+      - name: Scripts are executable
+        run: |
+          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh; do
+            test -x "$f" || { echo "$f is not executable"; exit 1; }
+          done
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: ShellCheck
+        run: shellcheck Install.sh fxtunnel-installer.sh share-file-v2.sh

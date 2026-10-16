@@ -11,6 +11,8 @@
 # Design goals:
 #   - never modify the source directory
 #   - expose only the generated ZIP, never the source tree
+#   - never follow symbolic links: links are stored as links, so files
+#     outside the source tree are never pulled into the archive
 #   - isolate Cloudflare config from any existing ~/.cloudflared/config.yaml
 #   - verify ZIP integrity
 #   - verify the local HTTP endpoint
@@ -106,7 +108,7 @@ Usage:
   $0 /path/to/folder
 
 Examples:
-  $0 /root/swiftslate-secrets
+  $0 /root/project-files
   $0 /var/backups/project
 
 The source directory is read-only from this script's point of view.
@@ -399,9 +401,21 @@ create_zip() {
 
     info "Creating archive..."
 
+    # Without -y, Info-ZIP follows symbolic links and archives the TARGET's
+    # contents, which can pull files from outside the source tree into the
+    # public archive. Store links as links instead, and say so up front.
+    local link_list
+    link_list="$(find "$SOURCE_DIR" -type l -print 2>/dev/null || true)"
+    if [[ -n "$link_list" ]]; then
+        warn_msg "Symbolic links in the source are stored as links; their targets are NOT included:"
+        while IFS= read -r link_path; do
+            printf '         %s\n' "$link_path"
+        done <<< "$link_list"
+    fi
+
     (
         cd -- "$(dirname -- "$SOURCE_DIR")"
-        zip -q -r "$ZIP_PATH" "$SOURCE_NAME"
+        zip -q -r -y "$ZIP_PATH" "$SOURCE_NAME"
     ) || die "ZIP creation failed."
 
     [[ -s "$ZIP_PATH" ]] || die "Created ZIP is empty."

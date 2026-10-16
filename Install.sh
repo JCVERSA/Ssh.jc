@@ -113,6 +113,54 @@ check_sshd_setting() {
     fi
 }
 
+# Validates a Linux username before it reaches useradd / /home/<name> paths.
+# FIX (Phase 2, F-04): the name was previously taken from interactive input
+# unchecked, so values with '/', '..', spaces or a leading '-' could escape
+# the intended paths or be parsed as command options. Allowlist matching
+# Debian's own username rules instead.
+is_valid_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]] && (( ${#1} <= 32 ))
+}
+
+# Validates a tunnel name. The name is used as a path component under
+# STATE_DIR/tunnels/<name>/, inside a /tmp mktemp template, and as a
+# systemd unit suffix, so it must be a single safe path component.
+# FIX (Phase 2, F-04): same unchecked-input problem as the username above.
+is_valid_tunnel_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ && "$1" != *".."* && "$1" != -* && "$1" != "." ]]
+}
+
+# Asks for a tunnel name until a valid one is entered (see above).
+ask_tunnel_name() {
+    local name
+    while true; do
+        name=$(ask "$1" "$2")
+        if is_valid_tunnel_name "$name"; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+        error "Invalid tunnel name: '$name'. Use letters, digits, '.', '_' or '-' (no '..', no leading '-')." >&2
+    done
+}
+
+# Backs up /etc/ssh/sshd_config once per run, before the first in-place edit.
+# FIX (Phase 2, F-05): sshd_config was previously sed-edited with no backup;
+# `sshd -t` validation catches a broken file but there was no one-command
+# rollback. Idempotent: only the first call in a run does anything.
+backup_sshd_config_once() {
+    [[ "${SSHD_BACKUP_DONE:-0}" == "1" ]] && return 0
+    [[ -f /etc/ssh/sshd_config ]] || return 0
+    local backup
+    backup="/etc/ssh/sshd_config.bak-$(date +%Y%m%d-%H%M%S)"
+    if sudo cp -a /etc/ssh/sshd_config "$backup" 2>&1 | tee -a "$LOG_FILE"; then
+        sudo chmod 600 "$backup" 2>/dev/null || true
+        ok "Backup of sshd_config saved to $backup (restore: sudo cp -a $backup /etc/ssh/sshd_config)"
+        SSHD_BACKUP_DONE=1
+    else
+        warn "Could not back up /etc/ssh/sshd_config before editing it."
+    fi
+}
+
 # Ensures the SFTP subsystem is active. On Ubuntu/Debian, openssh-server
 # enables it out of the box (`Subsystem sftp ...` in the default
 # sshd_config), so this is normally a no-op; it only intervenes if that line
@@ -144,6 +192,7 @@ ensure_sftp_enabled() {
         return 1
     fi
 
+    backup_sshd_config_once
     if grep -qi '^#\?Subsystem[[:space:]]\+sftp' /etc/ssh/sshd_config 2>/dev/null; then
         sudo sed -i "s|^#\?Subsystem[[:space:]]\+sftp.*|Subsystem sftp ${sftp_server}|" /etc/ssh/sshd_config
     else
@@ -192,6 +241,7 @@ ensure_jq() {
 # Refactor (audit 4): previously duplicated near-identically in
 # create_admin_user and the root-access branch below.
 disable_password_auth_confirmed() {
+    backup_sshd_config_once
     sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
     if sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
         ok "Password authentication disabled for all accounts."
@@ -208,7 +258,13 @@ disable_password_auth_confirmed() {
 
 create_admin_user() {
     local username pubkey
-    username=$(ask "Username for the new admin account" "admin")
+    while true; do
+        username=$(ask "Username for the new admin account" "admin")
+        if is_valid_username "$username"; then
+            break
+        fi
+        error "Invalid username: '$username'. Use lowercase letters, digits, '_' or '-', starting with a letter or '_', max 32 characters."
+    done
 
     if id "$username" &>/dev/null; then
         ok "User '$username' already exists."
@@ -432,10 +488,12 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                 if confirm "Do you want to set/change the root password now?"; then
                     sudo passwd root
                     if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
+                        backup_sshd_config_once
                         sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
                         warn "PermitRootLogin set to 'yes'. Root + password over a public tunnel is a significant exposure; consider adding a key and disabling password auth below."
                         check_sshd_setting "PermitRootLogin" "yes"
                     else
+                        backup_sshd_config_once
                         sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
                         info "PermitRootLogin left as 'prohibit-password': the root password will work locally (console) but NOT over SSH. Add a key below, or use option 1."
                         check_sshd_setting "PermitRootLogin" "prohibit-password"
@@ -456,6 +514,7 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                         else
                             sudo chmod 700 /root/.ssh
                             sudo chmod 600 /root/.ssh/authorized_keys
+                            backup_sshd_config_once
                             sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
                             ok "Key added for root (PermitRootLogin set to 'prohibit-password': key-only)."
                             check_sshd_setting "PermitRootLogin" "prohibit-password"
@@ -681,7 +740,7 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         fi
     done
 
-    TUNNEL_NAME=$(ask "Name to identify this tunnel locally (used only for this script's own bookkeeping)" "ssh-sandbox")
+    TUNNEL_NAME=$(ask_tunnel_name "Name to identify this tunnel locally (used only for this script's own bookkeeping)" "ssh-sandbox")
 
     tunnel_state_set "$TUNNEL_NAME" name "$TUNNEL_NAME"
     tunnel_state_set "$TUNNEL_NAME" token "$FX_TOKEN"
@@ -723,7 +782,7 @@ else
         cloudflared tunnel list --output json 2>/dev/null | jq -r --arg name "$1" '.[] | select(.name == $name) | .id' | head -1
     }
 
-    TUNNEL_NAME=$(ask "Name of the tunnel to create (or existing one to reuse)" "ssh-sandbox")
+    TUNNEL_NAME=$(ask_tunnel_name "Name of the tunnel to create (or existing one to reuse)" "ssh-sandbox")
 
     EXISTING_ID=$(get_tunnel_id "$TUNNEL_NAME")
 
@@ -732,7 +791,7 @@ else
         if confirm "Reuse it?"; then
             TUNNEL_ID="$EXISTING_ID"
         else
-            TUNNEL_NAME=$(ask "New tunnel name" "${TUNNEL_NAME}-2")
+            TUNNEL_NAME=$(ask_tunnel_name "New tunnel name" "${TUNNEL_NAME}-2")
             cloudflared tunnel create "$TUNNEL_NAME" 2>&1 | tee -a "$LOG_FILE"
             TUNNEL_ID=$(get_tunnel_id "$TUNNEL_NAME")
         fi
@@ -811,8 +870,15 @@ if [[ "$DO_RUN" -eq 1 ]]; then
             info "Using the last configured tunnel: $SAVED_NAME"
             TUNNEL_NAME="$SAVED_NAME"
         else
-            TUNNEL_NAME=$(ask "Name of the tunnel to run" "ssh-sandbox")
+            TUNNEL_NAME=$(ask_tunnel_name "Name of the tunnel to run" "ssh-sandbox")
         fi
+    fi
+
+    # Names loaded from saved state never passed the input validation
+    # above; reject anything unsafe before it reaches a file path.
+    if ! is_valid_tunnel_name "${TUNNEL_NAME:-}"; then
+        error "Invalid tunnel name: '${TUNNEL_NAME:-}'. Use letters, digits, '.', '_' or '-' (no '..', no leading '-')."
+        exit 1
     fi
 
     # Recover the provider chosen for this tunnel when running standalone
@@ -858,7 +924,11 @@ if [[ "$DO_RUN" -eq 1 ]]; then
             error "No fxTunnel token found for '$TUNNEL_NAME'. Re-run this script's tunnel setup step (menu option 4) first."
             exit 1
         fi
-        CMD_ARR=(fxtunnel tcp "${LOCAL_PORT}" -t "${FX_TOKEN}")
+        # FIX (Phase 2, F-06): the token used to be passed as '-t <token>'
+        # in argv, visible to every local user in `ps aux` for the whole
+        # life of the tunnel. The client reads FXTUNNEL_TOKEN from its
+        # environment instead (vendor-documented), so keep it out of argv.
+        CMD_ARR=(fxtunnel tcp "${LOCAL_PORT}")
     else
         CMD_ARR=(cloudflared tunnel run --url "ssh://localhost:${LOCAL_PORT}" "${TUNNEL_NAME}")
     fi
@@ -909,9 +979,9 @@ EOF
     elif [[ "$RUN_MODE" == "3" ]] && [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         # fxTunnel has no built-in "service install" subcommand (unlike
         # cloudflared); write a plain systemd unit instead. The token is
-        # passed via an Environment= line in a root-only-readable unit file
-        # rather than embedded in ExecStart, so it doesn't leak through
-        # `ps aux` / world-readable ExecStart in `systemctl cat`.
+        # passed only via an Environment= line in a root-only-readable
+        # unit file; the client reads FXTUNNEL_TOKEN itself, so the token
+        # never appears in ExecStart / argv either (FIX Phase 2, F-06).
         UNIT_NAME="fxtunnel-${TUNNEL_NAME}"
         FXTUNNEL_BIN_PATH=$(command -v fxtunnel)
         if [[ -z "$FXTUNNEL_BIN_PATH" ]]; then
@@ -929,7 +999,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=FXTUNNEL_TOKEN=${FX_TOKEN}
-ExecStart=${FXTUNNEL_BIN_PATH} tcp ${LOCAL_PORT} -t \${FXTUNNEL_TOKEN}
+ExecStart=${FXTUNNEL_BIN_PATH} tcp ${LOCAL_PORT}
 Restart=on-failure
 RestartSec=5
 
@@ -958,15 +1028,20 @@ EOF
     if [[ "$RUN_MODE" == "1" ]]; then
         info "Running in the foreground. Press Ctrl+C to stop."
         if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
-            info "Command: fxtunnel tcp ${LOCAL_PORT} -t <token>"
+            info "Command: FXTUNNEL_TOKEN=<hidden> fxtunnel tcp ${LOCAL_PORT}"
+            FXTUNNEL_TOKEN="$FX_TOKEN" "${CMD_ARR[@]}"
         else
             info "Command: ${CMD_ARR[*]}"
+            "${CMD_ARR[@]}"
         fi
-        "${CMD_ARR[@]}"
     elif [[ "$RUN_MODE" == "2" ]]; then
         NOHUP_LOG=$(mktemp "/tmp/${SERVICE_LABEL}-${TUNNEL_NAME}-XXXXXX.log")
         info "Running in the background. Logs: $NOHUP_LOG"
-        nohup "${CMD_ARR[@]}" > "$NOHUP_LOG" 2>&1 &
+        if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
+            FXTUNNEL_TOKEN="$FX_TOKEN" nohup "${CMD_ARR[@]}" > "$NOHUP_LOG" 2>&1 &
+        else
+            nohup "${CMD_ARR[@]}" > "$NOHUP_LOG" 2>&1 &
+        fi
         TUNNEL_PID=$!
         sleep 3
         if kill -0 "$TUNNEL_PID" 2>/dev/null; then
