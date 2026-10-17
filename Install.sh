@@ -39,41 +39,28 @@ banner() {
     echo -e "${NC}"
 }
 
-# GUI / non-interactive mode (used by the SSH.JC Control Center backend):
-# with SSHJC_NONINTERACTIVE=1, prompts are answered from stdin and semantic
-# SSHJC_* env vars, EOF fails fast instead of hanging forever, and
-# interactive-only operations are refused rather than blocking on a TTY.
-gui_mode() { [[ "${SSHJC_NONINTERACTIVE:-}" == "1" ]]; }
-gui_env() {
-    # gui_env VARNAME -> prints its value when set in GUI mode
-    if gui_mode && [[ -n "${!1:-}" ]]; then
-        printf '%s\n' "${!1}"
-        return 0
-    fi
-    return 1
-}
-
+# Interactive prompts. ask()/confirm() read from the terminal; ask_secret()
+# is used for credentials so tokens are not echoed back to the screen.
 ask() {
     # ask "question" "default_value"
     local question="$1"
     local default="${2:-}"
     local answer
-    if gui_mode; then
-        if ! IFS= read -r answer; then
-            echo "ERROR: non-interactive mode ran out of answers for: $question" >&2
+    if [[ -n "$default" ]]; then
+        if ! read -rp "$(echo -e "${BOLD}${question}${NC} [${default}]: ")" answer; then
+            echo "ERROR: input ended while waiting for: $question" >&2
             # ask() usually runs inside $(...): a plain exit would only kill
-            # the subshell and retry loops would spin forever on EOF.
+            # the subshell and EOF retry loops would spin forever.
             kill -TERM $$ 2>/dev/null
             exit 1
         fi
         echo "${answer:-$default}"
-        return
-    fi
-    if [[ -n "$default" ]]; then
-        read -rp "$(echo -e "${BOLD}${question}${NC} [${default}]: ")" answer
-        echo "${answer:-$default}"
     else
-        read -rp "$(echo -e "${BOLD}${question}${NC}: ")" answer
+        if ! read -rp "$(echo -e "${BOLD}${question}${NC}: ")" answer; then
+            echo "ERROR: input ended while waiting for: $question" >&2
+            kill -TERM $$ 2>/dev/null
+            exit 1
+        fi
         echo "$answer"
     fi
 }
@@ -82,14 +69,22 @@ confirm() {
     # confirm "question" -> returns 0 (yes) or 1 (no)
     local question="$1"
     local answer
-    if gui_mode; then
-        # EOF in GUI mode safely means "no" (never enable by default).
-        IFS= read -r answer || return 1
-        [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]
-        return
+    if ! read -rp "$(echo -e "${BOLD}${question}${NC} [y/N]: ")" answer; then
+        return 1
     fi
-    read -rp "$(echo -e "${BOLD}${question}${NC} [y/N]: ")" answer
     [[ "$answer" =~ ^([yY][eE][sS]|[yY])$ ]]
+}
+
+ask_secret() {
+    # ask_secret "prompt" -> prints the secret on stdout, prompt on stderr.
+    local prompt="$1" secret
+    if ! IFS= read -rsp "${prompt}: " secret; then
+        echo "ERROR: input ended while waiting for a secret." >&2
+        kill -TERM $$ 2>/dev/null
+        exit 1
+    fi
+    printf '\n' >&2
+    printf '%s\n' "$secret"
 }
 
 # Validates a pasted string looks like a real SSH public key (OpenSSH format).
@@ -137,8 +132,10 @@ check_sshd_setting() {
     actual=$(sudo sshd -T 2>/dev/null | awk -v d="${directive,,}" 'tolower($1)==d {print $2; exit}')
     if [[ -z "$actual" ]]; then
         warn "Could not determine the effective value of $directive (sshd -T). Verify manually after restart."
+        return 1
     elif [[ "${actual,,}" != "${expected,,}" ]]; then
         warn "Effective '$directive' is '$actual', not '$expected' as intended. A drop-in file under /etc/ssh/sshd_config.d/*.conf is likely overriding it (Ubuntu/cloud-init default). Edit that file directly or ensure it's included after sshd_config's own settings."
+        return 1
     else
         ok "Effective '$directive' confirmed as '$actual'."
     fi
@@ -163,15 +160,6 @@ is_valid_tunnel_name() {
 
 # Asks for a tunnel name until a valid one is entered (see above).
 ask_tunnel_name() {
-    if gui_mode && [[ -n "${SSHJC_TUNNEL_NAME:-}" ]]; then
-        if is_valid_tunnel_name "$SSHJC_TUNNEL_NAME"; then
-            printf '%s\n' "$SSHJC_TUNNEL_NAME"
-            return 0
-        fi
-        error "Invalid SSHJC_TUNNEL_NAME: '$SSHJC_TUNNEL_NAME'." >&2
-        kill -TERM $$ 2>/dev/null
-        exit 1
-    fi
     local name
     while true; do
         name=$(ask "$1" "$2")
@@ -196,7 +184,6 @@ backup_sshd_config_once() {
         sudo chmod 600 "$backup" 2>/dev/null || true
         ok "Backup of sshd_config saved to $backup (restore: sudo cp -a $backup /etc/ssh/sshd_config)"
         SSHD_BACKUP_DONE=1
-        SSHD_LAST_BACKUP="$backup"
     else
         error "Could not back up /etc/ssh/sshd_config before editing it."
         return 1
@@ -204,7 +191,7 @@ backup_sshd_config_once() {
 }
 
 # Sets one sshd_config directive (replacing a commented or active line, or
-# appending it), after a one-time backup. Used by the GUI SSHJC_ACTION mode.
+# appending it), after a one-time backup.
 apply_sshd_directive() {
     local directive="$1" value="$2"
     if ! backup_sshd_config_once; then
@@ -234,11 +221,7 @@ ensure_sftp_enabled() {
     fi
 
     warn "The SFTP subsystem is not active in the current sshd configuration."
-    if gui_mode && [[ "${SSHJC_ENABLE_SFTP:-0}" != "1" ]]; then
-        info "SFTP left disabled (GUI mode: use the SFTP toggle action to enable it)."
-        return 0
-    fi
-    if ! gui_mode && ! confirm "Enable SFTP now (adds a 'Subsystem sftp' line to /etc/ssh/sshd_config)?"; then
+    if ! confirm "Enable SFTP now (adds a 'Subsystem sftp' line to /etc/ssh/sshd_config)?"; then
         info "SFTP left disabled."
         return 0
     fi
@@ -253,11 +236,20 @@ ensure_sftp_enabled() {
         return 1
     fi
 
-    backup_sshd_config_once
+    if ! backup_sshd_config_once; then
+        error "Refusing to edit sshd_config without a backup."
+        return 1
+    fi
     if grep -qi '^#\?Subsystem[[:space:]]\+sftp' /etc/ssh/sshd_config 2>/dev/null; then
-        sudo sed -i "s|^#\?Subsystem[[:space:]]\+sftp.*|Subsystem sftp ${sftp_server}|" /etc/ssh/sshd_config
+        if ! sudo sed -i "s|^#\?Subsystem[[:space:]]\+sftp.*|Subsystem sftp ${sftp_server}|" /etc/ssh/sshd_config; then
+            error "Could not update the SFTP subsystem in sshd_config."
+            return 1
+        fi
     else
-        echo "Subsystem sftp ${sftp_server}" | sudo tee -a /etc/ssh/sshd_config > /dev/null
+        if ! echo "Subsystem sftp ${sftp_server}" | sudo tee -a /etc/ssh/sshd_config > /dev/null; then
+            error "Could not add the SFTP subsystem to sshd_config."
+            return 1
+        fi
     fi
 
     if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
@@ -268,7 +260,8 @@ ensure_sftp_enabled() {
     if sudo sshd -T 2>/dev/null | grep -qi '^subsystem sftp'; then
         ok "SFTP subsystem configured (${sftp_server})."
     else
-        warn "Could not confirm SFTP is active after the change. A drop-in file under /etc/ssh/sshd_config.d/*.conf may be interfering. Verify manually: sudo sshd -T | grep -i subsystem"
+        error "Could not confirm SFTP is active after the change. A drop-in file under /etc/ssh/sshd_config.d/*.conf may be interfering. Verify manually: sudo sshd -T | grep -i subsystem"
+        return 1
     fi
 
     if [[ -d /run/systemd/system ]]; then
@@ -307,8 +300,11 @@ disable_password_auth_confirmed() {
         return 1
     fi
     if sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
+        if ! check_sshd_setting "PasswordAuthentication" "no"; then
+            error "PasswordAuthentication could not be confirmed as disabled."
+            return 1
+        fi
         ok "Password authentication disabled for all accounts."
-        check_sshd_setting "PasswordAuthentication" "no"
         if [[ -d /run/systemd/system ]]; then
             warn "Restart sshd to apply changes: sudo systemctl restart ssh"
         else
@@ -316,6 +312,7 @@ disable_password_auth_confirmed() {
         fi
     else
         error "sshd_config now has a syntax error - DO NOT restart sshd until this is fixed, or you may lock yourself out. See $LOG_FILE."
+        return 1
     fi
 }
 
@@ -343,50 +340,81 @@ ensure_fxtunnel_path() {
     return 1
 }
 
-create_admin_user() {
-    local username pubkey
-    if [[ -n "${SSHJC_USERNAME:-}" ]] && gui_mode; then
-        username="$SSHJC_USERNAME"
-        if ! is_valid_username "$username"; then
-            error "Invalid SSHJC_USERNAME: '$username'."
-            return 1
-        fi
+is_valid_domain() {
+    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
+}
+
+is_valid_hostname() {
+    is_valid_domain "$1"
+}
+
+# Prints a root-owned, non-group/world-writable fxtunnel path safe for a
+# root systemd unit. A binary under ~/.local/bin is copied to /usr/local/bin
+# first; a root service must never execute a user-writable file.
+fx_systemd_bin_path() {
+    local src target owner_mode owner mode
+    src=$(command -v fxtunnel 2>/dev/null || true)
+    [[ -n "$src" ]] || return 1
+    target="/usr/local/bin/fxtunnel"
+    if [[ "$src" != "$target" ]]; then
+        sudo install -d -o root -g root -m 0755 /usr/local/bin || return 1
+        sudo install -o root -g root -m 0755 -- "$src" "$target" || return 1
+    else
+        sudo chown root:root "$target" || return 1
+        sudo chmod 0755 "$target" || return 1
     fi
-    while [[ -z "${username:-}" ]]; do
+    owner_mode=$(stat -c '%u %a' "$target" 2>/dev/null) || return 1
+    IFS=' ' read -r owner mode <<<"$owner_mode"
+    [[ "$owner" == "0" ]] || return 1
+    (( (8#$mode & 8#022) == 0 )) || return 1
+    printf '%s\n' "$target"
+}
+
+create_admin_user() {
+    local username pubkey user_home
+    while true; do
         username=$(ask "Username for the new admin account" "admin")
-        if is_valid_username "$username"; then
+        if is_valid_username "$username" && [[ "$username" != "root" ]]; then
             break
         fi
-        error "Invalid username: '$username'. Use lowercase letters, digits, '_' or '-', starting with a letter or '_', max 32 characters."
+        error "Invalid admin username: '$username'. Use lowercase letters, digits, '_' or '-', starting with a letter or '_', max 32 characters; use the root option for root."
     done
 
     if id "$username" &>/dev/null; then
         ok "User '$username' already exists."
+        user_home=$(getent passwd "$username" 2>/dev/null | cut -d: -f6)
+        [[ -n "$user_home" ]] || user_home="/home/$username"
+        if ! id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx 'sudo'; then
+            info "Adding existing user '$username' to the 'sudo' group."
+            if ! sudo usermod -aG sudo "$username" || ! id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx 'sudo'; then
+                error "Could not add '$username' to the 'sudo' group."
+                return 1
+            fi
+        fi
     else
         sudo useradd -m -s /bin/bash -G sudo "$username" 2>&1 | tee -a "$LOG_FILE"
         if id "$username" &>/dev/null; then
             ok "User '$username' created and added to the 'sudo' group."
+            user_home=$(getent passwd "$username" 2>/dev/null | cut -d: -f6)
+            [[ -n "$user_home" ]] || user_home="/home/$username"
         else
             error "Failed to create user '$username'. Check the log: $LOG_FILE"
             return 1
         fi
     fi
 
-    if gui_mode && [[ -v SSHJC_PUBKEY ]]; then
-        pubkey="$SSHJC_PUBKEY"
-    else
-        pubkey=$(ask "Paste the SSH public key for '$username' (contents of your .pub key)" "")
-    fi
+    pubkey=$(ask "Paste the SSH public key for '$username' (contents of your .pub key)" "")
     if [[ -n "$pubkey" ]]; then
         if ! is_valid_pubkey "$pubkey"; then
             warn "This doesn't look like a standard SSH public key format. Adding it anyway, but double-check it works before closing this session."
         fi
-        if ! add_key_dedup "$pubkey" "/home/$username/.ssh/authorized_keys"; then
-            error "Could not add the key for '$username'. Skipping ownership/permission changes and the password-disable prompt below."
+        if ! add_key_dedup "$pubkey" "${user_home}/.ssh/authorized_keys"; then
+            error "Could not add the key for '$username'."
+            return 1
         else
-            if ! sudo chown -R "${username}:${username}" "/home/$username/.ssh" || \
-               ! sudo chmod 700 "/home/$username/.ssh" || \
-               ! sudo chmod 600 "/home/$username/.ssh/authorized_keys"; then
+            if ! sudo chown -R "${username}:${username}" "${user_home}/.ssh" || \
+               ! sudo chmod 700 "${user_home}/.ssh" || \
+               ! sudo chmod 600 "${user_home}/.ssh/authorized_keys"; then
                 error "The key was written for '$username', but ownership/permissions could not be set; sshd may reject it."
                 return 1
             fi
@@ -400,7 +428,10 @@ create_admin_user() {
             # publicly reachable, silently undermining the "recommended" label.
             echo
             if confirm "Disable SSH password authentication for ALL accounts now that '$username' has a key? (recommended - do this only after confirming the key works)"; then
-                disable_password_auth_confirmed
+                if ! disable_password_auth_confirmed; then
+                    error "Password authentication could not be disabled safely."
+                    return 1
+                fi
             else
                 warn "Password authentication left enabled. Any local account with a password can still log in over SSH once the tunnel is public."
             fi
@@ -516,16 +547,6 @@ choose_saved_tunnel() {
     local -a tunnels=()
     mapfile -t tunnels < <(list_saved_tunnels)
     ((${#tunnels[@]} > 0)) || return 1
-    if gui_mode && [[ -n "${SSHJC_TUNNEL_NAME:-}" ]]; then
-        local _t
-        for _t in "${tunnels[@]}"; do
-            if [[ "$_t" == "$SSHJC_TUNNEL_NAME" ]]; then
-                printf '%s\n' "$_t"
-                return 0
-            fi
-        done
-        return 1
-    fi
     if ((${#tunnels[@]} == 1)); then
         printf '%s\n' "${tunnels[0]}"
         return 0
@@ -693,6 +714,8 @@ title "Pre-flight checks"
 require_root_tools
 
 if [[ -f /etc/os-release ]]; then
+    # /etc/os-release is a trusted runtime file provided by the OS.
+    # shellcheck disable=SC1091
     . /etc/os-release
     info "Detected system: ${PRETTY_NAME:-unknown Linux}"
     if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" && "${ID_LIKE:-}" != *"debian"* ]]; then
@@ -702,57 +725,6 @@ if [[ -f /etc/os-release ]]; then
 else
     warn "Could not detect the distribution (/etc/os-release missing)."
     confirm "Continue anyway?" || exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Non-interactive action mode (SSH.JC Control Center backend). Runs one
-# function-backed operation with env-provided parameters, then exits.
-# ---------------------------------------------------------------------------
-if [[ -n "${SSHJC_ACTION:-}" ]]; then
-    case "$SSHJC_ACTION" in
-        update_sshd_security)
-            UPDATED=0
-            if [[ -n "${SSHJC_PERMIT_ROOT_LOGIN:-}" ]]; then
-                case "$SSHJC_PERMIT_ROOT_LOGIN" in
-                    yes|no|prohibit-password|forced-commands-only) ;;
-                    *) error "Invalid SSHJC_PERMIT_ROOT_LOGIN: '$SSHJC_PERMIT_ROOT_LOGIN'."; exit 1 ;;
-                esac
-                apply_sshd_directive "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN" || exit 1
-                UPDATED=1
-            fi
-            if [[ -n "${SSHJC_PASSWORD_AUTHENTICATION:-}" ]]; then
-                case "$SSHJC_PASSWORD_AUTHENTICATION" in
-                    yes|no) ;;
-                    *) error "Invalid SSHJC_PASSWORD_AUTHENTICATION: '$SSHJC_PASSWORD_AUTHENTICATION'."; exit 1 ;;
-                esac
-                apply_sshd_directive "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION" || exit 1
-                UPDATED=1
-            fi
-            if [[ "$UPDATED" -eq 0 ]]; then
-                error "SSHJC_ACTION=update_sshd_security needs SSHJC_PERMIT_ROOT_LOGIN and/or SSHJC_PASSWORD_AUTHENTICATION."
-                exit 1
-            fi
-            if ! sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
-                error "sshd_config invalid after update; restoring backup."
-                if [[ -n "${SSHD_LAST_BACKUP:-}" && -f "${SSHD_LAST_BACKUP:-}" ]]; then
-                    sudo cp -a "$SSHD_LAST_BACKUP" /etc/ssh/sshd_config
-                fi
-                exit 1
-            fi
-            [[ -n "${SSHJC_PERMIT_ROOT_LOGIN:-}" ]] && check_sshd_setting "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN"
-            [[ -n "${SSHJC_PASSWORD_AUTHENTICATION:-}" ]] && check_sshd_setting "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION"
-            ok "sshd security directives updated."
-            exit 0
-            ;;
-        toggle_sftp)
-            SSHJC_ENABLE_SFTP=1 ensure_sftp_enabled
-            exit $?
-            ;;
-        *)
-            error "Unknown SSHJC_ACTION: '$SSHJC_ACTION'."
-            exit 1
-            ;;
-    esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -856,7 +828,7 @@ if [[ "$DO_SSH" -eq 1 ]]; then
     echo "  1) Create a dedicated admin user with an SSH key (recommended)"
     echo "  2) Configure root access (password and/or key) - legacy, less secure"
     echo "  3) Skip user/access configuration for now"
-    ACCESS_MODE=$(gui_env SSHJC_ACCESS_MODE || ask "Choice (1-3)" "1")
+    ACCESS_MODE=$(ask "Choice (1-3)" "1")
 
     case "$ACCESS_MODE" in
         1)
@@ -868,19 +840,16 @@ if [[ "$DO_SSH" -eq 1 ]]; then
         2)
             if confirm "Are you sure you want to enable root SSH access? A dedicated user (option 1) is safer."; then
                 if confirm "Do you want to set/change the root password now?"; then
-                    if gui_mode; then
-                        error "GUI mode: setting the root password interactively is not supported. Add an SSH key instead."
-                        exit 1
-                    fi
-                    sudo passwd root
-                    if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
+                    if ! sudo passwd root; then
+                        error "Failed to set the root password; root SSH settings were not changed."
+                    elif confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
                         if ! apply_sshd_directive "PermitRootLogin" "yes"; then error "Failed to set PermitRootLogin; stopping."; exit 1; fi
                         warn "PermitRootLogin set to 'yes'. Root + password over a public tunnel is a significant exposure; consider adding a key and disabling password auth below."
-                        check_sshd_setting "PermitRootLogin" "yes"
+                        if ! check_sshd_setting "PermitRootLogin" "yes"; then error "PermitRootLogin could not be confirmed as 'yes'; stopping."; exit 1; fi
                     else
                         if ! apply_sshd_directive "PermitRootLogin" "prohibit-password"; then error "Failed to set PermitRootLogin; stopping."; exit 1; fi
                         info "PermitRootLogin left as 'prohibit-password': the root password will work locally (console) but NOT over SSH. Add a key below, or use option 1."
-                        check_sshd_setting "PermitRootLogin" "prohibit-password"
+                        if ! check_sshd_setting "PermitRootLogin" "prohibit-password"; then error "PermitRootLogin could not be confirmed; stopping."; exit 1; fi
                     fi
                 else
                     warn "Remember to set a root password (or an SSH key) before connecting."
@@ -900,11 +869,11 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                             sudo chmod 600 /root/.ssh/authorized_keys
                             if ! apply_sshd_directive "PermitRootLogin" "prohibit-password"; then error "Failed to set PermitRootLogin for root; stopping."; exit 1; fi
                             ok "Key added for root (PermitRootLogin set to 'prohibit-password': key-only)."
-                            check_sshd_setting "PermitRootLogin" "prohibit-password"
+                            if ! check_sshd_setting "PermitRootLogin" "prohibit-password"; then error "PermitRootLogin could not be confirmed for root; stopping."; exit 1; fi
                             if confirm "Disable password login entirely now that a key is configured? (recommended)"; then
                                 if ! apply_sshd_directive "PasswordAuthentication" "no"; then error "Failed to disable password authentication; stopping."; exit 1; fi
                                 ok "Password authentication disabled."
-                                check_sshd_setting "PasswordAuthentication" "no"
+                                if ! check_sshd_setting "PasswordAuthentication" "no"; then error "PasswordAuthentication could not be confirmed as disabled; stopping."; exit 1; fi
                             fi
                             # FIX (Medium #12 - audit 2): validate config syntax before
                             # inviting the user to restart sshd, instead of assuming the
@@ -927,13 +896,20 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                 info "Root access configuration skipped."
             fi
             ;;
-        *)
+        3)
             info "User/access configuration skipped."
+            ;;
+        *)
+            error "Invalid access choice: '$ACCESS_MODE'."
+            exit 1
             ;;
     esac
 
     echo
-    ensure_sftp_enabled
+    if ! ensure_sftp_enabled; then
+        error "SFTP configuration failed. Stopping before the SSH step is reported complete."
+        exit 1
+    fi
 
     ok "SSH step complete."
 fi
@@ -946,7 +922,7 @@ if [[ "$DO_INSTALL_CF" -eq 1 ]]; then
 
     echo "  1) Cloudflare Tunnel (cloudflared)"
     echo "  2) fxTunnel (fxtun.dev - SaaS, TCP tunnel with a token)"
-    TUNNEL_PROVIDER_CHOICE=$(gui_env SSHJC_PROVIDER || ask "Choice (1-2)" "1")
+    TUNNEL_PROVIDER_CHOICE=$(ask "Choice (1-2)" "1")
     case "$TUNNEL_PROVIDER_CHOICE" in
         fxtunnel|2) TUNNEL_PROVIDER="fxtunnel" ;;
         *) TUNNEL_PROVIDER="cloudflared" ;;
@@ -976,15 +952,24 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
         # than cloudflared's API-digest lookup since it doesn't depend on
         # the GitHub API being reachable/unrate-limited at install time.
         # The installer script itself is served from the website, not a
-        # release asset, so it has no published checksum; require explicit
-        # confirmation before running it as-is, consistent with how an
-        # unverified cloudflared package is handled above.
-        warn "No published checksum is available for the install.sh script itself (only release binaries have checksums.txt); it will run with your current shell privileges."
-        if ! confirm "Review $FX_INSTALLER_TMP now if you want, then proceed with running it?"; then
-            error "Installation aborted by user (unverified installer script)."
+        # release asset, so it has no published checksum. Never execute it
+        # unless the user supplies an expected SHA-256 obtained from a
+        # trusted source and the downloaded file matches it.
+        warn "No published checksum is available for the install.sh script itself (only release binaries have checksums.txt)."
+        FX_INSTALLER_SHA256=$(ask "SHA-256 of fxtun.dev/install.sh from a trusted source (leave empty to abort)" "${FX_INSTALLER_SHA256:-}")
+        FX_INSTALLER_SHA256="${FX_INSTALLER_SHA256,,}"
+        if [[ ! "$FX_INSTALLER_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            error "A trusted SHA-256 is required before this installer script can be executed. Aborting."
             rm -f "$FX_INSTALLER_TMP"
             exit 1
         fi
+        FX_INSTALLER_ACTUAL_SHA=$(sha256sum "$FX_INSTALLER_TMP" | awk '{print $1}')
+        if [[ "$FX_INSTALLER_ACTUAL_SHA" != "$FX_INSTALLER_SHA256" ]]; then
+            error "fxTunnel installer checksum mismatch (expected $FX_INSTALLER_SHA256, got $FX_INSTALLER_ACTUAL_SHA). Aborting."
+            rm -f "$FX_INSTALLER_TMP"
+            exit 1
+        fi
+        ok "fxTunnel installer checksum verified (sha256)."
 
         if sh "$FX_INSTALLER_TMP" 2>&1 | tee -a "$LOG_FILE"; then
             ok "fxTunnel installer completed."
@@ -1025,11 +1010,7 @@ else
         # silently pull different cloudflared versions). Let the user pin a
         # specific tag; default to latest to keep the previous behavior for
         # anyone who just wants the newest release.
-        if gui_mode; then
-            CF_VERSION=""
-        else
-            CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
-        fi
+        CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
         if [[ -n "$CF_VERSION" ]] && [[ ! "$CF_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
             error "Invalid cloudflared version: '$CF_VERSION'."
             exit 1
@@ -1071,18 +1052,9 @@ else
                     exit 1
                 fi
             else
-                warn "No published checksum available via the GitHub API for this asset (rate limit, network issue, or API change). Integrity cannot be verified beyond the HTTPS download itself."
-                if gui_mode; then
-                    error "GUI mode: refusing to install cloudflared without a verified checksum."
-                    rm -f "$TMP_DEB"
-                    exit 1
-                fi
-                if ! confirm "Install this UNVERIFIED package anyway?"; then
-                    error "Installation aborted by user (unverified package)."
-                    rm -f "$TMP_DEB"
-                    exit 1
-                fi
-                warn "Proceeding with an unverified package, as confirmed."
+                error "No published checksum available via the GitHub API for this asset (rate limit, network issue, or API change). Refusing to install an unverified package as root."
+                rm -f "$TMP_DEB"
+                exit 1
             fi
 
             sudo dpkg -i "$TMP_DEB" 2>&1 | tee -a "$LOG_FILE"
@@ -1111,15 +1083,11 @@ fi
 if [[ "$DO_CREATE_TUNNEL" -eq 1 ]]; then
 
     if [[ -z "${TUNNEL_PROVIDER:-}" ]]; then
-        if gui_mode && [[ -n "${SSHJC_PROVIDER:-}" ]]; then
-            TUNNEL_PROVIDER="$SSHJC_PROVIDER"
-        else
-            TUNNEL_PROVIDER=$(state_get provider)
-        fi
+        TUNNEL_PROVIDER=$(state_get provider)
         if [[ -z "$TUNNEL_PROVIDER" ]]; then
             echo "  1) Cloudflare Tunnel (cloudflared)"
             echo "  2) fxTunnel (fxtun.dev - SaaS, TCP tunnel with a token)"
-            TUNNEL_PROVIDER_CHOICE=$(gui_env SSHJC_PROVIDER || ask "Which provider is this for? (1-2)" "1")
+            TUNNEL_PROVIDER_CHOICE=$(ask "Which provider is this for? (1-2)" "1")
             case "$TUNNEL_PROVIDER_CHOICE" in
                 fxtunnel|2) TUNNEL_PROVIDER="fxtunnel" ;;
                 *) TUNNEL_PROVIDER="cloudflared" ;;
@@ -1133,22 +1101,16 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
 
     info "Generate a token from your fxtun.dev dashboard (sign up / log in, then create an API token)."
     FX_TOKEN=""
-    if gui_mode && [[ -n "${SSHJC_FX_TOKEN:-}" ]]; then
-        FX_TOKEN="$SSHJC_FX_TOKEN"
-    fi
     while true; do
         if [[ -z "$FX_TOKEN" ]]; then
-            FX_TOKEN=$(ask "fxTunnel token (starts with sk_)" "")
+            FX_TOKEN=$(ask_secret "fxTunnel token (starts with sk_)")
         fi
         if [[ -z "$FX_TOKEN" ]]; then
             error "A token is required to use fxTunnel."
-        elif [[ "$FX_TOKEN" =~ ^sk_[^[:space:]]+$ ]]; then
+        elif [[ "$FX_TOKEN" =~ ^sk_[A-Za-z0-9][A-Za-z0-9._~+/=-]*$ ]]; then
             break
         else
-            error "Invalid fxTunnel token format (expected 'sk_' followed by non-whitespace characters)."
-            if gui_mode; then
-                exit 1
-            fi
+            error "Invalid fxTunnel token format (expected 'sk_' followed by letters, digits, '.', '_', '-', '~', '+', '/' or '=')."
             FX_TOKEN=""
         fi
     done
@@ -1165,16 +1127,11 @@ else
     CERT_PATH="$HOME/.cloudflared/cert.pem"
     if [[ -f "$CERT_PATH" ]]; then
         ok "A certificate already exists ($CERT_PATH)."
-        if gui_mode; then
-            info "Using the existing certificate (GUI mode)."
-        elif ! confirm "Do you want to log in again anyway (new login)?"; then
+        if ! confirm "Do you want to log in again anyway (new login)?"; then
             info "Using the existing certificate."
         else
             cloudflared tunnel login
         fi
-    elif gui_mode; then
-        error "GUI mode: no Cloudflare certificate found. Run 'cloudflared tunnel login' once from a terminal, then retry."
-        exit 1
     else
         info "No certificate found. Starting login."
         info "A URL will be shown: open it in a browser, log in, and authorize your domain."
@@ -1206,10 +1163,7 @@ else
 
     if [[ -n "$EXISTING_ID" ]]; then
         warn "A tunnel named '$TUNNEL_NAME' already exists (ID: $EXISTING_ID)."
-        if gui_mode; then
-            info "Reusing the existing tunnel (GUI mode)."
-            TUNNEL_ID="$EXISTING_ID"
-        elif confirm "Reuse it?"; then
+        if confirm "Reuse it?"; then
             TUNNEL_ID="$EXISTING_ID"
         else
             TUNNEL_NAME=$(ask_tunnel_name "New tunnel name" "${TUNNEL_NAME}-2")
@@ -1241,15 +1195,18 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]] && [[ "${TUNNEL_PROVIDER:-cloudflared}" != "fxtun
     echo
 
     while true; do
-        DOMAIN=$(gui_env SSHJC_DOMAIN || ask "Your domain (already added to Cloudflare, e.g. jcversanb.dpdns.org)" "")
-        if [[ -z "$DOMAIN" ]]; then
-            error "A domain is required to create the DNS route."
-        else
+        DOMAIN=$(ask "Your domain (already added to Cloudflare, e.g. jcversanb.dpdns.org)" "")
+        if is_valid_domain "$DOMAIN"; then
             break
         fi
+        error "Invalid domain: '$DOMAIN'. Enter a domain such as jcversanb.dpdns.org."
     done
 
-    SUBDOMAIN=$(gui_env SSHJC_SUBDOMAIN || ask "Subdomain name to use (e.g. ssh)" "ssh")
+    SUBDOMAIN=$(ask "Subdomain name to use (e.g. ssh)" "ssh")
+    while [[ -n "$SUBDOMAIN" ]] && [[ ! "$SUBDOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; do
+        error "Invalid subdomain: '$SUBDOMAIN'. Use DNS labels such as 'ssh' or 'ssh.internal'."
+        SUBDOMAIN=$(ask "Subdomain name to use (e.g. ssh)" "ssh")
+    done
 
     # Build the final hostname, avoiding a duplicated dot if the user left
     # the subdomain empty (in which case the root domain is routed).
@@ -1261,10 +1218,14 @@ if [[ "$DO_ROUTE_DNS" -eq 1 ]] && [[ "${TUNNEL_PROVIDER:-cloudflared}" != "fxtun
 
     echo
     info "Final hostname: ${BOLD}${SSH_HOSTNAME}${NC}"
-    if gui_mode; then
-        info "Hostname confirmed (GUI mode)."
-    elif ! confirm "Is this correct?"; then
-        SSH_HOSTNAME=$(ask "Enter the full hostname you want directly" "$SSH_HOSTNAME")
+    if ! confirm "Is this correct?"; then
+        while true; do
+            SSH_HOSTNAME=$(ask "Enter the full hostname you want directly" "$SSH_HOSTNAME")
+            if is_valid_hostname "$SSH_HOSTNAME"; then
+                break
+            fi
+            error "Invalid hostname: '$SSH_HOSTNAME'."
+        done
     fi
 
     info "DNS route: $SSH_HOSTNAME -> tunnel $TUNNEL_NAME"
@@ -1313,13 +1274,6 @@ if [[ "$DO_RUN" -eq 1 ]]; then
 
     # FIX (Low #13 - audit 2): the port was previously accepted as-is with no
     # validation, so a typo would silently produce a broken tunnel URL.
-    if gui_mode && [[ -n "${SSHJC_LOCAL_PORT:-}" ]]; then
-        LOCAL_PORT="$SSHJC_LOCAL_PORT"
-        if ! [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] || ! ((10#$LOCAL_PORT >= 1 && 10#$LOCAL_PORT <= 65535)); then
-            error "Invalid SSHJC_LOCAL_PORT: '$LOCAL_PORT'."
-            exit 1
-        fi
-    fi
     while [[ -z "${LOCAL_PORT:-}" ]]; do
         LOCAL_PORT=$(ask "Local port to expose (SSH = 22)" "22")
         # FIX (Low #17 - audit 3): bash arithmetic treats a leading-zero
@@ -1336,10 +1290,18 @@ if [[ "$DO_RUN" -eq 1 ]]; then
     echo "  2) Run in the background (nohup - stops on reboot)"
     if [[ -d /run/systemd/system ]]; then
         echo "  3) Install as a systemd service (recommended - survives reboots)"
-        RUN_MODE=$(gui_env SSHJC_RUN_MODE || ask "Run mode (1-3)" "3")
+        RUN_MODE=$(ask "Run mode (1-3)" "3")
+        if [[ ! "$RUN_MODE" =~ ^[123]$ ]]; then
+            error "Invalid run mode: '$RUN_MODE'. Choose 1, 2 or 3."
+            exit 1
+        fi
     else
         warn "systemd not available here: option 3 won't work on this system."
-        RUN_MODE=$(gui_env SSHJC_RUN_MODE || ask "Run mode (1-2)" "2")
+        RUN_MODE=$(ask "Run mode (1-2)" "2")
+        if [[ ! "$RUN_MODE" =~ ^[12]$ ]]; then
+            error "Invalid run mode: '$RUN_MODE'. Choose 1 or 2."
+            exit 1
+        fi
     fi
 
     SERVICE_LABEL="cloudflared"
@@ -1384,13 +1346,13 @@ if [[ "$DO_RUN" -eq 1 ]]; then
             RUN_MODE=2
         else
             info "Writing /etc/cloudflared/config.yml ..."
-            sudo mkdir -p /etc/cloudflared
-            sudo tee /etc/cloudflared/config.yml > /dev/null <<EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: ${CRED_FILE}
-url: ssh://localhost:${LOCAL_PORT}
-EOF
-            if sudo cloudflared service install 2>&1 | tee -a "$LOG_FILE" && \
+            if ! sudo mkdir -p /etc/cloudflared; then
+                error "Could not create /etc/cloudflared. Falling back to background mode."
+                RUN_MODE=2
+            elif ! printf 'tunnel: %s\ncredentials-file: %s\nurl: ssh://localhost:%s\n' "$TUNNEL_ID" "$CRED_FILE" "$LOCAL_PORT" | sudo tee /etc/cloudflared/config.yml > /dev/null; then
+                error "Could not write /etc/cloudflared/config.yml. Falling back to background mode."
+                RUN_MODE=2
+            elif sudo cloudflared service install 2>&1 | tee -a "$LOG_FILE" && \
                sudo systemctl enable --now cloudflared 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet cloudflared; then
@@ -1416,32 +1378,38 @@ EOF
         # unit file; the client reads FXTUNNEL_TOKEN itself, so the token
         # never appears in ExecStart / argv either (FIX Phase 2, F-06).
         UNIT_NAME="fxtunnel-${TUNNEL_NAME}"
-        FXTUNNEL_BIN_PATH=$(command -v fxtunnel)
-        if [[ -z "$FXTUNNEL_BIN_PATH" ]]; then
-            error "fxtunnel binary not found in PATH. Cannot install the systemd service."
+        UNIT_FILE="/etc/systemd/system/${UNIT_NAME}.service"
+        if ! FXTUNNEL_BIN_PATH=$(fx_systemd_bin_path); then
+            error "Could not prepare a root-owned fxtunnel binary under /usr/local/bin. Cannot install the systemd service safely."
             warn "Falling back to background mode."
             RUN_MODE=2
         else
-            info "Writing /etc/systemd/system/${UNIT_NAME}.service ..."
-            sudo install -m 600 /dev/null "/etc/systemd/system/${UNIT_NAME}.service"
-            sudo tee "/etc/systemd/system/${UNIT_NAME}.service" > /dev/null <<EOF
-[Unit]
-Description=fxTunnel (${TUNNEL_NAME}) - TCP tunnel for local port ${LOCAL_PORT}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=FXTUNNEL_TOKEN=${FX_TOKEN}
-ExecStart=${FXTUNNEL_BIN_PATH} tcp ${LOCAL_PORT}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            sudo chmod 600 "/etc/systemd/system/${UNIT_NAME}.service"
-            if sudo systemctl daemon-reload 2>&1 | tee -a "$LOG_FILE" && \
+            info "Writing ${UNIT_FILE} ..."
+            if ! sudo install -m 600 /dev/null "$UNIT_FILE"; then
+                error "Could not create ${UNIT_FILE}. Falling back to background mode."
+                RUN_MODE=2
+            elif ! printf '%s\n' \
+                '[Unit]' \
+                "Description=fxTunnel (${TUNNEL_NAME}) - TCP tunnel for local port ${LOCAL_PORT}" \
+                'After=network-online.target' \
+                'Wants=network-online.target' \
+                '' \
+                '[Service]' \
+                'Type=simple' \
+                "Environment=FXTUNNEL_TOKEN=${FX_TOKEN}" \
+                "ExecStart=${FXTUNNEL_BIN_PATH} tcp ${LOCAL_PORT}" \
+                'Restart=on-failure' \
+                'RestartSec=5' \
+                '' \
+                '[Install]' \
+                'WantedBy=multi-user.target' \
+                | sudo tee "$UNIT_FILE" > /dev/null; then
+                error "Could not write ${UNIT_FILE}. Falling back to background mode."
+                RUN_MODE=2
+            elif ! sudo chmod 600 "$UNIT_FILE"; then
+                error "Could not set permissions on ${UNIT_FILE}. Falling back to background mode."
+                RUN_MODE=2
+            elif sudo systemctl daemon-reload 2>&1 | tee -a "$LOG_FILE" && \
                sudo systemctl enable --now "$UNIT_NAME" 2>&1 | tee -a "$LOG_FILE"; then
                 sleep 2
                 if systemctl is-active --quiet "$UNIT_NAME"; then
@@ -1577,11 +1545,9 @@ else
     fi
 fi
 
-ok "Done. Full log available at: $LOG_FILE"
-
-# In GUI mode a tunnel that failed to start must fail the job: exiting 0
-# after the summary would make the console report a false success.
-if gui_mode && [[ "${TUNNEL_START_FAILED:-0}" -eq 1 ]]; then
-    error "Tunnel failed to start (GUI mode: exiting with a failure status)."
+if [[ "${TUNNEL_START_FAILED:-0}" -eq 1 ]]; then
+    error "Tunnel failed to start. See the log above for details."
     exit 1
 fi
+
+ok "Done. Full log available at: $LOG_FILE"
