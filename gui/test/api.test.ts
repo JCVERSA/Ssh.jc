@@ -2,7 +2,7 @@ import assert from 'assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { redactSecrets } from '../server/systemService.js';
+import { redactSecrets, parseFxEndpoint, buildConnectCommand } from '../server/systemService.js';
 import { jobManager } from '../server/jobManager.js';
 import { buildInvocation } from '../server/scriptService.js';
 import { hashPassword, verifyPassword } from '../server/auth.js';
@@ -157,7 +157,35 @@ async function runTests() {
     assert.strictEqual(inv.env.SSHJC_FX_TOKEN, 'sk_secret_123456');
   });
 
-  // 7. Password Auth
+  // 7. fxTunnel Endpoint Parsing & Connect Commands
+  test('fx Endpoint: parses the daemon-style TCP line and ignores the control server', () => {
+    const log = [
+      'Connecting to fxtunnel server fxtun.dev:4443 ...',
+      '2026-10-16T23:50:01Z INF TCP: fxtun.ru:12222',
+    ].join('\n');
+    assert.strictEqual(parseFxEndpoint(log), 'fxtun.ru:12222');
+
+    const bare = 'assigned 203.0.113.7:10022 for you';
+    assert.strictEqual(parseFxEndpoint(bare), '203.0.113.7:10022');
+
+    assert.strictEqual(parseFxEndpoint('nothing useful here'), undefined);
+    assert.strictEqual(parseFxEndpoint('only localhost:8080 and 127.0.0.1:22'), undefined);
+  });
+
+  test('Connect Command: built per provider from real endpoints', () => {
+    assert.strictEqual(
+      buildConnectCommand('fxtunnel', { publicEndpoint: 'fxtun.ru:12222', user: 'admin' }),
+      'ssh -p 12222 admin@fxtun.ru'
+    );
+    assert.strictEqual(
+      buildConnectCommand('cloudflared', { hostname: 'ssh.example.com', user: 'admin' }),
+      'ssh -o ProxyCommand="cloudflared access ssh --hostname ssh.example.com" admin@ssh.example.com'
+    );
+    assert.strictEqual(buildConnectCommand('fxtunnel', {}), undefined);
+    assert.strictEqual(buildConnectCommand('cloudflared', {}), undefined);
+  });
+
+  // 8. Password Auth
   test('Auth: scrypt hash verifies the right password and rejects wrong ones', () => {
     const hash = hashPassword('correct horse battery staple');
     assert(hash.startsWith('scrypt$'));

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Globe,
   Copy,
@@ -32,6 +32,15 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
 }) => {
   const { tunnels, system, ssh } = status;
   const [selectedTunnel, setSelectedTunnel] = useState<TunnelInstance | null>(tunnels[0] || null);
+
+  // Re-sync the selection when fresh status arrives (e.g. fxTunnel has just
+  // published its public endpoint) so commands appear without a page reload.
+  useEffect(() => {
+    setSelectedTunnel((prev) => {
+      if (!prev) return tunnels[0] || null;
+      return tunnels.find((t) => t.name === prev.name) || tunnels[0] || null;
+    });
+  }, [tunnels]);
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState(false);
 
@@ -88,11 +97,23 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
     }
   };
 
-  const activeHost = selectedTunnel?.hostname || 'ssh.example.com';
-  const connectUser = ssh.configuredUsers[0] || 'root';
-
-  const cloudflaredSshCmd = `ssh -o ProxyCommand="cloudflared access ssh --hostname ${activeHost}" ${connectUser}@${activeHost}`;
-  const cloudflaredSftpCmd = `sftp -o ProxyCommand="cloudflared access ssh --hostname ${activeHost}" ${connectUser}@${activeHost}`;
+  const connectUser = selectedTunnel?.connectUser || ssh.configuredUsers[0] || 'root';
+  const sshCmd = selectedTunnel?.connectCommand;
+  const fxHost = selectedTunnel?.publicEndpoint
+    ? selectedTunnel.publicEndpoint.slice(0, selectedTunnel.publicEndpoint.lastIndexOf(':'))
+    : undefined;
+  const fxPort = selectedTunnel?.publicEndpoint
+    ? selectedTunnel.publicEndpoint.slice(selectedTunnel.publicEndpoint.lastIndexOf(':') + 1)
+    : undefined;
+  const clientHost = selectedTunnel?.hostname || selectedTunnel?.publicEndpoint || '—';
+  const sftpCmd = !selectedTunnel
+    ? undefined
+    : selectedTunnel.provider === 'cloudflared' && selectedTunnel.hostname
+      ? `sftp -o ProxyCommand="cloudflared access ssh --hostname ${selectedTunnel.hostname}" ${connectUser}@${selectedTunnel.hostname}`
+      : fxHost && fxPort
+        ? `sftp -P ${fxPort} ${connectUser}@${fxHost}`
+        : undefined;
+  const prereqCmd = selectedTunnel?.provider === 'fxtunnel' ? 'pkg install openssh' : 'pkg install openssh cloudflared';
 
   return (
     <div className="space-y-6">
@@ -168,7 +189,7 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
                     >
                       <td className="py-3 px-3 font-semibold text-[#e6f1fc]">{t.name}</td>
                       <td className="py-3 px-3 text-[#38bdf8] uppercase font-semibold">{t.provider}</td>
-                      <td className="py-3 px-3 text-[#00e5ff] truncate max-w-xs">{t.hostname || 'Dynamic Port'}</td>
+                      <td className="py-3 px-3 text-[#00e5ff] truncate max-w-xs">{t.hostname || t.publicEndpoint || 'Dynamic Port'}</td>
                       <td className="py-3 px-3">
                         <span
                           className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-semibold ${
@@ -240,9 +261,9 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
             <div className="space-y-2">
               <span className="text-xs font-medium text-[#b5c7d8] block">1. Client Prerequisite Package:</span>
               <div className="p-3 bg-[#071320] border border-[#1e334a] rounded font-mono text-xs text-[#e6f1fc] flex items-center justify-between">
-                <code>pkg install openssh cloudflared</code>
+                <code>{prereqCmd}</code>
                 <button
-                  onClick={() => handleCopy('pkg install openssh cloudflared', 'req-termux')}
+                  onClick={() => handleCopy(prereqCmd, 'req-termux')}
                   className="p-1 hover:bg-[#112234] rounded text-[#7891a8] hover:text-[#00e5ff] cursor-pointer"
                   title="Copy command"
                 >
@@ -254,33 +275,49 @@ export const TunnelManager: React.FC<TunnelManagerProps> = ({
             {/* Step 2: SSH Command */}
             <div className="space-y-2">
               <span className="text-xs font-medium text-[#b5c7d8] block">2. Remote SSH Terminal Command:</span>
-              <div className="p-3 bg-[#071320] border border-[#1e334a] rounded font-mono text-xs text-[#00e5ff] flex items-center justify-between">
-                <code className="break-all">{cloudflaredSshCmd}</code>
-                <button
-                  onClick={() => handleCopy(cloudflaredSshCmd, 'ssh-cmd')}
-                  className="ml-2 p-1 hover:bg-[#112234] rounded text-[#7891a8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
-                  title="Copy command"
-                >
-                  {copiedCmd === 'ssh-cmd' ? <Check className="w-3.5 h-3.5 text-[#10b981]" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
-              </div>
+              {sshCmd ? (
+                <div className="p-3 bg-[#071320] border border-[#1e334a] rounded font-mono text-xs text-[#00e5ff] flex items-center justify-between">
+                  <code className="break-all">{sshCmd}</code>
+                  <button
+                    onClick={() => handleCopy(sshCmd, 'ssh-cmd')}
+                    className="ml-2 p-1 hover:bg-[#112234] rounded text-[#7891a8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
+                    title="Copy command"
+                  >
+                    {copiedCmd === 'ssh-cmd' ? <Check className="w-3.5 h-3.5 text-[#10b981]" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              ) : (
+                <div className="p-3 bg-[#071320] border border-[#1e334a] rounded text-xs text-[#b5c7d8]">
+                  {selectedTunnel.provider === 'fxtunnel'
+                    ? selectedTunnel.isRunning
+                      ? 'fxTunnel is starting: the assigned public address and the exact command will appear here automatically.'
+                      : 'Start the tunnel: as soon as fxTunnel assigns the public address, the exact connect command appears here.'
+                    : 'No hostname yet: run "Create / Configure Tunnel" (wizard option 4) so the DNS route exists.'}
+                </div>
+              )}
             </div>
 
             {/* Step 3: SFTP File Transfer */}
             <div className="space-y-2">
               <span className="text-xs font-medium text-[#b5c7d8] block">3. SFTP File Transfer Command:</span>
-              <div className="p-3 bg-[#071320] border border-[#1e334a] rounded font-mono text-xs text-[#e6f1fc] flex items-center justify-between">
-                <code className="break-all">{cloudflaredSftpCmd}</code>
-                <button
-                  onClick={() => handleCopy(cloudflaredSftpCmd, 'sftp-cmd')}
-                  className="ml-2 p-1 hover:bg-[#112234] rounded text-[#7891a8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
-                  title="Copy command"
-                >
-                  {copiedCmd === 'sftp-cmd' ? <Check className="w-3.5 h-3.5 text-[#10b981]" /> : <Copy className="w-3.5 h-3.5" />}
-                </button>
-              </div>
+              {sftpCmd ? (
+                <div className="p-3 bg-[#071320] border border-[#1e334a] rounded font-mono text-xs text-[#e6f1fc] flex items-center justify-between">
+                  <code className="break-all">{sftpCmd}</code>
+                  <button
+                    onClick={() => handleCopy(sftpCmd, 'sftp-cmd')}
+                    className="ml-2 p-1 hover:bg-[#112234] rounded text-[#7891a8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
+                    title="Copy command"
+                  >
+                    {copiedCmd === 'sftp-cmd' ? <Check className="w-3.5 h-3.5 text-[#10b981]" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              ) : (
+                <div className="p-3 bg-[#071320] border border-[#1e334a] rounded text-xs text-[#b5c7d8]">
+                  Available as soon as the SSH command above is known.
+                </div>
+              )}
               <p className="text-[11px] text-[#7891a8] leading-relaxed">
-                For FileZilla or WinSCP: choose protocol SFTP, host {activeHost}, and configure the ProxyCommand in advanced settings.
+                For FileZilla or WinSCP: choose protocol SFTP, host {clientHost}, and configure the ProxyCommand in advanced settings.
               </p>
             </div>
           </GlassCard>

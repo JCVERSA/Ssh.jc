@@ -31,6 +31,8 @@ All jobs spawn `bash Install.sh` (located via `SSHJC_SCRIPT_PATH`, default `../I
 | `update_sshd_security` | SSH Management | `SSHJC_ACTION=update_sshd_security` (+ directive env vars) |
 | `toggle_sftp` | SSH Management | `SSHJC_ACTION=toggle_sftp` |
 
+**Smart connection commands**: `GET /api/system/status` returns, per tunnel, the ready-to-paste `connectCommand` — Cloudflare: `ssh -o ProxyCommand="cloudflared access ssh --hostname …" user@host`; fxTunnel: `ssh -p <port> user@host` with the dynamically assigned endpoint parsed from the tunnel log (`TCP: host:port`) or the systemd journal. The wizard's completion panel and Tunnel Manager display it automatically (polled, no reload). Already-installed dependencies (sshd, cloudflared, fxtunnel) are detected and skipped by `Install.sh`; the wizard badges those steps "already present".
+
 GUI-mode contract in `Install.sh`: prompts read answers from stdin and fail fast on EOF (never block on a TTY); interactive-only actions (root password change, browser-based `cloudflared tunnel login`) are refused with a clear error; `update_sshd_security` validates with `sshd -t` and restores the timestamped backup on failure.
 
 ---

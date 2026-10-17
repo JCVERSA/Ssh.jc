@@ -237,6 +237,70 @@ export function getSshStatus(): SshStatus {
   };
 }
 
+function readLogTail(file: string, bytes = 65536): string {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const len = Math.min(size, bytes);
+      if (len === 0) return '';
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      return buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Extract the public host:port fxTunnel assigned to a TCP tunnel from its
+ * client log (e.g. "TCP: fxtun.ru:12222"). The control server port (4443)
+ * and localhost are never mistaken for the public endpoint. Returns the
+ * last match of the strongest matching pattern.
+ */
+export function parseFxEndpoint(logText: string): string | undefined {
+  const patterns = [
+    /TCP:\s*([a-zA-Z0-9.-]+):(\d{2,5})/gi,
+    /tcp:\/\/([a-zA-Z0-9.-]+):(\d{2,5})/gi,
+    /((?:\d{1,3}\.){3}\d{1,3}):(\d{2,5})/g,
+    /([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):(\d{2,5})/g,
+  ];
+  for (const re of patterns) {
+    let found: string | undefined;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(logText)) !== null) {
+      const host = m[1];
+      const port = Number(m[2]);
+      if (host === 'localhost' || host.startsWith('127.')) continue;
+      if (port === 4443 || port < 1 || port > 65535) continue;
+      found = `${host}:${port}`;
+    }
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** Build the ready-to-paste SSH command for a tunnel, per provider. */
+export function buildConnectCommand(
+  provider: 'cloudflared' | 'fxtunnel',
+  opts: { hostname?: string; publicEndpoint?: string; user?: string }
+): string | undefined {
+  const user = opts.user || 'root';
+  if (provider === 'cloudflared') {
+    if (!opts.hostname) return undefined;
+    return `ssh -o ProxyCommand="cloudflared access ssh --hostname ${opts.hostname}" ${user}@${opts.hostname}`;
+  }
+  if (!opts.publicEndpoint) return undefined;
+  const idx = opts.publicEndpoint.lastIndexOf(':');
+  if (idx <= 0) return undefined;
+  const host = opts.publicEndpoint.slice(0, idx);
+  const port = opts.publicEndpoint.slice(idx + 1);
+  return `ssh -p ${port} ${user}@${host}`;
+}
+
 export function getTunnels(): TunnelInstance[] {
   const tunnels: TunnelInstance[] = [];
   const tunnelsDir = path.join(STATE_DIR, 'tunnels');
@@ -280,6 +344,13 @@ export function getTunnels(): TunnelInstance[] {
           provider = 'fxtunnel';
         }
 
+        const portFile = path.join(itemPath, 'port');
+        let savedPort = 22;
+        if (fs.existsSync(portFile)) {
+          const parsed = parseInt(fs.readFileSync(portFile, 'utf8').trim(), 10);
+          if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) savedPort = parsed;
+        }
+
         let isRunning = false;
         let runMode: 'foreground' | 'background' | 'systemd' | 'unknown' = 'unknown';
 
@@ -303,17 +374,45 @@ export function getTunnels(): TunnelInstance[] {
           }
         }
 
+        // Smart connection info: the panel shows the exact SSH command
+        // for the chosen provider without any manual lookup.
+        let connectUser: string | undefined;
+        const userFile = path.join(STATE_DIR, 'user');
+        if (fs.existsSync(userFile)) {
+          connectUser = fs.readFileSync(userFile, 'utf8').trim() || undefined;
+        }
+
+        let publicEndpoint: string | undefined;
+        if (provider === 'fxtunnel') {
+          if (logFile && fs.existsSync(logFile)) {
+            publicEndpoint = parseFxEndpoint(readLogTail(logFile));
+          }
+          if (!publicEndpoint && runMode === 'systemd') {
+            const journal = safeExec(`journalctl -u fxtunnel-${name} -n 60 --no-pager 2>/dev/null`);
+            if (journal) publicEndpoint = parseFxEndpoint(journal);
+          }
+        }
+
+        const connectCommand = buildConnectCommand(provider, {
+          hostname,
+          publicEndpoint,
+          user: connectUser,
+        });
+
         tunnels.push({
           name,
           provider,
           hostname,
           domain,
-          targetPort: 22,
+          targetPort: savedPort,
           pid,
           isRunning,
           runMode,
           logFile,
-          tokenConfigured
+          tokenConfigured,
+          publicEndpoint,
+          connectUser,
+          connectCommand
         });
       }
     } catch {

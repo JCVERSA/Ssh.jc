@@ -23,6 +23,12 @@ export interface TunnelInstance {
   runMode: 'foreground' | 'background' | 'systemd' | 'unknown';
   logFile?: string;
   tokenConfigured?: boolean;
+  /** fxTunnel only: dynamically assigned public host:port (from the tunnel log). */
+  publicEndpoint?: string;
+  /** SSH user for the connect command (saved by Install.sh, default root). */
+  connectUser?: string;
+  /** Ready-to-paste SSH command matching the provider, when known. */
+  connectCommand?: string;
 }
 
 export interface ProtectedInfrastructure {

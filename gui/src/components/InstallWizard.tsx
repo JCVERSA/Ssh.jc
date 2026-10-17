@@ -123,10 +123,14 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
 
   const fullHostname = subdomain ? `${subdomain}.${domain}` : domain;
   const connectionUser = createAdmin && username ? username : 'root';
+  // The backend resolves the real endpoint (fxTunnel's dynamic host:port is
+  // parsed from the tunnel log) and the ready-to-paste command per provider.
+  const completedTunnel = status.tunnels.find((t) => t.name === tunnelName);
   const connectionCmd =
-    provider === 'cloudflared'
+    completedTunnel?.connectCommand ||
+    (provider === 'cloudflared' && domain
       ? `ssh -o ProxyCommand="cloudflared access ssh --hostname ${fullHostname}" ${connectionUser}@${fullHostname}`
-      : `ssh -p <port> ${connectionUser}@<fxtunnel-host>`;
+      : undefined);
 
   return (
     <div className="space-y-6">
@@ -199,6 +203,9 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
               onClick={() => setSelectedMode('install_openssh')}
             >
               <span className="font-mono text-xs text-[#38bdf8] font-semibold">OPTION 2</span>
+              {status.ssh.isRunning && (
+                <span className="ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#10b981]/15 border border-[#10b981]/30 text-[#10b981]">ALREADY RUNNING — SKIPPED</span>
+              )}
               <h3 className="text-sm font-semibold text-[#e6f1fc] mt-2">OpenSSH Server Only</h3>
               <p className="text-xs text-[#b5c7d8] mt-1 leading-relaxed">
                 Installs openssh-server, starts sshd daemon, creates admin user with authorized_keys, and enables SFTP.
@@ -211,6 +218,9 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
               onClick={() => setSelectedMode('install_tunnel_client')}
             >
               <span className="font-mono text-xs text-[#10b981] font-semibold">OPTION 3</span>
+              {(status.system.cloudflaredInstalled || status.system.fxtunnelInstalled) && (
+                <span className="ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#10b981]/15 border border-[#10b981]/30 text-[#10b981]">CLIENT ALREADY INSTALLED — SKIPPED</span>
+              )}
               <h3 className="text-sm font-semibold text-[#e6f1fc] mt-2">Install Tunnel Client Only</h3>
               <p className="text-xs text-[#b5c7d8] mt-1 leading-relaxed">
                 Downloads and installs official package: cloudflared (.deb with sha256 check) or fxTunnel binary.
@@ -235,6 +245,9 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
               onClick={() => setSelectedMode('run_tunnel')}
             >
               <span className="font-mono text-xs text-[#00e5ff] font-semibold">OPTION 5</span>
+              {status.tunnels.some((t) => t.isRunning) && (
+                <span className="ml-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#10b981]/15 border border-[#10b981]/30 text-[#10b981]">TUNNEL ALREADY RUNNING</span>
+              )}
               <h3 className="text-sm font-semibold text-[#e6f1fc] mt-2">Run Configured Tunnel</h3>
               <p className="text-xs text-[#b5c7d8] mt-1 leading-relaxed">
                 Launches configured tunnel in background (nohup) or as a systemd service, guarding the console port.
@@ -558,23 +571,32 @@ export const InstallWizard: React.FC<InstallWizardProps> = ({
                 <CheckCircle2 className="w-4 h-4" />
                 <span>Execution Succeeded</span>
               </div>
-              <p className="text-xs text-[#b5c7d8]">
-                Connect to your remote SSH server using the verified command below:
-              </p>
-              <div className="p-3 bg-[#030d18] rounded border border-[#1e334a] flex items-center justify-between font-mono text-xs text-[#00e5ff]">
-                <code className="break-all">{connectionCmd}</code>
-                <button
-                  onClick={() => {
-                    navigator.clipboard.writeText(connectionCmd);
-                    setCopiedCmd(true);
-                    setTimeout(() => setCopiedCmd(false), 2000);
-                  }}
-                  className="ml-2 p-1.5 hover:bg-[#112234] rounded text-[#b5c7d8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
-                  title="Copy command"
-                >
-                  {copiedCmd ? <Check className="w-4 h-4 text-[#10b981]" /> : <Copy className="w-4 h-4" />}
-                </button>
-              </div>
+              {connectionCmd ? (
+                <>
+                  <p className="text-xs text-[#b5c7d8]">
+                    Connect to your remote SSH server using the verified command below:
+                  </p>
+                  <div className="p-3 bg-[#030d18] rounded border border-[#1e334a] flex items-center justify-between font-mono text-xs text-[#00e5ff]">
+                    <code className="break-all">{connectionCmd}</code>
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(connectionCmd);
+                        setCopiedCmd(true);
+                        setTimeout(() => setCopiedCmd(false), 2000);
+                      }}
+                      className="ml-2 p-1.5 hover:bg-[#112234] rounded text-[#b5c7d8] hover:text-[#00e5ff] shrink-0 cursor-pointer"
+                      title="Copy command"
+                    >
+                      {copiedCmd ? <Check className="w-4 h-4 text-[#10b981]" /> : <Copy className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-[#b5c7d8]">
+                  fxTunnel assigns the public address when the tunnel starts: the exact connect
+                  command will appear here and in Tunnel Manager within a few seconds.
+                </p>
+              )}
             </div>
           )}
 
