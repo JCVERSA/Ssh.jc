@@ -169,6 +169,7 @@ ask_tunnel_name() {
             return 0
         fi
         error "Invalid SSHJC_TUNNEL_NAME: '$SSHJC_TUNNEL_NAME'." >&2
+        kill -TERM $$ 2>/dev/null
         exit 1
     fi
     local name
@@ -197,7 +198,8 @@ backup_sshd_config_once() {
         SSHD_BACKUP_DONE=1
         SSHD_LAST_BACKUP="$backup"
     else
-        warn "Could not back up /etc/ssh/sshd_config before editing it."
+        error "Could not back up /etc/ssh/sshd_config before editing it."
+        return 1
     fi
 }
 
@@ -205,8 +207,11 @@ backup_sshd_config_once() {
 # appending it), after a one-time backup. Used by the GUI SSHJC_ACTION mode.
 apply_sshd_directive() {
     local directive="$1" value="$2"
-    backup_sshd_config_once
-    if grep -q "^#\?${directive}[[:space:]]" /etc/ssh/sshd_config; then
+    if ! backup_sshd_config_once; then
+        error "Refusing to edit sshd_config without a backup."
+        return 1
+    fi
+    if sudo grep -q "^#\?${directive}[[:space:]]" /etc/ssh/sshd_config; then
         sudo sed -i "s/^#\?${directive}.*/${directive} ${value}/" /etc/ssh/sshd_config
     else
         echo "${directive} ${value}" | sudo tee -a /etc/ssh/sshd_config > /dev/null
@@ -297,8 +302,10 @@ ensure_jq() {
 # Refactor (audit 4): previously duplicated near-identically in
 # create_admin_user and the root-access branch below.
 disable_password_auth_confirmed() {
-    backup_sshd_config_once
-    sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+    if ! apply_sshd_directive "PasswordAuthentication" "no"; then
+        error "Could not update PasswordAuthentication in sshd_config."
+        return 1
+    fi
     if sudo sshd -t 2>&1 | tee -a "$LOG_FILE"; then
         ok "Password authentication disabled for all accounts."
         check_sshd_setting "PasswordAuthentication" "no"
@@ -377,9 +384,12 @@ create_admin_user() {
         if ! add_key_dedup "$pubkey" "/home/$username/.ssh/authorized_keys"; then
             error "Could not add the key for '$username'. Skipping ownership/permission changes and the password-disable prompt below."
         else
-            sudo chown -R "${username}:${username}" "/home/$username/.ssh"
-            sudo chmod 700 "/home/$username/.ssh"
-            sudo chmod 600 "/home/$username/.ssh/authorized_keys"
+            if ! sudo chown -R "${username}:${username}" "/home/$username/.ssh" || \
+               ! sudo chmod 700 "/home/$username/.ssh" || \
+               ! sudo chmod 600 "/home/$username/.ssh/authorized_keys"; then
+                error "The key was written for '$username', but ownership/permissions could not be set; sshd may reject it."
+                return 1
+            fi
             ok "Key added for '$username'."
 
             # FIX (High #14 - audit 3): this path was presented as the
@@ -542,6 +552,17 @@ choose_saved_tunnel() {
     done
 }
 
+# A saved PID can outlive a reboot and be reused by an unrelated process.
+# Only trust it when the live process really is a tunnel client.
+tunnel_pid_is_tunnel() {
+    local pid="$1" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    [[ "$cmdline" == *cloudflared* || "$cmdline" == *fxtunnel* ]]
+}
+
 # Prints the runtime status of a saved tunnel.
 tunnel_runtime_status() {
     local name="$1" svc pid
@@ -551,7 +572,7 @@ tunnel_runtime_status() {
         return
     fi
     pid=$(tunnel_state_get "$name" pid)
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    if [[ -n "$pid" ]] && tunnel_pid_is_tunnel "$pid"; then
         echo "running (background, PID $pid)"
         return
     fi
@@ -617,8 +638,11 @@ manage_tunnels() {
                 if [[ -n "$svc" ]] && command -v systemctl &>/dev/null && systemctl is-active --quiet "$svc" 2>/dev/null; then
                     sudo systemctl stop "$svc" 2>&1 | tee -a "$LOG_FILE" && ok "Service $svc stopped."
                 fi
-                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                if [[ -n "$pid" ]] && tunnel_pid_is_tunnel "$pid"; then
                     kill "$pid" 2>/dev/null && ok "Background tunnel (PID $pid) stopped."
+                    rm -f -- "${STATE_DIR}/tunnels/$name/pid"
+                elif [[ -n "$pid" ]]; then
+                    warn "Saved PID $pid is not a tunnel process (stale or reused); it was NOT killed."
                     rm -f -- "${STATE_DIR}/tunnels/$name/pid"
                 fi
                 info "Status now: $(tunnel_runtime_status "$name")"
@@ -628,7 +652,9 @@ manage_tunnels() {
             if [[ -n "$svc" ]] && command -v systemctl &>/dev/null; then
                 sudo systemctl restart "$svc" 2>&1 | tee -a "$LOG_FILE" && ok "Service $svc restarted."
             elif [[ -n "$port" ]]; then
-                [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+                if [[ -n "$pid" ]] && tunnel_pid_is_tunnel "$pid"; then
+                    kill "$pid" 2>/dev/null
+                fi
                 sleep 1
                 local new_log
                 new_log=$(mktemp "/tmp/tunnel-${name}-XXXXXX.log")
@@ -668,9 +694,9 @@ require_root_tools
 
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
-    info "Detected system: $PRETTY_NAME"
-    if [[ "$ID" != "ubuntu" && "$ID" != "debian" && "$ID_LIKE" != *"debian"* ]]; then
-        warn "This script targets Ubuntu/Debian. Your system ($PRETTY_NAME) might not be compatible."
+    info "Detected system: ${PRETTY_NAME:-unknown Linux}"
+    if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" && "${ID_LIKE:-}" != *"debian"* ]]; then
+        warn "This script targets Ubuntu/Debian. Your system (${PRETTY_NAME:-unknown Linux}) might not be compatible."
         confirm "Continue anyway?" || exit 1
     fi
 else
@@ -691,7 +717,7 @@ if [[ -n "${SSHJC_ACTION:-}" ]]; then
                     yes|no|prohibit-password|forced-commands-only) ;;
                     *) error "Invalid SSHJC_PERMIT_ROOT_LOGIN: '$SSHJC_PERMIT_ROOT_LOGIN'."; exit 1 ;;
                 esac
-                apply_sshd_directive "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN"
+                apply_sshd_directive "PermitRootLogin" "$SSHJC_PERMIT_ROOT_LOGIN" || exit 1
                 UPDATED=1
             fi
             if [[ -n "${SSHJC_PASSWORD_AUTHENTICATION:-}" ]]; then
@@ -699,7 +725,7 @@ if [[ -n "${SSHJC_ACTION:-}" ]]; then
                     yes|no) ;;
                     *) error "Invalid SSHJC_PASSWORD_AUTHENTICATION: '$SSHJC_PASSWORD_AUTHENTICATION'."; exit 1 ;;
                 esac
-                apply_sshd_directive "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION"
+                apply_sshd_directive "PasswordAuthentication" "$SSHJC_PASSWORD_AUTHENTICATION" || exit 1
                 UPDATED=1
             fi
             if [[ "$UPDATED" -eq 0 ]]; then
@@ -720,7 +746,7 @@ if [[ -n "${SSHJC_ACTION:-}" ]]; then
             ;;
         toggle_sftp)
             SSHJC_ENABLE_SFTP=1 ensure_sftp_enabled
-            exit 0
+            exit $?
             ;;
         *)
             error "Unknown SSHJC_ACTION: '$SSHJC_ACTION'."
@@ -805,6 +831,21 @@ if [[ "$DO_SSH" -eq 1 ]]; then
         fi
     fi
 
+    SSH_RUNNING=0
+    if [[ -d /run/systemd/system ]]; then
+        if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+            SSH_RUNNING=1
+        fi
+    fi
+    if pgrep -x sshd &>/dev/null; then
+        SSH_RUNNING=1
+    fi
+    if [[ "$SSH_RUNNING" -eq 0 ]]; then
+        error "sshd does not appear to be running after the start attempt. Fix the SSH service before continuing."
+        exit 1
+    fi
+    ok "sshd is running."
+
     echo
     # FIX (Critical #1 + #2): the original flow set a root password and
     # advertised root SSH login in the final summary, but never touched
@@ -819,7 +860,10 @@ if [[ "$DO_SSH" -eq 1 ]]; then
 
     case "$ACCESS_MODE" in
         1)
-            create_admin_user
+            if ! create_admin_user; then
+                error "Admin user configuration failed. Stopping instead of continuing with unconfigured SSH access."
+                exit 1
+            fi
             ;;
         2)
             if confirm "Are you sure you want to enable root SSH access? A dedicated user (option 1) is safer."; then
@@ -830,13 +874,11 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                     fi
                     sudo passwd root
                     if confirm "Allow root to log in WITH THIS PASSWORD over SSH? (sets PermitRootLogin yes - without this, the password only works locally)"; then
-                        backup_sshd_config_once
-                        sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+                        if ! apply_sshd_directive "PermitRootLogin" "yes"; then error "Failed to set PermitRootLogin; stopping."; exit 1; fi
                         warn "PermitRootLogin set to 'yes'. Root + password over a public tunnel is a significant exposure; consider adding a key and disabling password auth below."
                         check_sshd_setting "PermitRootLogin" "yes"
                     else
-                        backup_sshd_config_once
-                        sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+                        if ! apply_sshd_directive "PermitRootLogin" "prohibit-password"; then error "Failed to set PermitRootLogin; stopping."; exit 1; fi
                         info "PermitRootLogin left as 'prohibit-password': the root password will work locally (console) but NOT over SSH. Add a key below, or use option 1."
                         check_sshd_setting "PermitRootLogin" "prohibit-password"
                     fi
@@ -856,12 +898,11 @@ if [[ "$DO_SSH" -eq 1 ]]; then
                         else
                             sudo chmod 700 /root/.ssh
                             sudo chmod 600 /root/.ssh/authorized_keys
-                            backup_sshd_config_once
-                            sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+                            if ! apply_sshd_directive "PermitRootLogin" "prohibit-password"; then error "Failed to set PermitRootLogin for root; stopping."; exit 1; fi
                             ok "Key added for root (PermitRootLogin set to 'prohibit-password': key-only)."
                             check_sshd_setting "PermitRootLogin" "prohibit-password"
                             if confirm "Disable password login entirely now that a key is configured? (recommended)"; then
-                                sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+                                if ! apply_sshd_directive "PasswordAuthentication" "no"; then error "Failed to disable password authentication; stopping."; exit 1; fi
                                 ok "Password authentication disabled."
                                 check_sshd_setting "PasswordAuthentication" "no"
                             fi
@@ -989,6 +1030,10 @@ else
         else
             CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
         fi
+        if [[ -n "$CF_VERSION" ]] && [[ ! "$CF_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            error "Invalid cloudflared version: '$CF_VERSION'."
+            exit 1
+        fi
         if [[ -n "$CF_VERSION" ]]; then
             URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/${ASSET_NAME}"
         else
@@ -1027,6 +1072,11 @@ else
                 fi
             else
                 warn "No published checksum available via the GitHub API for this asset (rate limit, network issue, or API change). Integrity cannot be verified beyond the HTTPS download itself."
+                if gui_mode; then
+                    error "GUI mode: refusing to install cloudflared without a verified checksum."
+                    rm -f "$TMP_DEB"
+                    exit 1
+                fi
                 if ! confirm "Install this UNVERIFIED package anyway?"; then
                     error "Installation aborted by user (unverified package)."
                     rm -f "$TMP_DEB"
@@ -1086,12 +1136,20 @@ if [[ "$TUNNEL_PROVIDER" == "fxtunnel" ]]; then
     if gui_mode && [[ -n "${SSHJC_FX_TOKEN:-}" ]]; then
         FX_TOKEN="$SSHJC_FX_TOKEN"
     fi
-    while [[ -z "$FX_TOKEN" ]]; do
-        FX_TOKEN=$(ask "fxTunnel token (starts with sk_)" "")
+    while true; do
+        if [[ -z "$FX_TOKEN" ]]; then
+            FX_TOKEN=$(ask "fxTunnel token (starts with sk_)" "")
+        fi
         if [[ -z "$FX_TOKEN" ]]; then
             error "A token is required to use fxTunnel."
-        else
+        elif [[ "$FX_TOKEN" =~ ^sk_[^[:space:]]+$ ]]; then
             break
+        else
+            error "Invalid fxTunnel token format (expected 'sk_' followed by non-whitespace characters)."
+            if gui_mode; then
+                exit 1
+            fi
+            FX_TOKEN=""
         fi
     done
 
@@ -1337,6 +1395,7 @@ EOF
                 sleep 2
                 if systemctl is-active --quiet cloudflared; then
                     tunnel_state_set "$TUNNEL_NAME" service "cloudflared"
+                    tunnel_state_set "$TUNNEL_NAME" port "$LOCAL_PORT"
                     ok "cloudflared installed and running as a systemd service."
                     info "Manage it with: sudo systemctl {status|restart|stop} cloudflared"
                     info "Logs: sudo journalctl -u cloudflared -f"
@@ -1364,6 +1423,7 @@ EOF
             RUN_MODE=2
         else
             info "Writing /etc/systemd/system/${UNIT_NAME}.service ..."
+            sudo install -m 600 /dev/null "/etc/systemd/system/${UNIT_NAME}.service"
             sudo tee "/etc/systemd/system/${UNIT_NAME}.service" > /dev/null <<EOF
 [Unit]
 Description=fxTunnel (${TUNNEL_NAME}) - TCP tunnel for local port ${LOCAL_PORT}
@@ -1386,6 +1446,7 @@ EOF
                 sleep 2
                 if systemctl is-active --quiet "$UNIT_NAME"; then
                     tunnel_state_set "$TUNNEL_NAME" service "$UNIT_NAME"
+                    tunnel_state_set "$TUNNEL_NAME" port "$LOCAL_PORT"
                     ok "fxTunnel installed and running as a systemd service ($UNIT_NAME)."
                     info "Manage it with: sudo systemctl {status|restart|stop} $UNIT_NAME"
                     info "Logs: sudo journalctl -u $UNIT_NAME -f"
