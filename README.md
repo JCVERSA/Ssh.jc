@@ -18,7 +18,22 @@ Le script affiche ensuite un menu interactif :
 4. Créer/configurer un tunnel
 5. Lancer un tunnel enregistré
 6. Gérer les tunnels enregistrés
-7. Quitter
+7. Installer les outils VPS essentiels
+8. Quitter
+
+## Outils VPS essentiels (menu 7)
+
+Le choix **7** installe un pack d’administration VPS. Il est aussi proposé, de façon optionnelle, au début de l’installation complète (choix 1).
+
+Le pack comprend :
+
+- outils de base et de compilation : `build-essential`, `curl`, `wget`, `git`, `vim`, `nano`, `unzip`, `zip`, `ca-certificates`, `gnupg`, `apt-transport-https`, `sudo` ;
+- confort d’administration : `tmux`, `screen`, `htop`, `net-tools`, `ufw`, `fail2ban`, `rsync`, `jq`, `dnsutils`, `lsof` ;
+- Python : `python3`, `python3-venv`, `python3-pip` ;
+- Node.js : le script demande la version majeure à installer (**20 LTS** ou **22**) via NodeSource, puis installe `nodejs` et `pm2` en global ;
+- `cloudflared` : le script essaie d’abord le dépôt apt officiel Cloudflare ; en cas d’échec, il utilise en secours le paquet `.deb` GitHub vérifié par SHA-256.
+
+Le pack est “best-effort” : si un composant échoue, les autres sont quand même tentés et les échecs sont résumés dans le log. Dans le menu dédié, le script termine avec une erreur si au moins un composant a échoué ; dans l’installation complète, il avertit et continue vers SSH + tunnel.
 
 ## Et si `sudo` est absent ?
 

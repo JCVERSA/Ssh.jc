@@ -565,6 +565,202 @@ require_root_tools() {
     fi
 }
 
+
+install_cloudflared_github_verified() {
+    local ARCH ASSET_NAME CF_VERSION URL TMP_DEB EXPECTED_SHA ACTUAL_SHA CF_RELEASE_API
+        # FIX (Low #18 - audit 3): a failed detection used to fall back to
+        # "amd64" silently, which could download the wrong package on a
+        # non-amd64 host with no dpkg. Now it's an explicit, visible warning.
+        if ARCH=$(dpkg --print-architecture 2>/dev/null) && [[ -n "$ARCH" ]]; then
+            info "Detected architecture: $ARCH"
+        else
+            ARCH="amd64"
+            warn "Could not detect architecture via dpkg; defaulting to amd64. If this host is not x86_64, cancel and check manually."
+        fi
+        ASSET_NAME="cloudflared-linux-${ARCH}.deb"
+        # FIX (Medium #1 - audit 4): "releases/latest" makes installs
+        # non-reproducible across time (two runs on different dates can
+        # silently pull different cloudflared versions). Let the user pin a
+        # specific tag; default to latest to keep the previous behavior for
+        # anyone who just wants the newest release.
+        CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
+        if [[ -n "$CF_VERSION" ]] && [[ ! "$CF_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            error "Invalid cloudflared version: '$CF_VERSION'."
+            return 1
+        fi
+        if [[ -n "$CF_VERSION" ]]; then
+            URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/${ASSET_NAME}"
+        else
+            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${ASSET_NAME}"
+        fi
+        info "Downloading from: $URL"
+
+        # FIX (Medium #15 - audit 3): predictable /tmp path replaced with
+        # mktemp for the same symlink/TOCTOU reason as LOG_FILE above - this
+        # file is about to be installed as root via sudo dpkg -i.
+        TMP_DEB=$(mktemp "/tmp/cloudflared-${ARCH}-XXXXXX.deb")
+
+        if curl -fL -o "$TMP_DEB" "$URL" 2>&1 | tee -a "$LOG_FILE"; then
+            # FIX (Critical #3): verify integrity when GitHub publishes a
+            # digest for the asset, instead of trusting the download blindly.
+            ensure_jq
+            EXPECTED_SHA=""
+            if command -v jq &>/dev/null; then
+                if [[ -n "$CF_VERSION" ]]; then
+                    CF_RELEASE_API="https://api.github.com/repos/cloudflare/cloudflared/releases/tags/${CF_VERSION}"
+                else
+                    CF_RELEASE_API="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+                fi
+                EXPECTED_SHA=$(curl -fsSL "$CF_RELEASE_API" 2>/dev/null \
+                    | jq -r --arg name "$ASSET_NAME" '.assets[]? | select(.name == $name) | (.digest // empty)' 2>/dev/null \
+                    | sed -n 's/^sha256://p')
+            fi
+            if [[ -n "$EXPECTED_SHA" ]]; then
+                ACTUAL_SHA=$(sha256sum "$TMP_DEB" | awk '{print $1}')
+                if [[ "$EXPECTED_SHA" == "$ACTUAL_SHA" ]]; then
+                    ok "Checksum verified (sha256)."
+                else
+                    error "Checksum mismatch for $ASSET_NAME (expected $EXPECTED_SHA, got $ACTUAL_SHA). Aborting."
+                    rm -f "$TMP_DEB"
+                    return 1
+                fi
+            else
+                error "No published checksum available via the GitHub API for this asset (rate limit, network issue, or API change). Refusing to install an unverified package as root."
+                rm -f "$TMP_DEB"
+                return 1
+            fi
+
+            sudo dpkg -i "$TMP_DEB" 2>&1 | tee -a "$LOG_FILE"
+            # Resolve any missing dependencies
+            sudo apt-get install -f -y 2>&1 | tee -a "$LOG_FILE"
+            rm -f "$TMP_DEB"
+        else
+            error "Failed to download cloudflared. Check your network connection."
+            rm -f "$TMP_DEB"
+            return 1
+        fi
+    command -v cloudflared &>/dev/null
+}
+
+apt_update() {
+    sudo apt-get update 2>&1 | tee -a "$LOG_FILE"
+}
+
+apt_install() {
+    sudo apt-get install -y "$@" 2>&1 | tee -a "$LOG_FILE"
+}
+
+install_nodejs_nodesource() {
+    local major=$1 tmp_script
+    tmp_script=$(mktemp "/tmp/nodesource-setup-XXXXXX.sh") || return 1
+    info "Downloading the NodeSource setup script for Node.js ${major}.x ..."
+    if ! curl -fsSL "https://deb.nodesource.com/setup_${major}.x" -o "$tmp_script" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "$tmp_script"
+        return 1
+    fi
+    if ! sudo -E bash "$tmp_script" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "$tmp_script"
+        return 1
+    fi
+    rm -f "$tmp_script"
+    apt_install nodejs || return 1
+    command -v node &>/dev/null && command -v npm &>/dev/null
+}
+
+install_cloudflared_official_repo() {
+    if command -v cloudflared &>/dev/null; then
+        ok "cloudflared is already installed ($(cloudflared --version 2>&1 | head -1))."
+        return 0
+    fi
+    apt_install curl gnupg ca-certificates apt-transport-https || return 1
+    sudo install -d -m 0755 /usr/share/keyrings || return 1
+    info "Adding the official Cloudflare apt repository ..."
+    if ! curl -fsSL "https://pkg.cloudflare.com/cloudflare-main.gpg" | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/cloudflare-main.gpg 2>&1 | tee -a "$LOG_FILE"; then
+        return 1
+    fi
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null || return 1
+    apt_update || return 1
+    apt_install cloudflared || return 1
+    command -v cloudflared &>/dev/null
+}
+
+install_cloudflared_best_effort() {
+    if command -v cloudflared &>/dev/null; then
+        ok "cloudflared is already installed ($(cloudflared --version 2>&1 | head -1))."
+        return 0
+    fi
+    info "Trying the official Cloudflare apt repository first ..."
+    if install_cloudflared_official_repo; then
+        ok "cloudflared installed from the official Cloudflare repository."
+        return 0
+    fi
+    warn "The official Cloudflare repository method failed. Falling back to the verified GitHub .deb ..."
+    if install_cloudflared_github_verified; then
+        ok "cloudflared installed from the verified GitHub release package."
+        return 0
+    fi
+    return 1
+}
+
+# Optional VPS essentials pack (dedicated menu entry, also proposed during
+# Full setup). Best-effort by design: one failing component is logged and
+# counted, the remaining components are still attempted, and the caller
+# decides whether the failure is fatal (dedicated menu entry) or just a
+# warning (Full setup continues with SSH + tunnel).
+install_essentials() {
+    local failures=0 node_choice
+
+    if ! command -v apt-get &>/dev/null; then
+        error "The essentials pack is apt-based and needs apt-get (Ubuntu/Debian)."
+        return 1
+    fi
+
+    title "Installing essential VPS tools"
+    apt_update || failures=$((failures + 1))
+
+    info "Installing base/build/admin packages ..."
+    apt_install build-essential curl wget git vim nano unzip zip         ca-certificates gnupg apt-transport-https sudo tmux screen         htop net-tools ufw fail2ban rsync jq dnsutils lsof         || failures=$((failures + 1))
+
+    info "Installing Python tooling ..."
+    apt_update || failures=$((failures + 1))
+    apt_install python3 python3-venv python3-pip || failures=$((failures + 1))
+
+    while true; do
+        node_choice=$(ask "Node.js major version to install (20 LTS or 22)" "20")
+        case "$node_choice" in
+            20|22) break ;;
+            *) error "Invalid Node.js version: '$node_choice'. Enter 20 or 22." ;;
+        esac
+    done
+    if install_nodejs_nodesource "$node_choice"; then
+        ok "Node.js $(node --version 2>/dev/null) / npm $(npm --version 2>/dev/null) installed."
+    else
+        warn "NodeSource setup failed; falling back to the distribution nodejs/npm packages ..."
+        apt_install nodejs npm || failures=$((failures + 1))
+    fi
+    if command -v npm &>/dev/null; then
+        info "Installing pm2 globally ..."
+        sudo npm install -g pm2 2>&1 | tee -a "$LOG_FILE" || failures=$((failures + 1))
+    else
+        warn "npm is not available; skipping pm2."
+        failures=$((failures + 1))
+    fi
+
+    if ! install_cloudflared_best_effort; then
+        warn "cloudflared could not be installed by either method (official repo or verified GitHub .deb)."
+        failures=$((failures + 1))
+    fi
+
+    apt_update || failures=$((failures + 1))
+
+    if [[ "$failures" -gt 0 ]]; then
+        warn "Essentials finished with $failures failed component(s). Other components were still attempted; see the log: $LOG_FILE"
+        return 1
+    fi
+    ok "Essential VPS tools installed."
+    return 0
+}
+
 # FIX (Medium #15 - audit 3): a predictable filename under the shared,
 # world-writable /tmp is a symlink/TOCTOU risk (a local attacker could
 # pre-create the path before this script runs). mktemp allocates the file
@@ -585,7 +781,8 @@ Menu:
   4) Create / configure a tunnel
   5) Run an already configured tunnel (pick from saved tunnels)
   6) Manage tunnels (status / logs / stop / restart)
-  7) Quit
+  7) Install essential VPS tools (build tools, Python, Node.js, pm2, cloudflared, admin utilities)
+  8) Quit
 
 State and saved tunnels live in ~/.setup-ssh-tunnel/ (permissions 700/600).
 Before the first change in a run, /etc/ssh/sshd_config is backed up to
@@ -845,21 +1042,42 @@ echo "  3) Install cloudflared only (no tunnel configuration)"
 echo "  4) Create / configure a Cloudflare tunnel (cloudflared already installed)"
 echo "  5) Run an already configured tunnel"
 echo "  6) Manage tunnels (status / logs / stop / restart)"
-echo "  7) Quit"
+echo "  7) Install essential VPS tools"
+echo "  8) Quit"
 echo
 
-MODE=$(ask "Choice (1-7)" "1")
+MODE=$(ask "Choice (1-8)" "1")
 
 case "$MODE" in
-    1) DO_SSH=1; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=1; DO_MANAGE=0 ;;
-    2) DO_SSH=1; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0 ;;
-    3) DO_SSH=0; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0 ;;
-    4) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=0; DO_MANAGE=0 ;;
-    5) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=1; DO_MANAGE=0 ;;
-    6) DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=1 ;;
-    7) info "See you next time."; exit 0 ;;
+    1) DO_FULL=1; DO_SSH=1; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=1; DO_MANAGE=0; DO_ESSENTIALS=0 ;;
+    2) DO_FULL=0; DO_SSH=1; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0; DO_ESSENTIALS=0 ;;
+    3) DO_FULL=0; DO_SSH=0; DO_INSTALL_CF=1; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0; DO_ESSENTIALS=0 ;;
+    4) DO_FULL=0; DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=1; DO_ROUTE_DNS=1; DO_RUN=0; DO_MANAGE=0; DO_ESSENTIALS=0 ;;
+    5) DO_FULL=0; DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=1; DO_MANAGE=0; DO_ESSENTIALS=0 ;;
+    6) DO_FULL=0; DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=1; DO_ESSENTIALS=0 ;;
+    7) DO_FULL=0; DO_SSH=0; DO_INSTALL_CF=0; DO_CREATE_TUNNEL=0; DO_ROUTE_DNS=0; DO_RUN=0; DO_MANAGE=0; DO_ESSENTIALS=1 ;;
+    8) info "See you next time."; exit 0 ;;
     *) error "Invalid choice."; exit 1 ;;
 esac
+
+
+# ---------------------------------------------------------------------------
+# Optional step: essential VPS tools (menu 7 = dedicated, Full setup = opt-in)
+# ---------------------------------------------------------------------------
+if [[ "$DO_ESSENTIALS" -eq 1 ]]; then
+    if install_essentials; then
+        ok "Essential tools setup complete. Full log available at: $LOG_FILE"
+        exit 0
+    fi
+    error "Essential tools setup finished with failures. Full log available at: $LOG_FILE"
+    exit 1
+fi
+
+if [[ "$DO_FULL" -eq 1 ]] && confirm "Install the essential VPS tools pack too (build tools, Python, Node.js 20/22 + pm2, cloudflared, admin utilities)?"; then
+    if ! install_essentials; then
+        warn "The essentials pack reported failures. Continuing with the SSH + tunnel setup; you can re-run menu option 7 later. See the log: $LOG_FILE"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: OpenSSH server
@@ -1102,75 +1320,8 @@ else
     if command -v cloudflared &>/dev/null; then
         ok "cloudflared is already installed ($(cloudflared --version 2>&1 | head -1))."
     else
-        # FIX (Low #18 - audit 3): a failed detection used to fall back to
-        # "amd64" silently, which could download the wrong package on a
-        # non-amd64 host with no dpkg. Now it's an explicit, visible warning.
-        if ARCH=$(dpkg --print-architecture 2>/dev/null) && [[ -n "$ARCH" ]]; then
-            info "Detected architecture: $ARCH"
-        else
-            ARCH="amd64"
-            warn "Could not detect architecture via dpkg; defaulting to amd64. If this host is not x86_64, cancel and check manually."
-        fi
-        ASSET_NAME="cloudflared-linux-${ARCH}.deb"
-        # FIX (Medium #1 - audit 4): "releases/latest" makes installs
-        # non-reproducible across time (two runs on different dates can
-        # silently pull different cloudflared versions). Let the user pin a
-        # specific tag; default to latest to keep the previous behavior for
-        # anyone who just wants the newest release.
-        CF_VERSION=$(ask "cloudflared version to install (e.g. 2025.6.0), or leave empty for latest" "")
-        if [[ -n "$CF_VERSION" ]] && [[ ! "$CF_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            error "Invalid cloudflared version: '$CF_VERSION'."
-            exit 1
-        fi
-        if [[ -n "$CF_VERSION" ]]; then
-            URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/${ASSET_NAME}"
-        else
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/${ASSET_NAME}"
-        fi
-        info "Downloading from: $URL"
-
-        # FIX (Medium #15 - audit 3): predictable /tmp path replaced with
-        # mktemp for the same symlink/TOCTOU reason as LOG_FILE above - this
-        # file is about to be installed as root via sudo dpkg -i.
-        TMP_DEB=$(mktemp "/tmp/cloudflared-${ARCH}-XXXXXX.deb")
-
-        if curl -fL -o "$TMP_DEB" "$URL" 2>&1 | tee -a "$LOG_FILE"; then
-            # FIX (Critical #3): verify integrity when GitHub publishes a
-            # digest for the asset, instead of trusting the download blindly.
-            ensure_jq
-            EXPECTED_SHA=""
-            if command -v jq &>/dev/null; then
-                if [[ -n "$CF_VERSION" ]]; then
-                    CF_RELEASE_API="https://api.github.com/repos/cloudflare/cloudflared/releases/tags/${CF_VERSION}"
-                else
-                    CF_RELEASE_API="https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
-                fi
-                EXPECTED_SHA=$(curl -fsSL "$CF_RELEASE_API" 2>/dev/null \
-                    | jq -r --arg name "$ASSET_NAME" '.assets[]? | select(.name == $name) | (.digest // empty)' 2>/dev/null \
-                    | sed -n 's/^sha256://p')
-            fi
-            if [[ -n "$EXPECTED_SHA" ]]; then
-                ACTUAL_SHA=$(sha256sum "$TMP_DEB" | awk '{print $1}')
-                if [[ "$EXPECTED_SHA" == "$ACTUAL_SHA" ]]; then
-                    ok "Checksum verified (sha256)."
-                else
-                    error "Checksum mismatch for $ASSET_NAME (expected $EXPECTED_SHA, got $ACTUAL_SHA). Aborting."
-                    rm -f "$TMP_DEB"
-                    exit 1
-                fi
-            else
-                error "No published checksum available via the GitHub API for this asset (rate limit, network issue, or API change). Refusing to install an unverified package as root."
-                rm -f "$TMP_DEB"
-                exit 1
-            fi
-
-            sudo dpkg -i "$TMP_DEB" 2>&1 | tee -a "$LOG_FILE"
-            # Resolve any missing dependencies
-            sudo apt-get install -f -y 2>&1 | tee -a "$LOG_FILE"
-            rm -f "$TMP_DEB"
-        else
-            error "Failed to download cloudflared. Check your network connection."
-            rm -f "$TMP_DEB"
+        if ! install_cloudflared_github_verified; then
+            error "cloudflared installation failed. Check the log: $LOG_FILE"
             exit 1
         fi
     fi
