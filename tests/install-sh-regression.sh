@@ -28,7 +28,9 @@ DECOY_PIDS=()
 cleanup() {
     local pid
     for pid in "${DECOY_PIDS[@]}"; do
-        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+        if [[ -n "$pid" ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
     done
     if [[ "${KEEP_TEST_ARTIFACTS:-0}" != "1" && "$TEST_ROOT" == /tmp/sshjc-install-tests-* ]]; then
         rm -rf -- "$TEST_ROOT"

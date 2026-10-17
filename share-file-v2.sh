@@ -52,6 +52,10 @@ die() { error_msg "$*"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Invoked indirectly via `trap cleanup EXIT` below. Older ShellCheck
+# versions report the body as unreachable (SC2317) because they cannot see
+# that indirect invocation.
+# shellcheck disable=SC2317
 cleanup() {
     local rc=$?
 

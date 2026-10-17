@@ -269,7 +269,9 @@ cmd_stop() {
     echo "${pids}" | xargs -r kill 2>/dev/null || true
     sleep 1
     pids="$(gui_pids)"
-    [ -n "${pids}" ] && echo "${pids}" | xargs -r kill -9 2>/dev/null || true
+    if [ -n "${pids}" ]; then
+      echo "${pids}" | xargs -r kill -9 2>/dev/null || true
+    fi
     ok "Console arrêtée."
   fi
 }
@@ -350,7 +352,9 @@ cmd_env() {
       ;;
     get) [ -n "${key}" ] || die "Usage: ./manage.sh env get CLE"; env_value "${key}" ;;
     set)
-      [ -n "${key}" ] && [ -n "${value}" ] || die "Usage: ./manage.sh env set CLE VALEUR"
+      if [ -z "${key}" ] || [ -z "${value}" ]; then
+        die "Usage: ./manage.sh env set CLE VALEUR"
+      fi
       case "${key}" in GUI_PASSWORD*) die "Utilise ./manage.sh password (hash scrypt, jamais en clair)." ;; esac
       env_set "${key}" "${value}"; ok "${key} mis à jour. Redémarre : ./manage.sh restart"
       ;;
