@@ -443,10 +443,116 @@ create_admin_user() {
     state_set user "$username"
 }
 
+# Tries to install sudo with the system package manager. This function is
+# only called when the script is already running as root, so every attempt is
+# best-effort: a failed manager never aborts the script, we simply move on to
+# the next one and report at the end if sudo is still missing.
+install_sudo_as_root() {
+    if command -v apt-get &>/dev/null; then
+        info "Trying to install sudo with apt-get ..."
+        DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | tee -a "$LOG_FILE" || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v apt &>/dev/null; then
+        info "Trying to install sudo with apt ..."
+        DEBIAN_FRONTEND=noninteractive apt update 2>&1 | tee -a "$LOG_FILE" || true
+        DEBIAN_FRONTEND=noninteractive apt install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v dnf &>/dev/null; then
+        info "Trying to install sudo with dnf ..."
+        dnf install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v microdnf &>/dev/null; then
+        info "Trying to install sudo with microdnf ..."
+        microdnf install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v yum &>/dev/null; then
+        info "Trying to install sudo with yum ..."
+        yum install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v apk &>/dev/null; then
+        info "Trying to install sudo with apk ..."
+        apk update 2>&1 | tee -a "$LOG_FILE" || true
+        apk add --no-cache sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v pacman &>/dev/null; then
+        info "Trying to install sudo with pacman ..."
+        # No -Sy here: a partial sync/upgrade can break Arch-based systems.
+        pacman -S --noconfirm sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v zypper &>/dev/null; then
+        info "Trying to install sudo with zypper ..."
+        zypper --non-interactive refresh 2>&1 | tee -a "$LOG_FILE" || true
+        zypper --non-interactive install -y sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    if command -v xbps-install &>/dev/null; then
+        info "Trying to install sudo with xbps-install ..."
+        xbps-install -Sy sudo 2>&1 | tee -a "$LOG_FILE" || true
+        command -v sudo &>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Best-effort sudo bootstrap for minimal VPS images where sudo is absent.
+# As root we can install it directly. As a normal user we can try once via
+# `su` (which will ask for the root password) and add that user to the sudo
+# group. Any failure is reported cleanly; the script never continues without
+# a working sudo.
+try_install_sudo() {
+    command -v sudo &>/dev/null && return 0
+
+    warn "sudo is not installed. Trying to install it automatically ..."
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        install_sudo_as_root || true
+        hash -r 2>/dev/null || true
+        if command -v sudo &>/dev/null; then
+            ok "sudo installed successfully."
+            return 0
+        fi
+    elif command -v su &>/dev/null; then
+        warn "sudo is missing and this is not a root shell. Trying once via su (root password required) ..."
+        local current_user user_q su_cmd
+        current_user=$(id -un)
+        printf -v user_q '%q' "$current_user"
+        su_cmd="export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive; "
+        su_cmd+="if command -v apt-get >/dev/null 2>&1; then apt-get update; apt-get install -y sudo; "
+        su_cmd+="elif command -v apt >/dev/null 2>&1; then apt update; apt install -y sudo; "
+        su_cmd+="elif command -v dnf >/dev/null 2>&1; then dnf install -y sudo; "
+        su_cmd+="elif command -v microdnf >/dev/null 2>&1; then microdnf install -y sudo; "
+        su_cmd+="elif command -v yum >/dev/null 2>&1; then yum install -y sudo; "
+        su_cmd+="elif command -v apk >/dev/null 2>&1; then apk update; apk add --no-cache sudo; "
+        su_cmd+="elif command -v pacman >/dev/null 2>&1; then pacman -S --noconfirm sudo; "
+        su_cmd+="elif command -v zypper >/dev/null 2>&1; then zypper --non-interactive refresh; zypper --non-interactive install -y sudo; "
+        su_cmd+="elif command -v xbps-install >/dev/null 2>&1; then xbps-install -Sy sudo; fi; "
+        su_cmd+="if getent group sudo >/dev/null 2>&1; then usermod -aG sudo ${user_q} 2>/dev/null || adduser ${user_q} sudo 2>/dev/null || true; fi"
+        if su -c "$su_cmd"; then
+            hash -r 2>/dev/null || true
+            if command -v sudo &>/dev/null; then
+                ok "sudo installed successfully."
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
 require_root_tools() {
     if ! command -v sudo &>/dev/null; then
-        error "sudo is not available on this system. The script must be run as root or with sudo installed."
-        exit 1
+        if ! try_install_sudo; then
+            error "sudo is not available on this system and could not be installed automatically."
+            error "Install it manually, then re-run this script. Examples: 'apt-get install -y sudo' (Debian/Ubuntu, as root), 'dnf install -y sudo' (Fedora/RHEL), or 'apk add sudo' (Alpine)."
+            exit 1
+        fi
     fi
     # FIX (Medium #9): the original script only checked that the `sudo`
     # binary existed, not that the current user can actually use it. This
@@ -454,6 +560,7 @@ require_root_tools() {
     # clear failure up front.
     if ! sudo -v 2>/dev/null; then
         error "The current user does not appear to have sudo privileges (or the sudo password was refused)."
+        error "If your account was just added to the sudo group, disconnect/reconnect your SSH session and re-run this script."
         exit 1
     fi
 }
