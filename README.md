@@ -53,13 +53,19 @@ Bash installers for remote access and temporary file sharing on Linux
 
 ## Development
 
-CI (`.github/workflows/ci.yml`) runs `bash -n` and ShellCheck on every
-push/PR. Run locally:
+CI (`.github/workflows/ci.yml`) runs syntax checks, ShellCheck, and the
+stubbed `Install.sh` regression suite on every push/PR. Run locally:
 
 ```bash
-bash -n Install.sh fxtunnel-installer.sh share-file-v2.sh
-shellcheck Install.sh fxtunnel-installer.sh share-file-v2.sh
+bash -n Install.sh fxtunnel-installer.sh share-file-v2.sh manage.sh tests/install-sh-regression.sh
+sh -n scripts/install.sh
+shellcheck Install.sh fxtunnel-installer.sh share-file-v2.sh manage.sh scripts/install.sh tests/install-sh-regression.sh
+tests/install-sh-regression.sh
 ```
+
+The regression suite never provisions a real tunnel or edits the host's
+SSH configuration: commands are stubbed, state lives in a temporary `HOME`,
+and `/etc` cases run inside a user/mount namespace when available.
 
 See `AUDIT-2026-10-16-fullstack-v2.1.md` for the security/quality audit
 these scripts were hardened against, including finding IDs (F-01…F-11)

@@ -10,16 +10,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Syntax check (bash -n)
+      - name: Syntax check
         run: |
-          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh; do
+          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh manage.sh tests/install-sh-regression.sh; do
             echo "== $f"
             bash -n "$f"
           done
+          echo "== scripts/install.sh"
+          sh -n scripts/install.sh
 
       - name: Scripts are executable
         run: |
-          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh; do
+          for f in Install.sh fxtunnel-installer.sh share-file-v2.sh manage.sh scripts/install.sh tests/install-sh-regression.sh; do
             test -x "$f" || { echo "$f is not executable"; exit 1; }
           done
 
@@ -29,4 +31,7 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: ShellCheck
-        run: shellcheck Install.sh fxtunnel-installer.sh share-file-v2.sh
+        run: shellcheck Install.sh fxtunnel-installer.sh share-file-v2.sh manage.sh scripts/install.sh tests/install-sh-regression.sh
+
+      - name: Install.sh stubbed regression tests
+        run: tests/install-sh-regression.sh
