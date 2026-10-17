@@ -1,8 +1,0 @@
-# ShellCheck configuration — keep this list minimal and justified.
-#
-# SC1091 (not following sourced file): Install.sh sources /etc/os-release,
-#   a runtime system file that does not exist on every machine running
-#   ShellCheck. It cannot be followed statically; this is expected.
-# SC2329 (function never invoked): share-file-v2.sh's cleanup() is invoked
-#   indirectly via `trap cleanup EXIT`, which ShellCheck cannot see.
-disable=SC1091,SC2329
