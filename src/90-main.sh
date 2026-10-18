@@ -168,7 +168,11 @@ case "${1:-}" in
   setup)
     require_root
     check_system
-    setup_all
+    if [[ $# -gt 1 ]]; then
+      setup_all "${@:2}"
+    else
+      setup_all
+    fi
     ;;
   start|restart)
     require_root

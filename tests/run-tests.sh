@@ -155,6 +155,7 @@ bash "$ARTIFACT" --help > "$OUT/help.log" 2>&1
 check "$OUT/help.log" "ola tui opens" "help documents ola tui"
 check "$OUT/help.log" "ola bench --stream" "help documents streaming bench"
 check "$OUT/help.log" "ola update downloads" "help documents ola update"
+check "$OUT/help.log" "ola setup default uses" "help documents quick setup"
 if (cd "$ROOT" && sha256sum -c ollama-cloudflare-setup.sh.sha256 > "$OUT/artifact-sha256.log" 2>&1); then
   echo "PASS: published artifact SHA-256 matches"
   pass=$((pass + 1))
@@ -275,6 +276,56 @@ reset_case
 run doctor > "$OUT/doctor.log" 2>&1; echo "doctor exit=$?"
 check "$OUT/doctor.log" "Textual TUI is not installed/ready" "doctor reports optional TUI state"
 check "$OUT/doctor.log" "Doctor summary: 0 failure(s)" "doctor has no failures"
+
+# --- Quick setup arguments ---------------------------------------------------------
+reset_case
+run setup qwen3:1.7b > "$OUT/setup-missing-mode.log" 2>&1; setup_missing_exit=$?
+echo "setup missing mode exit=$setup_missing_exit"
+check "$OUT/setup-missing-mode.log" "only 'ola setup default' is supported" "quick setup requires a tunnel mode"
+if [[ "$setup_missing_exit" -ne 0 ]]; then
+  echo "PASS: quick setup missing mode exits nonzero"
+  pass=$((pass + 1))
+else
+  echo "FAIL: quick setup missing mode should exit nonzero"
+  fail=$((fail + 1))
+fi
+
+run setup qwen3:1.7b 3 > "$OUT/setup-invalid-mode.log" 2>&1; setup_invalid_exit=$?
+echo "setup invalid mode exit=$setup_invalid_exit"
+check "$OUT/setup-invalid-mode.log" "Invalid tunnel mode" "quick setup rejects an unknown tunnel mode"
+
+run setup qwen3:1.7b 1 ollama.example.com > "$OUT/setup-quick-hostname.log" 2>&1; setup_quick_host_exit=$?
+echo "setup quick with hostname exit=$setup_quick_host_exit"
+check "$OUT/setup-quick-hostname.log" "only supported with Named Tunnel" "quick setup rejects a hostname with Quick Tunnel"
+
+reset_case
+run setup default > "$OUT/setup-default.log" 2>&1; setup_default_exit=$?
+echo "setup default exit=$setup_default_exit"
+check "$OUT/setup-default.log" "Setup rapide : modèle qwen3:1.7b · tunnel 1" "setup default selects the built-in model and Quick Tunnel"
+check "$OUT/setup-default.log" "Quick Tunnel URL: https://fresh-quick.trycloudflare.com" "setup default configures a Quick Tunnel"
+check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:1.7b" "setup default saves the built-in default model"
+check_file_contains "$TEST_ETC/ollama-cloudflare-url" "https://fresh-quick.trycloudflare.com" "setup default saves the Quick Tunnel URL"
+
+reset_case
+run setup llama3.2:1b account ollama.example.com > "$OUT/setup-named.log" 2>&1; setup_named_exit=$?
+echo "setup named exit=$setup_named_exit"
+check "$OUT/setup-named.log" "Setup rapide : modèle llama3.2:1b · tunnel 2" "quick setup accepts a model and account mode"
+check "$OUT/setup-named.log" "Named Tunnel preset: tunnel name 'ollama-vps', hostname 'ollama.example.com'." "quick setup uses the preset Named Tunnel name and hostname"
+check_file_contains "$TEST_ETC/ollama-cloudflare-model" "llama3.2:1b" "quick setup saves the requested model"
+check_file_contains "$TEST_ETC/ollama-cloudflare-url" "https://ollama.example.com" "quick setup saves the Named Tunnel URL"
+check_file_contains "$TEST_ETC/cloudflared/config.yml" "hostname: ollama.example.com" "quick setup writes the Named Tunnel hostname"
+
+reset_case
+printf '%s\n' "ollama.example.com" | run setup qwen3:0.6b named > "$OUT/setup-named-prompt.log" 2>&1; setup_named_prompt_exit=$?
+echo "setup named prompt exit=$setup_named_prompt_exit"
+check "$OUT/setup-named-prompt.log" "Named Tunnel preset: tunnel name 'ollama-vps'." "quick Named setup asks only for the missing hostname"
+check_file_contains "$TEST_ETC/ollama-cloudflare-url" "https://ollama.example.com" "quick Named setup uses the prompted hostname"
+
+reset_case
+printf '%s\n%s\n' "qwen3:0.6b" "1" | run setup > "$OUT/setup-interactive.log" 2>&1; setup_interactive_exit=$?
+echo "setup interactive exit=$setup_interactive_exit"
+check "$OUT/setup-interactive.log" "Quick Tunnel URL: https://fresh-quick.trycloudflare.com" "interactive setup still prompts for model and tunnel"
+check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:0.6b" "interactive setup saves the prompted model"
 
 # --- Self-update -----------------------------------------------------------------
 export OLA_UPDATE_URL="https://updates.example.test/ollama-cloudflare-setup.sh"

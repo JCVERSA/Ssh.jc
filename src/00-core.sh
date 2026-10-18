@@ -54,6 +54,7 @@ usage(){
   echo "No argument opens an interactive menu."
   echo "setup, update, start, recover, use, unload, delete, restart, stop, 'speed apply|reset', 'fluid keepalive' and 'tui install' require root; status, doctor, test, speed, fluid status/preset, tui status, models, ps, logs and watchdog are read-only. Bench does not change config or disk files, but may load/unload models in RAM while testing."
   echo "ola update downloads the latest published ola artifact, verifies its SHA-256, keeps the previous version as a backup, installs it atomically, restarts the configured services and rolls back if the post-update restart/API check fails."
+  echo "ola setup default uses the built-in default model ($MODEL_DEFAULT) and a Quick Tunnel. ola setup <model> <1|quick|2|account|named> [hostname] runs the full setup without the model/tunnel prompts; the hostname is only for Named Tunnel mode."
   echo "ola tui opens the optional full-screen Textual interface (dashboard and model actions). 'ola tui install' repairs its isolated Python environment; 'ola tui status' reports it."
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."

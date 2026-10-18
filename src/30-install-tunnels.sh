@@ -40,9 +40,11 @@ install_ollama(){
   done
   ok "Ollama is running under Supervisor ($OLLAMA_USER) and answers on 127.0.0.1:11434."
 
-  local model
-  if ! model=$(prompt_value "Ollama model [$MODEL_DEFAULT]: " "$MODEL_DEFAULT"); then
-    die "No input received for the Ollama model; aborting instead of silently using the default."
+  local model=${1:-}
+  if [[ -z "$model" ]]; then
+    if ! model=$(prompt_value "Ollama model [$MODEL_DEFAULT]: " "$MODEL_DEFAULT"); then
+      die "No input received for the Ollama model; aborting instead of silently using the default."
+    fi
   fi
   is_valid_model_name "$model" || die "Invalid Ollama model name: $model"
   stop_loaded_models_except "$model"
@@ -250,18 +252,33 @@ refresh_named_tunnel_uuid(){
 }
 
 configure_named_tunnel(){
-  local tunnel_name hostname uuid source_cred cred_file protocol_line="" candidate_home alt_home
+  local preset=${2:-0} tunnel_name="ollama-vps" hostname=${1:-} uuid source_cred cred_file protocol_line="" candidate_home alt_home
   echo ""
   warn "This mode uses your Cloudflare account and a domain/subdomain. It does not configure Cloudflare Access."
-  if ! tunnel_name=$(prompt_value "Tunnel name [ollama-vps]: " "ollama-vps"); then
-    die "No input received for the tunnel name; aborting."
+  if [[ "$preset" == "1" ]]; then
+    if [[ -n "$hostname" ]]; then
+      hostname="${hostname,,}"
+      is_valid_hostname "$hostname" || die "Invalid hostname."
+      info "Named Tunnel preset: tunnel name '$tunnel_name', hostname '$hostname'."
+    else
+      if ! hostname=$(prompt_value "Public hostname (e.g. ollama.example.com): " ""); then
+        die "No input received for the public hostname; aborting."
+      fi
+      hostname="${hostname,,}"
+      is_valid_hostname "$hostname" || die "Invalid hostname."
+      info "Named Tunnel preset: tunnel name '$tunnel_name'."
+    fi
+  else
+    if ! tunnel_name=$(prompt_value "Tunnel name [ollama-vps]: " "ollama-vps"); then
+      die "No input received for the tunnel name; aborting."
+    fi
+    [[ "$tunnel_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$tunnel_name" != *".."* ]] || die "Invalid tunnel name."
+    if ! hostname=$(prompt_value "Public hostname (e.g. ollama.example.com): " ""); then
+      die "No input received for the public hostname; aborting."
+    fi
+    hostname="${hostname,,}"
+    is_valid_hostname "$hostname" || die "Invalid hostname."
   fi
-  [[ "$tunnel_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ && "$tunnel_name" != *".."* ]] || die "Invalid tunnel name."
-  if ! hostname=$(prompt_value "Public hostname (e.g. ollama.example.com): " ""); then
-    die "No input received for the public hostname; aborting."
-  fi
-  hostname="${hostname,,}"
-  is_valid_hostname "$hostname" || die "Invalid hostname."
 
   ensure_service_users
   if [[ ! -f "$CF_CLI_HOME/cert.pem" ]]; then

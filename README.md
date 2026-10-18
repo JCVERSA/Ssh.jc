@@ -217,13 +217,45 @@ Le setup effectue notamment les étapes suivantes :
 12. démarre et vérifie le tunnel ;
 13. affiche le statut final et l’URL publique.
 
-Forme non interactive équivalente pour démarrer le setup :
+Forme équivalente pour démarrer le setup :
 
 ```bash
 ./ollama-cloudflare-setup.sh setup
 ```
 
-Le setup reste interactif pour le choix du modèle et du tunnel.
+Sans argument après `setup`, le choix du modèle et du tunnel reste interactif.
+
+#### Setup rapide avec arguments
+
+Pour décider le modèle et le tunnel directement dans la commande :
+
+```bash
+# Modèle par défaut du projet (qwen3:1.7b) + Quick Tunnel
+ola setup default
+
+# Modèle imposé + Quick Tunnel
+ola setup qwen3:0.6b 1
+ola setup qwen3:0.6b quick
+
+# Modèle imposé + Named Tunnel, hostname imposé
+ola setup qwen3:1.7b 2 ollama.example.com
+ola setup qwen3:1.7b account ollama.example.com
+ola setup qwen3:1.7b named ollama.example.com
+
+# Named Tunnel sans hostname : seul le hostname manquant est demandé
+ola setup qwen3:1.7b 2
+```
+
+Règles :
+
+- `ola setup <modèle>` seul est refusé : le mode tunnel est obligatoire, sauf pour le raccourci complet `ola setup default` ;
+- `default` désigne toujours le modèle intégré au projet, actuellement `qwen3:1.7b`, même si un autre modèle est enregistré comme défaut sur le sandbox ;
+- le mot-clé `default` peut aussi servir de modèle avec un mode explicite, par exemple `ola setup default 2 ollama.example.com` ;
+- les modes acceptés sont `1` ou `quick` pour Quick Tunnel, et `2`, `account` ou `named` pour Named Tunnel ;
+- en mode Named Tunnel rapide, le nom du tunnel est `ollama-vps` ; si le hostname est absent, il est demandé, et la connexion Cloudflare reste interactive si aucun certificat de connexion n’existe encore ;
+- pour choisir un nom de tunnel personnalisé, utilise le setup interactif classique `ola setup`.
+
+Ces formes rapides exécutent le **même setup complet** que la forme interactive : elles suppriment seulement les questions dont la réponse est déjà fournie. Sur un sandbox déjà configuré, elles peuvent donc régénérer les configurations et redémarrer les services.
 
 ### 3. Première vérification
 
@@ -531,7 +563,9 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 |---|---|
 | `ola` | Ouvre le menu interactif. |
 | `ola help` ou `ola --help` | Affiche l’aide courte. |
-| `ola setup` | Lance ou relance l’installation complète et régénère les configurations. |
+| `ola setup` | Lance ou relance l’installation complète interactive et régénère les configurations. |
+| `ola setup default` | Setup complet rapide avec le modèle intégré par défaut (`qwen3:1.7b`) et un Quick Tunnel. |
+| `ola setup <modèle> <1\|quick\|2\|account\|named> [hostname]` | Setup complet sans les questions modèle/tunnel ; le hostname optionnel n’est accepté qu’en mode Named Tunnel. |
 | `ola status` | Affiche Supervisor, l’API locale, les modèles connus et l’URL publique enregistrée. |
 | `ola doctor` | Diagnostic complet : binaires, Supervisor, services, API, modèles, tunnel, RAM, disque, logs et URL publique. |
 | `ola test` | Teste l’API locale, vérifie le modèle par défaut, fait une mini-conversation et teste l’URL publique. |

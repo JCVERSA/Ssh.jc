@@ -329,7 +329,65 @@ recover_services(){
   ok "Recover finished."
 }
 
+normalize_setup_tunnel_mode(){
+  local token=${1,,}
+  case "$token" in
+    1|quick) printf '%s' "1" ;;
+    2|account|named) printf '%s' "2" ;;
+    *) return 1 ;;
+  esac
+}
+
+setup_arguments_usage(){
+  echo "Usage: ola setup [default | <model> <1|quick|2|account|named> [hostname]]" >&2
+  echo "  ola setup                         setup interactif complet" >&2
+  echo "  ola setup default                 modèle $MODEL_DEFAULT + Quick Tunnel" >&2
+  echo "  ola setup <model> <mode>          setup complet sans les questions modèle/tunnel" >&2
+  echo "  ola setup <model> 2 <hostname>    Named Tunnel avec hostname imposé" >&2
+}
+
 setup_all(){
+  local requested_model="" tunnel_mode="" requested_hostname="" named_preset=0
+  if [[ $# -gt 0 ]]; then
+    if [[ $# -gt 3 ]]; then
+      setup_arguments_usage
+      die "Too many setup arguments."
+    fi
+    if [[ $# -eq 1 ]]; then
+      [[ "${1,,}" == "default" ]] || {
+        setup_arguments_usage
+        die "With one argument, only 'ola setup default' is supported; otherwise give a model and a tunnel mode."
+      }
+      requested_model="$MODEL_DEFAULT"
+      tunnel_mode="1"
+    else
+      if [[ "${1,,}" == "default" ]]; then
+        requested_model="$MODEL_DEFAULT"
+      else
+        requested_model=$1
+      fi
+      tunnel_mode=$(normalize_setup_tunnel_mode "$2") || {
+        setup_arguments_usage
+        die "Invalid tunnel mode: $2 (expected 1, quick, 2, account or named)."
+      }
+      if [[ $# -eq 3 ]]; then
+        [[ "$tunnel_mode" == "2" ]] || {
+          setup_arguments_usage
+          die "The hostname argument is only supported with Named Tunnel mode 2."
+        }
+        requested_hostname=${3,,}
+        is_valid_hostname "$requested_hostname" || die "Invalid hostname: $3"
+      fi
+      [[ "$tunnel_mode" == "2" ]] && named_preset=1
+    fi
+    is_valid_model_name "$requested_model" || die "Invalid Ollama model name: $requested_model"
+    info "Setup rapide : modèle $requested_model · tunnel $tunnel_mode"
+    if [[ "$tunnel_mode" == "2" ]]; then
+      info "Named Tunnel : nom de tunnel 'ollama-vps'${requested_hostname:+, hostname $requested_hostname}."
+    fi
+    warn "Rappel : le tunnel expose l'API Ollama sans authentification ; garde l'URL privée."
+  fi
+
   case "$CF_TUNNEL_PROTOCOL" in
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
@@ -344,20 +402,22 @@ setup_all(){
   ensure_service_users
   ensure_supervisor_running
   ensure_watchdog
-  install_ollama
+  install_ollama "$requested_model"
   install_cloudflared
   ensure_service_users
-  echo
-  echo "Choose tunnel mode:"
-  echo "  1) Quick Tunnel (random trycloudflare.com URL; easiest, temporary URL)"
-  echo "  2) Named Tunnel (your domain + Cloudflare account; persistent hostname)"
-  local mode
-  if ! mode=$(prompt_value "Choice [1]: " "1"); then
-    die "No input received for the tunnel mode; aborting instead of silently choosing a public Quick Tunnel."
+  local mode=$tunnel_mode
+  if [[ -z "$mode" ]]; then
+    echo
+    echo "Choose tunnel mode:"
+    echo "  1) Quick Tunnel (random trycloudflare.com URL; easiest, temporary URL)"
+    echo "  2) Named Tunnel (your domain + Cloudflare account; persistent hostname)"
+    if ! mode=$(prompt_value "Choice [1]: " "1"); then
+      die "No input received for the tunnel mode; aborting instead of silently choosing a public Quick Tunnel."
+    fi
   fi
   case "$mode" in
     1) configure_quick_tunnel ;;
-    2) configure_named_tunnel ;;
+    2) configure_named_tunnel "$requested_hostname" "$named_preset" ;;
     *) die "Invalid choice." ;;
   esac
   echo
