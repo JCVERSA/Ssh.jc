@@ -1092,18 +1092,22 @@ L’écran affiche :
 - un tableau actualisé des modèles : état disque/RAM, taille, modèle par défaut, expiration keep-alive et contexte chargé ;
 - un détail du modèle sélectionné : état, caractère par défaut, paramètres, famille, quantification et capacités déclarées par `/api/show`.
 
-Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle. S’il n’y a aucun modèle, le tableau et le panneau de détail affichent explicitement l’état vide et proposent la touche `a` pour en ajouter un.
+Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle. Au premier affichage, le modèle déjà chargé en RAM est sélectionné en priorité, sinon le modèle par défaut. S’il n’y a aucun modèle, le tableau et le panneau de détail affichent explicitement l’état vide et proposent la touche `a` pour en ajouter un.
+
+L’affichage s’adapte à la taille du terminal : mode standard à partir d’environ 95 colonnes ou 29 lignes, mode compact en dessous (bannière masquée, panneaux réduits, noms de modèles raccourcis au milieu), puis mode minimal sur très petit terminal (panneaux masqués pour conserver un tableau utilisable). Les confirmations gardent aussi leurs boutons visibles sur petit écran.
 
 ### Touches
 
 | Touche | Action |
 |---|---|
 | `↑` / `↓` | Choisir un modèle |
+| `m` | Ouvrir le menu d’actions du modèle sélectionné |
+| `?` | Ouvrir l’aide complète |
 | `u` | Utiliser le modèle sélectionné (confirmation) |
 | `d` | Supprimer définitivement le modèle sélectionné du disque (confirmation renforcée si c’est le défaut) |
-| `l` | Libérer le modèle sélectionné de la RAM |
+| `l` | Libérer le modèle sélectionné de la RAM (confirmation s’il est chargé) |
 | `a` | Ajouter et utiliser un modèle (saisie du nom) |
-| `w` | Préchauffer le modèle (`ola fluid warm`) |
+| `w` | Préchauffer le modèle (`ola fluid warm`, confirmation si la RAM va changer) |
 | `p` | Afficher son preset fluidité |
 | `b` | Benchmark classique du modèle (confirmation) |
 | `B` | Benchmark streaming du modèle (confirmation) |
@@ -1114,14 +1118,14 @@ Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de mod
 | `r` | Rafraîchir maintenant |
 | `q` | Quitter ou fermer l’écran courant |
 
-Les actions longues s’exécutent en arrière-plan de l’interface et leur sortie complète s’affiche dans un écran de résultat. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. Dans toutes les confirmations, le focus initial est placé sur **Annuler** : appuyer immédiatement sur `Entrée` annule, et il faut choisir explicitement le bouton d’exécution pour lancer l’action. Seul le bouton de suppression utilise la couleur de danger. En utilisateur non-root, l’affichage reste utile, tandis que `ola` refusera les actions protégées et affichera son erreur.
+Les actions longues ouvrent immédiatement un écran d’exécution : la sortie de `ola` y défile en direct, avec le temps écoulé. Pendant l’exécution, `q` ou `Ctrl+C` demande l’annulation du processus (le CLI et ses sous-processus sont arrêtés proprement) ; une fois l’action terminée ou annulée, `q` ferme l’écran. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. Dans toutes les confirmations, le focus initial est placé sur **Annuler** : appuyer immédiatement sur `Entrée` annule, et il faut choisir explicitement le bouton d’exécution pour lancer l’action. Seul le bouton de suppression utilise la couleur de danger. En utilisateur non-root, l’affichage et les lectures restent disponibles, mais `u`, `d`, `l` et `a` sont refusés avant confirmation car ils exigent root.
 
 ### Limites de la TUI
 
 - Elle nécessite un vrai terminal interactif ; dans un pipe ou un script, `ola tui` refuse de démarrer et renvoie vers les commandes texte.
 - Elle ne remplace ni le menu `ola`, ni les commandes scriptables.
 - Les actions passent par le CLI : un bench lancé depuis la TUI a donc les mêmes effets RAM que `ola bench` en ligne de commande.
-- Le rendu exact dépend du terminal (taille, couleurs, police). Un terminal d’au moins environ 100 colonnes est recommandé.
+- Le rendu exact dépend du terminal (taille, couleurs, police). Un terminal d’au moins environ 100 colonnes est recommandé pour tout voir ; `80×24` reste propre en mode compact, et les très petits terminaux conservent le tableau en masquant les panneaux.
 
 ## Utiliser l’API Ollama
 

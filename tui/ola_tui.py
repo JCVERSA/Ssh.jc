@@ -13,20 +13,25 @@ import asyncio
 import json
 import os
 import re
+import selectors
 import shutil
+import signal
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static, TextArea
+from textual.widgets import Button, DataTable, Footer, Header, Input, OptionList, RichLog, Static, TextArea
+from textual.widgets.option_list import Option
 
 API_URL = os.environ.get("OLA_TUI_API_URL", "http://127.0.0.1:11434").rstrip("/")
 CLI = os.environ.get("OLA_TUI_CLI") or shutil.which("ola") or "/usr/local/bin/ola"
@@ -62,6 +67,26 @@ def normalize_model(name: str) -> str:
 
 def valid_model(name: str) -> bool:
     return bool(MODEL_RE.fullmatch(name.strip()))
+
+
+def running_as_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def display_model_name(name: str, limit: int) -> str:
+    """Shorten a model name in the middle, keeping registry and tag visible."""
+    if len(name) <= limit:
+        return name
+    keep = max(8, limit - 1)
+    left = keep // 2
+    right = keep - left
+    return f"{name[:left]}…{name[-right:]}"
+
+
+def dialog_classes(app: App) -> str:
+    size = app.size
+    compact = size.width < 72 or size.height < 24
+    return "dialog compact" if compact else "dialog"
 
 
 def read_first_line(path: Path) -> str:
@@ -260,30 +285,112 @@ def fetch_show(model: str) -> dict[str, Any]:
         return {}
 
 
-def run_cli(args: list[str], timeout: int = 900) -> tuple[int, str]:
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_cli_stream(
+    args: list[str],
+    emit: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    timeout: int = 900,
+) -> tuple[int, str]:
+    """Run ola without a shell, streaming merged stdout/stderr line by line.
+
+    The child runs in its own process group so cancellation from the TUI can
+    stop the Bash CLI and the tools it launched (curl, ollama, ...).
+    """
     if not CLI:
         return 127, "Commande ola introuvable."
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [CLI, *args],
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return 127, f"Commande ola introuvable : {CLI}"
-    except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="ignore")
-        return 124, f"{output}\n\nCommande interrompue après {timeout} secondes."
     except OSError as exc:
         return 1, f"Impossible de lancer ola : {exc}"
-    output = "\n".join(
-        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
-    )
-    return result.returncode, output or "(aucune sortie)"
+
+    output: list[str] = []
+
+    def push(text: str) -> None:
+        output.append(text)
+        if emit is not None:
+            emit(text)
+
+    if process.stdout is None:
+        return 1, "Impossible de lire la sortie de ola."
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        os.set_blocking(process.stdout.fileno(), False)
+        buffer = b""
+        started = time.monotonic()
+        while True:
+            if should_cancel is not None and should_cancel():
+                _terminate_process(process)
+                push("")
+                push("Action annulée par l'utilisateur.")
+                return 130, "\n".join(output).strip() or "(aucune sortie)"
+            if time.monotonic() - started > timeout:
+                _terminate_process(process)
+                push("")
+                push(f"Commande interrompue après {timeout} secondes.")
+                return 124, "\n".join(output).strip() or "(aucune sortie)"
+
+            events = selector.select(timeout=0.1)
+            if events:
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if chunk:
+                    # Progress reporters often update with carriage returns
+                    # instead of newlines; treat both as line boundaries so
+                    # downloads are visible while they run.
+                    buffer += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                    while b"\n" in buffer:
+                        raw, buffer = buffer.split(b"\n", 1)
+                        push(raw.decode("utf-8", errors="replace").rstrip("\r"))
+                elif process.poll() is not None:
+                    break
+            elif process.poll() is not None:
+                break
+        if buffer:
+            push(buffer.decode("utf-8", errors="replace").rstrip("\r"))
+        code = int(process.wait())
+        return code, "\n".join(output).strip() or "(aucune sortie)"
+    finally:
+        selector.close()
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -306,7 +413,7 @@ class ConfirmScreen(ModalScreen[bool]):
         self.confirm_variant = confirm_variant
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
+        with Vertical(classes=dialog_classes(self.app)):
             yield Static(self.dialog_title, classes="dialog-title")
             yield Static(self.dialog_message, classes="dialog-message")
             with Horizontal(classes="dialog-buttons"):
@@ -330,7 +437,7 @@ class AddModelScreen(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Annuler")]
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog"):
+        with Vertical(classes=dialog_classes(self.app)):
             yield Static("Ajouter et utiliser un modèle", classes="dialog-title")
             yield Static(
                 "Le modèle sera téléchargé si nécessaire, puis chargé. Les autres modèles seront déchargés de la RAM par ola use.",
@@ -368,26 +475,79 @@ class OutputScreen(Screen):
     BINDINGS = [
         Binding("escape", "close", "Fermer"),
         Binding("q", "close", "Fermer"),
+        Binding("ctrl+c", "cancel_action", "Annuler l'action"),
     ]
 
-    def __init__(self, title: str, content: str):
+    def __init__(self, title: str, content: str = "", running: bool = False):
         super().__init__()
         self.output_title = title
         self.output_content = content
+        self.running = running
+        self.finished_code: int | None = None
+        self.started_at = time.monotonic()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
             yield Static(self.output_title, id="output-title")
             yield RichLog(id="output-log", highlight=False, markup=False, wrap=True)
+            yield Static("", id="output-status")
         yield Footer()
 
     def on_mount(self) -> None:
         log = self.query_one("#output-log", RichLog)
-        log.write(self.output_content)
+        if self.output_content:
+            log.write(self.output_content)
         log.scroll_home(animate=False)
+        self._update_status()
+        if self.running:
+            self.set_interval(1.0, self._update_status)
+
+    def _elapsed(self) -> int:
+        return max(0, int(time.monotonic() - self.started_at))
+
+    def _update_status(self) -> None:
+        try:
+            status = self.query_one("#output-status", Static)
+        except Exception:
+            return
+        if self.running:
+            status.update(
+                f"En cours depuis {self._elapsed()} s · sortie en direct · q ou Ctrl+C : annuler"
+            )
+        elif self.finished_code is not None:
+            status.update(
+                f"Terminé · code {self.finished_code} · durée {self._elapsed()} s · q : fermer"
+            )
+
+    def append_output(self, text: str) -> None:
+        try:
+            self.query_one("#output-log", RichLog).write(text)
+        except Exception:
+            pass
+
+    def set_finished(self, code: int) -> None:
+        self.finished_code = int(code)
+        self.running = False
+        self._update_status()
+
+    def action_cancel_action(self) -> None:
+        if not self.running:
+            return
+        request = getattr(self.app, "request_action_cancel", None)
+        if callable(request):
+            request()
+        try:
+            self.query_one("#output-status", Static).update(
+                "Annulation demandée… attente de l'arrêt du processus."
+            )
+        except Exception:
+            pass
 
     def action_close(self) -> None:
+        if self.running:
+            self.action_cancel_action()
+            return
         self.app.pop_screen()
 
 
@@ -445,6 +605,119 @@ class LogsScreen(Screen):
         self.app.pop_screen()
 
 
+HELP_TEXT = """OLA — AIDE DE L'INTERFACE TERMINAL
+
+BUT
+Cette interface supervise Ollama et le tunnel Cloudflare. Le moteur reste
+la commande ola : la TUI lit l'API locale et délègue les actions au CLI,
+avec ses protections (un seul modèle chargé, suppression vérifiée,
+packs Speed/Fluidité et retours arrière).
+
+NAVIGATION
+  ↑ / ↓        Choisir un modèle
+  m            Ouvrir le menu d'actions du modèle sélectionné
+  ?            Cette aide
+  r            Rafraîchir l'état
+  t            Changer de thème
+  q / Échap    Fermer l'écran courant ; quitter depuis l'écran principal
+
+ACTIONS SUR LE MODÈLE SÉLECTIONNÉ
+  u  Utiliser : décharger les autres modèles, charger celui-ci, le définir par défaut
+  d  Supprimer définitivement du disque (confirmation)
+  l  Libérer de la RAM seulement (confirmation si le modèle est chargé)
+  a  Ajouter/télécharger puis utiliser un modèle
+  w  Préchauffer pour 30 minutes (confirmation si la RAM va changer)
+  p  Afficher le preset fluidité JSON
+  b  Benchmark classique (confirmation)
+  B  Benchmark streaming / premier token visible (confirmation)
+  s  État du Pack Speed
+  f  État du Pack Fluidité
+  g  Journaux Supervisor (1-5 pour changer, r rafraîchir)
+
+CONFIRMATIONS ET SÉCURITÉ
+Le focus initial d'une confirmation est toujours sur Annuler.
+Appuyer sur Entrée juste après l'ouverture annule donc l'action.
+Il faut choisir explicitement le bouton d'exécution pour continuer.
+La suppression du modèle par défaut exige toujours cette confirmation.
+
+ACTIONS LONGUES
+Les téléchargements, utilisations et benchmarks affichent leur sortie en
+direct avec le temps écoulé. Pendant l'exécution, q ou Ctrl+C demande
+l'annulation du processus ; q ferme ensuite l'écran de résultat.
+
+ACCÈS
+En root, toutes les actions sont disponibles.
+En non-root, l'affichage reste possible, mais Utiliser, Supprimer,
+Libérer RAM et Ajouter sont désactivés car ola exige root.
+
+TERMINAL
+À partir d'environ 95 colonnes ou 29 lignes, l'affichage est standard.
+En dessous, un mode compact masque la bannière et réduit les panneaux.
+Sur très petit terminal, les panneaux sont masqués pour garder le tableau
+des modèles utilisable.
+"""
+
+
+class HelpScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "close", "Fermer"),
+        Binding("q", "close", "Fermer"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical():
+            yield Static("Aide Ola", id="output-title")
+            yield TextArea(HELP_TEXT, id="help-content", read_only=True, show_line_numbers=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#help-content", TextArea).focus()
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
+class ActionMenuScreen(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Annuler"),
+        Binding("q", "cancel", "Annuler"),
+    ]
+
+    def __init__(self, model: str, protected_disabled: bool = False):
+        super().__init__()
+        self.model_name = model
+        self.protected_disabled = protected_disabled
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes=f"{dialog_classes(self.app)} action-dialog"):
+            yield Static(f"Actions — {self.model_name}", classes="dialog-title")
+            yield OptionList(
+                Option("u — Utiliser et définir par défaut", id="use", disabled=self.protected_disabled),
+                Option("d — Supprimer définitivement du disque…", id="delete", disabled=self.protected_disabled),
+                Option("l — Libérer de la RAM…", id="unload", disabled=self.protected_disabled),
+                Option("w — Préchauffer 30 minutes…", id="warm"),
+                Option("p — Preset fluidité", id="preset"),
+                Option("b — Benchmark classique…", id="bench"),
+                Option("B — Benchmark streaming…", id="stream"),
+                Option("s — État Pack Speed", id="speed"),
+                Option("f — État Pack Fluidité", id="fluid"),
+                Option("g — Journaux", id="logs"),
+                id="action-list",
+            )
+            yield Static("↑/↓ choisir · Entrée valider · Échap annuler", classes="dialog-message")
+
+    def on_mount(self) -> None:
+        self.query_one("#action-list", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(event.option.id)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class OlaTui(App):
     TITLE = "Ola"
     SUB_TITLE = "Ollama + Cloudflare"
@@ -483,6 +756,13 @@ class OlaTui(App):
         content-align: left middle;
     }
     #output-log { height: 1fr; border: solid $primary; }
+    #output-status {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
+        color: $text;
+    }
+    #help-content { height: 1fr; border: solid $primary; }
     #log-title {
         height: 2;
         padding: 0 1;
@@ -503,13 +783,35 @@ class OlaTui(App):
         border: thick $primary;
     }
     .dialog-title { text-style: bold; padding-bottom: 1; }
-    .dialog-message { padding-bottom: 1; }
+    .dialog-message { padding-bottom: 1; max-height: 12; overflow-y: auto; }
     .dialog-buttons { height: 3; align: right middle; }
     .dialog-buttons Button { margin-left: 1; }
+    .dialog.compact {
+        width: 60;
+        max-width: 96%;
+        max-height: 96%;
+        margin: 1 1;
+        padding: 0 1;
+    }
+    .dialog.compact .dialog-title { padding-bottom: 0; }
+    .dialog.compact .dialog-message { padding-bottom: 0; max-height: 8; overflow-y: auto; }
+    .action-dialog { width: 68; }
+    .action-dialog #action-list { height: 11; }
+    .dialog.compact.action-dialog #action-list { height: 8; }
+
+    /* Responsive terminal modes, toggled from App.on_resize/on_mount. */
+    .responsive-compact #banner { display: none; }
+    .responsive-compact #top { height: 9; }
+    .responsive-compact #summary, .responsive-compact #details { height: 9; }
+    .responsive-minimal #banner { display: none; }
+    .responsive-minimal #top { display: none; }
+    .responsive-minimal #status { display: none; }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quitter"),
+        Binding("?", "help", "Aide"),
+        Binding("m", "action_menu", "Actions"),
         Binding("r", "refresh", "Rafraîchir"),
         Binding("u", "use_model", "Utiliser"),
         Binding("d", "delete_model", "Supprimer"),
@@ -532,6 +834,7 @@ class OlaTui(App):
         self.show_cache: dict[str, dict[str, Any]] = {}
         self.refreshing = False
         self.action_running = False
+        self._action_cancel_requested = False
         self.theme_index = 0
         # Keep direct references to the main-screen widgets. App.query_one()
         # searches the currently displayed screen, so background refreshes
@@ -562,8 +865,26 @@ class OlaTui(App):
         self.status_widget = self.query_one("#status", Static)
         table = self.models_table
         table.add_columns("État", "Modèle", "Taille", "RAM", "Défaut", "Expiration", "Contexte")
+        self._apply_responsive_layout()
         self.set_interval(3.0, self._refresh_timer)
         await self.refresh_snapshot(force=True)
+
+    def _apply_responsive_layout(self) -> None:
+        width, height = self.size.width, self.size.height
+        compact = width < 95 or height < 29
+        minimal = width < 64 or height < 19
+        for screen in self.screen_stack:
+            screen.set_class(compact, "responsive-compact")
+            screen.set_class(minimal, "responsive-minimal")
+        if self.models_table is not None:
+            # Column widths and expiry formatting depend on terminal width.
+            self.table_signature = None
+
+    async def _on_resize(self, event: events.Resize) -> None:
+        await super()._on_resize(event)
+        self._apply_responsive_layout()
+        if self.models_table is not None and (self.snapshot.models or self.current_model):
+            self._render_snapshot()
 
     def _refresh_timer(self) -> None:
         if not self.refreshing and not self.action_running:
@@ -633,7 +954,7 @@ class OlaTui(App):
             summary.append(f"{format_bytes(snap.swap_free)} libres / {format_bytes(snap.swap_total)}\n")
         summary.append("Accès : ", style="bold")
         summary.append(
-            "root (actions actives)" if hasattr(os, "geteuid") and os.geteuid() == 0 else "non-root (ola refusera les actions protégées)"
+            "root (actions actives)" if running_as_root() else "non-root (lecture seule pour les actions protégées)"
         )
         if snap.error:
             summary.append(f"\nErreur API : {snap.error}", style="red")
@@ -642,17 +963,31 @@ class OlaTui(App):
         table = self.models_table
         previous = self.current_model
         default_norm = normalize_model(snap.default_model)
-        table_signature = tuple(
-            (
-                model.name,
-                model.size,
-                model.loaded,
-                model.loaded_size,
-                model.expires_at,
-                model.context_length,
-                normalize_model(model.name) == default_norm,
-            )
-            for model in snap.models
+        width = self.size.width
+        if width >= 110:
+            model_name_limit = 54
+        elif width >= 90:
+            model_name_limit = 42
+        elif width >= 70:
+            model_name_limit = 32
+        else:
+            model_name_limit = 24
+        short_expiry = width < 90
+        table_signature = (
+            model_name_limit,
+            short_expiry,
+            tuple(
+                (
+                    model.name,
+                    model.size,
+                    model.loaded,
+                    model.loaded_size,
+                    model.expires_at,
+                    model.context_length,
+                    normalize_model(model.name) == default_norm,
+                )
+                for model in snap.models
+            ),
         )
         # Avoid rebuilding the table every three seconds when nothing changed:
         # it would reset the cursor/scroll while the user is navigating.
@@ -661,13 +996,16 @@ class OlaTui(App):
             table.clear()
             for model in snap.models:
                 is_default = normalize_model(model.name) == default_norm
+                expiry = format_expiry(model.expires_at) if model.loaded else "—"
+                if short_expiry and model.loaded:
+                    expiry = expiry[:10]
                 table.add_row(
                     "● RAM" if model.loaded else "○ disque",
-                    model.name,
+                    display_model_name(model.name, model_name_limit),
                     format_bytes(model.size),
                     format_bytes(model.loaded_size) if model.loaded else "—",
                     "défaut" if is_default else "—",
-                    format_expiry(model.expires_at) if model.loaded else "—",
+                    expiry,
                     str(model.context_length or "—"),
                     key=model.name,
                 )
@@ -685,7 +1023,15 @@ class OlaTui(App):
                 self.current_model = ""
             else:
                 names = [model.name for model in snap.models]
-                target = previous if previous in names else names[-1]
+                loaded_names = [model.name for model in snap.models if model.loaded]
+                if previous in names:
+                    target = previous
+                elif loaded_names:
+                    # The loaded model consumes the scarce RAM resource; it is
+                    # the most useful initial selection for this console.
+                    target = loaded_names[0]
+                else:
+                    target = names[-1]
                 self.current_model = target
                 try:
                     table.move_cursor(row=names.index(target), column=0, animate=False)
@@ -780,19 +1126,80 @@ class OlaTui(App):
             return ""
         return name
 
+    def _selected_model_info(self, name: str) -> ModelInfo | None:
+        return next((item for item in self.snapshot.models if item.name == name), None)
+
+    def _require_root(self, action_label: str) -> bool:
+        if running_as_root():
+            return True
+        self.notify(
+            f"{action_label} : root requis. Relance avec sudo ola tui ou utilise ola en root.",
+            severity="error",
+        )
+        return False
+
+    def _confirm_cli(
+        self,
+        title: str,
+        message: str,
+        confirm_label: str,
+        output_title: str,
+        args: list[str],
+        timeout: int = 900,
+        confirm_variant: str = "primary",
+    ) -> None:
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                self.run_worker(
+                    self.execute_cli(output_title, args, timeout=timeout),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmScreen(title, message, confirm_label, confirm_variant=confirm_variant),
+            done,
+        )
+
+    def request_action_cancel(self) -> None:
+        if self.action_running:
+            self._action_cancel_requested = True
+            self.notify("Annulation de l'action demandée…", severity="warning")
+
     async def execute_cli(self, title: str, args: list[str], timeout: int = 900) -> None:
         if self.action_running:
             self.notify("Une action est déjà en cours.", severity="warning")
             return
         self.action_running = True
+        self._action_cancel_requested = False
         if self.status_widget is not None:
             self.status_widget.update(f"Exécution : ola {' '.join(args)} …")
+        screen = OutputScreen(
+            title,
+            f"{title}\nCommande : ola {' '.join(args)}\n\n",
+            running=True,
+        )
+        self.push_screen(screen)
+
+        def emit(line: str) -> None:
+            try:
+                self.call_from_thread(screen.append_output, line)
+            except Exception:
+                pass
+
         try:
-            code, output = await asyncio.to_thread(run_cli, args, timeout)
-            heading = f"{title}\nCommande : ola {' '.join(args)}\nCode de sortie : {code}\n\n"
-            self.push_screen(OutputScreen(title, heading + output))
+            code, _output = await asyncio.to_thread(
+                run_cli_stream,
+                args,
+                emit,
+                lambda: self._action_cancel_requested,
+                timeout,
+            )
+            screen.set_finished(code)
             if code == 0:
                 self.notify("Action terminée.")
+            elif code == 130:
+                self.notify("Action annulée.", severity="warning")
             else:
                 self.notify(f"La commande a échoué (code {code}).", severity="error")
         finally:
@@ -805,7 +1212,7 @@ class OlaTui(App):
 
     def action_use_model(self) -> None:
         model = self._require_model()
-        if not model:
+        if not model or not self._require_root("Utiliser un modèle"):
             return
 
         def done(confirmed: bool) -> None:
@@ -827,7 +1234,7 @@ class OlaTui(App):
 
     def action_delete_model(self) -> None:
         model = self._require_model()
-        if not model:
+        if not model or not self._require_root("Supprimer un modèle"):
             return
         is_default = normalize_model(model) == normalize_model(self.snapshot.default_model)
         args = ["delete", model, "--force"] if is_default else ["delete", model]
@@ -857,14 +1264,23 @@ class OlaTui(App):
 
     def action_unload_model(self) -> None:
         model = self._require_model()
-        if model:
-            self.run_worker(
-                self.execute_cli("Libérer la RAM", ["unload", model]),
-                group="actions",
-                exclusive=True,
-            )
+        if not model or not self._require_root("Libérer la RAM"):
+            return
+        info = self._selected_model_info(model)
+        if info is None or not info.loaded:
+            self.notify(f"{model} n'est pas chargé en RAM.", severity="warning")
+            return
+        self._confirm_cli(
+            "Libérer la RAM ?",
+            f"ola unload {model}\n\nLe modèle sera déchargé de la mémoire. Une génération en cours peut être interrompue ; le fichier du modèle restera sur le disque.",
+            "Libérer",
+            "Libérer la RAM",
+            ["unload", model],
+        )
 
     def action_add_model(self) -> None:
+        if not self._require_root("Ajouter un modèle"):
+            return
         def done(name: str | None) -> None:
             if name:
                 self.run_worker(
@@ -877,12 +1293,33 @@ class OlaTui(App):
 
     def action_warm_model(self) -> None:
         model = self._require_model()
-        if model:
+        if not model:
+            return
+        info = self._selected_model_info(model)
+        loaded_others = [
+            item.name for item in self.snapshot.models if item.loaded and item.name != model
+        ]
+        if info is not None and info.loaded and not loaded_others:
             self.run_worker(
                 self.execute_cli("Préchauffer un modèle", ["fluid", "warm", model]),
                 group="actions",
                 exclusive=True,
             )
+            return
+        if loaded_others:
+            consequence = (
+                f"Le modèle chargé {loaded_others[0]} sera déchargé de la RAM, "
+                f"puis {model} sera chargé et gardé au chaud 30 minutes."
+            )
+        else:
+            consequence = f"{model} sera chargé en RAM et gardé au chaud 30 minutes."
+        self._confirm_cli(
+            "Préchauffer ce modèle ?",
+            f"ola fluid warm {model}\n\n{consequence}",
+            "Préchauffer",
+            "Préchauffer un modèle",
+            ["fluid", "warm", model],
+        )
 
     def action_preset_model(self) -> None:
         model = self._require_model()
@@ -953,6 +1390,38 @@ class OlaTui(App):
             self.execute_cli("Fluidité", ["fluid"], timeout=120),
             group="actions",
             exclusive=True,
+        )
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+    def action_action_menu(self) -> None:
+        model = self._require_model()
+        if not model:
+            return
+
+        def done(action: str | None) -> None:
+            if not action:
+                return
+            handlers = {
+                "use": self.action_use_model,
+                "delete": self.action_delete_model,
+                "unload": self.action_unload_model,
+                "warm": self.action_warm_model,
+                "preset": self.action_preset_model,
+                "bench": self.action_bench_model,
+                "stream": self.action_stream_bench_model,
+                "speed": self.action_speed_status,
+                "fluid": self.action_fluid_status,
+                "logs": self.action_logs,
+            }
+            handler = handlers.get(action)
+            if handler is not None:
+                handler()
+
+        self.push_screen(
+            ActionMenuScreen(model, protected_disabled=not running_as_root()),
+            done,
         )
 
     def action_logs(self) -> None:
