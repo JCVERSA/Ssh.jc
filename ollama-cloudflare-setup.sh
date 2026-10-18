@@ -154,6 +154,31 @@ ollama_bin_path(){
   fi
 }
 
+
+large_tmp_parent(){
+  local candidates=() candidate kb best="" best_kb=0
+  if [[ -n "${OLLAMA_TMPDIR:-}" ]]; then
+    mkdir -p "$OLLAMA_TMPDIR" 2>/dev/null || return 1
+    [[ -w "$OLLAMA_TMPDIR" ]] || return 1
+    printf '%s' "$OLLAMA_TMPDIR"
+    return 0
+  fi
+  [[ -n "${TMPDIR:-}" ]] && candidates+=("$TMPDIR")
+  candidates+=(/var/tmp /tmp)
+  for candidate in "${candidates[@]}"; do
+    mkdir -p "$candidate" 2>/dev/null || continue
+    [[ -w "$candidate" ]] || continue
+    kb=$(df -Pk "$candidate" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+    if [[ "$kb" -gt "$best_kb" ]]; then
+      best="$candidate"
+      best_kb="$kb"
+    fi
+  done
+  [[ -n "$best" ]] || return 1
+  printf '%s' "$best"
+}
+
 install_ollama_binary(){
   local dpkg_arch asset tmp_dir archive sums expected actual
   dpkg_arch=$(dpkg --print-architecture 2>/dev/null || true)
@@ -165,13 +190,19 @@ install_ollama_binary(){
   apt_update
   apt_install curl ca-certificates zstd tar
 
-  tmp_dir=$(mktemp -d "/tmp/ollama-install-XXXXXX") || die "Could not create a temporary directory."
+  local tmp_parent avail_kb
+  tmp_parent=$(large_tmp_parent) || die "Could not find a writable temporary directory. Set OLLAMA_TMPDIR to a directory on a disk with at least 2 GB free."
+  avail_kb=$(df -Pk "$tmp_parent" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  tmp_dir=$(mktemp -d "$tmp_parent/ollama-install-XXXXXX") || die "Could not create a temporary directory in $tmp_parent."
   archive="$tmp_dir/$asset"
   sums="$tmp_dir/sha256sum.txt"
-  info "Downloading Ollama release asset: $asset"
+  info "Downloading Ollama release asset: $asset (temporary directory: $tmp_dir)"
+  if [[ "${avail_kb:-0}" =~ ^[0-9]+$ && "$avail_kb" -lt 1800000 ]]; then
+    warn "Only about $((avail_kb / 1024)) MB free on $tmp_parent. The Ollama archive is over 1 GB; if the download fails, free disk space or set OLLAMA_TMPDIR to a larger disk."
+  fi
   if ! curl -fL --retry 3 "https://github.com/ollama/ollama/releases/latest/download/${asset}" -o "$archive"; then
     rm -rf "$tmp_dir"
-    die "Could not download Ollama. Check outbound network access to GitHub."
+    die "Could not download Ollama. This is usually a network error or not enough free disk space; check 'df -h' (especially /tmp and /var/tmp) and outbound access to GitHub."
   fi
   if ! curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/sha256sum.txt" -o "$sums"; then
     rm -rf "$tmp_dir"
