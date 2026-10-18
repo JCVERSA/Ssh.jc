@@ -19,6 +19,7 @@ Ce dépôt contient deux outils indépendants pour les VPS et conteneurs Debian/
   - [Guide d’utilisation `ola`](#guide-dutilisation-ola)
   - [Gestion interactive des modèles](#gestion-interactive-des-modèles)
   - [Vitesse : mesurer et optimiser (Pack Speed)](#vitesse--mesurer-et-optimiser-pack-speed)
+    - [Fluidité : premier token et streaming](#fluidité--premier-token-et-streaming)
   - [Utiliser l’API Ollama](#utiliser-lapi-ollama)
   - [Fonctionnement 24/7, watchdog et récupération](#fonctionnement-247-watchdog-et-récupération)
   - [Mettre à jour `ola`](#mettre-à-jour-ola)
@@ -378,7 +379,7 @@ Explications :
 - `OLLAMA_ORIGINS="*"` : autorise les requêtes venant du tunnel malgré le contrôle d’origine d’Ollama ;
 - le Host public est réécrit par cloudflared en `localhost:11434`, ce qui évite le second contrôle Ollama qui rejette les hostnames publics ;
 - `OLLAMA_CONTEXT_LENGTH` : taille de contexte par défaut, volontairement basse pour les petits sandboxes ;
-- `OLLAMA_KEEP_ALIVE="5m"` : un modèle inactif peut être déchargé après 5 minutes ;
+- `OLLAMA_KEEP_ALIVE="5m"` : un modèle inactif peut être déchargé après 5 minutes ; cette valeur par défaut du serveur est enregistrée dans `/etc/ollama-cloudflare-keepalive` et se change délibérément avec `ola fluid keepalive <durée|reset>` (voir [Fluidité](#fluidité--premier-token-et-streaming)) ;
 - `OLLAMA_MAX_LOADED_MODELS="1"` : objectif d’un seul modèle chargé en RAM sur une nouvelle installation ;
 - `OLLAMA_NUM_PARALLEL="1"` : une seule requête à la fois, plus sûr en RAM.
 
@@ -447,6 +448,7 @@ Attention : après avoir changé `OLLAMA_CONTEXT_LENGTH` ou `CF_TUNNEL_PROTOCOL`
 | `/etc/ollama-cloudflare-url` | URL publique enregistrée |
 | `/etc/ollama-cloudflare-model` | Modèle par défaut utilisé par `ola test` et le gestionnaire |
 | `/etc/ollama-cloudflare-speed` | Mode vitesse enregistré : `balanced` ou `speed` (Pack Speed) |
+| `/etc/ollama-cloudflare-keepalive` | Keep-alive par défaut du serveur Ollama enregistré (absent = `5m`), modifié par `ola fluid keepalive` |
 | `/var/lib/ollama/` | Home du service Ollama |
 | `/var/lib/ollama/.ollama/models/` | Modèles téléchargés sur le disque |
 
@@ -533,6 +535,13 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola speed` | Affiche le mode vitesse global du serveur Ollama, la liste des modèles présents concernés, la configuration effective, le CPU (AVX/AVX2, cœurs), la RAM et les recommandations. Lecture seule. |
 | `ola speed apply` | Active le Pack Speed pour **tout le serveur Ollama** : mesure chaque modèle présent avant, active Flash Attention + cache KV `q8_0`, redémarre Ollama seul, puis vérifie et mesure chaque modèle présent après. Retour arrière automatique si un modèle qui fonctionnait ne répond plus. Root requis. |
 | `ola speed reset` | Désactive le Pack Speed pour tout le serveur et restaure la configuration équilibrée, avec mesure/vérification de chaque modèle présent. Root requis. |
+| `ola bench --stream` | Mesure la **fluidité** de tous les modèles présents, un par un : temps avant le 1er token visible (TTFT) et régularité du flux, en local et via l’URL publique enregistrée si elle est joignable, avec synthèse. Alias : `ola fluid bench`. |
+| `ola bench --stream <modèle>` | Mesure la fluidité uniquement pour le modèle indiqué. |
+| `ola fluid` | Affiche l’état fluidité : keep-alive enregistré et effectif, modèles présents, modèle chargé en RAM avec sa taille et son expiration, RAM/swap et actions disponibles. Lecture seule. |
+| `ola fluid warm [modèle]` | Charge un seul modèle (le défaut de `ola` si non précisé) et le garde chaud pour la session (keep-alive 30 min par requête, ou le keep-alive serveur s’il a été rallongé). Libère les autres modèles d’abord. |
+| `ola fluid preset [modèle]` | Affiche un preset de requête stable et rapide à copier dans ton client (`stream:true`, `think:false` seulement si le modèle déclare la capacité thinking, `num_ctx`/`num_thread` fixes, keep-alive de session). Lecture seule. |
+| `ola fluid keepalive <durée>` | Change le keep-alive par défaut du serveur (`OLLAMA_KEEP_ALIVE`) pour toutes les requêtes qui ne le précisent pas, par ex. `30m`, `1h`, `2h30m`, `3600` ou `-1`. Enregistré dans `/etc/ollama-cloudflare-keepalive`, vérification de l’API et du modèle, retour arrière automatique. Root requis. |
+| `ola fluid keepalive reset` | Restaure le keep-alive par défaut du serveur : `5m`. Root requis. |
 | `ola models` | En terminal interactif, ouvre le gestionnaire de modèles. Sinon, affiche simplement la liste des modèles téléchargés. |
 | `ola use <modèle>` | Change de modèle : décharge d’abord les autres modèles en RAM, télécharge si besoin, charge le modèle demandé et le définit comme défaut pour `ola`. |
 | `ola ps` | Liste les modèles actuellement chargés en RAM. |
@@ -802,7 +811,7 @@ Pour chaque modèle présent, `ola bench` envoie deux fois la même question cou
 1. avec le thinking par défaut ;
 2. avec `"think": false`.
 
-Il affiche pour chaque run le temps total, le temps de chargement, la vitesse du prompt et la vitesse de génération en tokens/seconde, puis un verdict propre à ce modèle. À la fin, une **synthèse globale** compare les modèles présents. Le premier run d’un modèle peut inclure son chargement en RAM ; relance `ola bench` pour comparer à chaud.
+Il affiche pour chaque run le temps total, le temps de chargement, la vitesse du prompt et la vitesse de génération en tokens/seconde, puis un verdict propre à ce modèle. Quand Ollama rapporte le nombre de tokens de prompt lus depuis son cache (`prompt_eval_cached_count`), la vitesse de prompt affichée est celle du **prompt non caché** (les tokens en cache sont exclus du calcul, car les versions récentes d’Ollama ne chronomètrent que la partie non cachée) ; le nombre de tokens en cache est affiché à côté. À la fin, une **synthèse globale** compare les modèles présents. Le premier run d’un modèle peut inclure son chargement en RAM ; relance `ola bench` pour comparer à chaud.
 
 Un modèle peut refuser `think:false` s’il n’a pas de mode réflexion : le bench le signale pour ce modèle précis et continue avec les autres. Si un run échoue, la synthèse le marque sans empêcher les autres modèles d’être testés.
 
@@ -853,7 +862,7 @@ Ce que `ola speed apply` ne change **jamais** :
 - `OLLAMA_NUM_PARALLEL="1"` : augmenter le parallélisme ne rend pas une requête seule plus rapide et consomme plus de RAM ;
 - `OLLAMA_MAX_LOADED_MODELS="1"` : un seul modèle en RAM ;
 - le contexte (`1024`) : un contexte plus grand coûte de la RAM ;
-- le keep-alive (`5m`).
+- le keep-alive : Pack Speed ne le touche pas ; il se règle séparément et délibérément avec `ola fluid keepalive` (défaut `5m`).
 
 Relancer `ola speed apply` alors que le mode est déjà actif ne réécrit pas la configuration et ne redémarre pas Ollama (détection « already set ») ; en revanche, la commande relance un bench global de contrôle afin d’inclure aussi les modèles ajoutés depuis. Même logique pour `ola speed reset` si le mode équilibré est déjà actif. Un nouveau setup conserve le mode enregistré.
 
@@ -893,6 +902,80 @@ curl -fsS https://ton-hostname.example/api/chat \
 ```
 
 Le keep-alive de 5 minutes est un compromis : le modèle reste en RAM pour des réponses suivantes rapides, puis la RAM est libérée. `ola unload` force la libération immédiate si tu as besoin de RAM pour autre chose.
+
+### Fluidité : premier token et streaming
+
+La vitesse de génération (tok/s) n’est pas ce que l’on ressent en premier. Ce qui se ressent, c’est :
+
+1. **le délai avant le premier token visible** (TTFT) : chargement du modèle s’il n’est pas en RAM, évaluation du prompt, puis premier morceau de réponse ;
+2. **la régularité du flux ensuite** : les tokens arrivent-ils au fur et à mesure, ou par paquets après de longs silences ?
+
+Le Pack Fluidité mesure ces deux choses au lieu de les supposer, et donne les leviers sûrs pour les améliorer sur un petit sandbox. Il ne change ni le nombre de modèles chargés, ni le parallélisme, ni le contexte.
+
+#### Mesurer la fluidité : `ola bench --stream`
+
+```bash
+ola bench --stream            # tous les modèles présents, un par un
+ola bench --stream <modèle>   # un seul modèle
+ola fluid bench               # alias
+```
+
+Pour chaque modèle présent, la commande envoie la même question courte en `stream:true` (preset stable : `num_ctx 1024`, `num_thread` = cœurs physiques estimés, 48 tokens max, température 0, d’abord avec `think:false` puis, si le modèle le refuse, avec son comportement par défaut). Elle affiche :
+
+- **1er token visible** : délai avant le premier morceau de réponse visible ; le contenu `thinking` caché ne compte pas, donc un modèle qui « réfléchit » longtemps avant d’écrire affiche son vrai délai ressenti ;
+- le temps total, le temps de chargement du modèle, la vitesse de génération ;
+- la vitesse du **prompt non caché** : Ollama met les compteurs dans le dernier morceau du flux (`total_duration`, `load_duration`, `prompt_eval_count`, `prompt_eval_cached_count`, `prompt_eval_duration`, `eval_count`, `eval_duration`, en nanosecondes) ; depuis Ollama 0.33.3, `prompt_eval_duration` ne chronomètre que les tokens de prompt **non** lus depuis le cache du prompt, donc `ola` soustrait d’abord les tokens en cache avant de calculer des tok/s — sinon, répéter le même prompt afficherait une vitesse de prompt gonflée par le cache. Le bench classique `ola bench` applique la même correction quand Ollama rapporte le compteur de cache ;
+- le **plus grand trou** entre deux morceaux visibles et le nombre de morceaux : c’est la mesure de régularité.
+
+Si une URL publique est enregistrée et joignable depuis le sandbox, la même mesure est refaite **à travers le tunnel** et comparée au local dans la synthèse. Si le sandbox ne résout pas son propre hostname public (déjà observé sur ce type d’hébergement alors que le tunnel répondait depuis l’extérieur), la mesure publique est ignorée avec un avertissement explicite : le TTFT public se mesure alors depuis ton client réel. C’est indispensable : la documentation Cloudflare indique que le trafic proxifié est bufferisé par défaut sauf si l’origine répond avec `Content-Type: text/event-stream`, alors qu’Ollama streame en JSON ligne par ligne (`application/x-ndjson`). Le chemin public peut donc, selon le client et le réseau, ne pas restituer le flux au fur et à mesure — seule la comparaison TTFT local/public le montre. Si le TTFT public est très supérieur au TTFT local ou si les morceaux publics arrivent par paquets, le problème est le chemin public (tunnel/client), pas le modèle ni le serveur.
+
+Les requêtes de ce bench gardent le modèle testé chaud 30 minutes (`keep_alive`) : enchaîner avec tes vraies questions juste après profite donc d’un modèle déjà chargé. `ola bench --stream` ne change aucune configuration et ne modifie aucun fichier de modèle ; il peut charger/décharger des modèles en RAM pendant la séquence, comme `ola bench`.
+
+#### Voir l’état : `ola fluid`
+
+```bash
+ola fluid
+```
+
+Affiche le keep-alive enregistré (`/etc/ollama-cloudflare-keepalive`) et celui réellement écrit dans Supervisor, les modèles présents, le modèle chargé en RAM avec la taille qu’il occupe, son expiration keep-alive et le contexte chargé (données de `/api/ps`), la RAM et le swap libres, l’URL publique enregistrée, et les actions fluidité disponibles. `ola doctor` affiche aussi une ligne « Fluid keep-alive ».
+
+#### Garder un modèle chaud pour une session : `ola fluid warm`
+
+```bash
+ola fluid warm              # modèle par défaut de ola
+ola fluid warm <modèle>
+```
+
+Décharge d’abord les autres modèles, charge le modèle choisi avec une micro-requête, et le garde en RAM pour la session : le keep-alive envoyé vaut 30 minutes (ou le keep-alive serveur si tu l’as rallongé avec `ola fluid keepalive`). Les requêtes suivantes démarrent alors sans temps de chargement. C’est un préchauffage par session, pas un réglage permanent : après la session, `ola unload` libère la RAM. Ollama garde par défaut un modèle 5 minutes après sa dernière requête ; chaque nouvelle requête relance ce délai.
+
+#### Preset stable à envoyer à chaque requête : `ola fluid preset`
+
+```bash
+ola fluid preset [modèle]
+```
+
+Affiche un corps de requête complet à copier dans ton client, adapté au modèle : `stream:true`, keep-alive de session, `num_ctx` et `num_thread` fixes, et `"think": false` **uniquement si le modèle déclare la capacité `thinking`** (lue via `/api/show`) — pour un modèle sans réflexion, la ligne est omise au lieu d’être refusée. Réutilise ce preset **tel quel à chaque requête de la session** :
+
+- changer `num_ctx` (ou certains réglages du runner comme `num_thread`) entre deux requêtes peut forcer Ollama à recharger le modèle : c’est un temps de chargement complet payé en plein milieu d’une conversation ;
+- garde le même début de prompt (même system prompt, historique dans le même ordre) : Ollama réutilise le cache du prompt pour la partie inchangée, et seuls les nouveaux tokens sont évalués — c’est visible dans le compteur « prompt non caché » des benchs ;
+- limite `num_predict` au besoin réel et évite de changer de modèle au milieu d’une session.
+
+#### Changer le keep-alive par défaut du serveur : `ola fluid keepalive`
+
+```bash
+ola fluid keepalive 30m     # ou 1h, 2h30m, 3600 (secondes), -1 (toujours chargé)
+ola fluid keepalive reset   # retour à 5m
+```
+
+Par défaut, Ollama décharge un modèle inactif après 5 minutes (`OLLAMA_KEEP_ALIVE="5m"`) : la requête suivante repaye le chargement. Rallonger cette valeur rend les retours de session plus fluides, mais le modèle occupe sa RAM entre-temps — sur un sandbox d’environ 2 Go, `qwen3:1.7b` chargé ne laissait qu’environ 378 Mo disponibles dans les mesures ci-dessous. `-1` garde le modèle chargé jusqu’à `ola unload`, `ola use <autre modèle>` ou l’arrêt d’Ollama : à réserver à une session de travail surveillée.
+
+La commande (root) enregistre la valeur dans `/etc/ollama-cloudflare-keepalive`, régénère la configuration Supervisor en **conservant le mode Pack Speed actuel**, redémarre Ollama seul, puis vérifie l’API et un modèle présent ; si la vérification échoue, l’ancienne configuration et l’ancienne valeur sont restaurées automatiquement. Un nouveau setup conserve la valeur enregistrée. Astuce intermédiaire : un client peut aussi envoyer `"keep_alive": "30m"` dans une seule requête pour garder le modèle chaud sans changer le défaut du serveur — c’est ce que font `ola fluid warm` et le preset.
+
+#### Compromis RAM, honnêtement
+
+- Le keep-alive ne rend **pas** la génération plus rapide : il supprime seulement le rechargement entre deux requêtes. La vitesse une fois le modèle chaud reste celle mesurée par `ola bench`.
+- Plus le keep-alive est long, plus la RAM reste occupée longtemps ; avec un seul modèle chargé (`OLLAMA_MAX_LOADED_MODELS="1"`), charger un autre modèle décharge de toute façon le précédent.
+- Si le swap se remplit pendant une génération, les réponses deviennent saccadées : `ola fluid` affiche le swap libre, et garder un contexte à `1024` avec un seul modèle chargé reste le réglage sûr.
 
 ### Résultats mesurés sur un petit sandbox
 
@@ -1020,7 +1103,7 @@ curl -fsS https://ton-hostname.example/api/chat \
   }'
 ```
 
-Pour une réponse plus rapide sur les questions simples, ajoute `"think": false`, `"stream": true` et une limite `options.num_predict` (voir [Vitesse : mesurer et optimiser (Pack Speed)](#vitesse--mesurer-et-optimiser-pack-speed), et mesure avec `ola bench`).
+Pour une réponse plus rapide sur les questions simples, ajoute `"think": false`, `"stream": true` et une limite `options.num_predict` (voir [Vitesse : mesurer et optimiser (Pack Speed)](#vitesse--mesurer-et-optimiser-pack-speed), et mesure avec `ola bench`). Pour la fluidité ressentie — premier token visible et flux régulier, en local comme via le tunnel — voir [Fluidité](#fluidité--premier-token-et-streaming) et `ola bench --stream` ; le preset complet à copier est donné par `ola fluid preset [modèle]`.
 
 En cas d’erreur de frappe dans l’URL copiée depuis un chat, préfère construire l’URL à partir de `ola status` plutôt que de recopier un lien formaté.
 
@@ -1304,6 +1387,20 @@ Vérifie aussi que tes requêtes simples utilisent `"think": false` et `"stream"
 
 Évite d’augmenter `OLLAMA_CONTEXT_LENGTH` sur un sandbox de 2 Go sans tester progressivement.
 
+### Réponses qui démarrent lentement ou arrivent par paquets
+
+Distingue d’abord les deux symptômes avec la mesure (voir [Fluidité](#fluidité--premier-token-et-streaming)) :
+
+```bash
+ola bench --stream
+ola fluid
+```
+
+- **Premier token lent, surtout à la première question après une pause** : le modèle n’était plus en RAM (chargement inclus dans le TTFT et dans le temps de chargement affiché). Garde-le chaud pendant la session : `ola fluid warm [modèle]`, ou rallonge le défaut serveur avec `ola fluid keepalive 30m` si la RAM le permet, ou envoie `"keep_alive": "30m"` dans tes requêtes.
+- **Premier token lent à chaque requête, même à chaud** : prompt long à évaluer ou preset qui change à chaque appel. Garde un début de prompt stable (le compteur « prompt non caché » doit baisser quand le cache du prompt est réutilisé), réutilise le preset de `ola fluid preset [modèle]` sans changer `num_ctx`/`num_thread` entre deux requêtes, et borne `num_predict`.
+- **TTFT local bon mais TTFT public très supérieur, ou morceaux qui arrivent par paquets via l’URL publique** : le chemin public (tunnel/client) bufferise ou retarde le flux ; ce n’est pas un réglage Ollama. Compare les deux lignes du bench streaming, teste depuis un autre client/réseau, et vérifie `ola doctor`. Cloudflare documente un buffering par défaut du trafic proxifié sauf si l’origine répond en `text/event-stream`, alors qu’Ollama streame en NDJSON : selon le client, l’affichage progressif peut donc ne pas être restitué tel quel via le tunnel même si le serveur streame correctement en local.
+- **Réponse qui semble vide avant d’arriver d’un bloc** : sur un modèle à réflexion sans `think:false`, le budget de tokens peut être consommé par le thinking invisible ; la première partie visible arrive tard. Pour les questions simples, utilise `think:false` quand le modèle l’accepte.
+
 ### Un modèle refuse de se décharger de la RAM
 
 Symptôme possible pendant un bench global ou un `ola speed apply` :
@@ -1565,6 +1662,18 @@ L’optimisation est globale : elle concerne le serveur Ollama et tous les modè
 3. Côté application : `"think": false` pour les questions simples si le modèle le supporte, `"stream": true`, et `options.num_predict` raisonnable — le champ `model` reste à indiquer à chaque requête.
 4. Garde un seul modèle en RAM (`ola ps`, `ola unload`).
 5. Si un modèle reste trop lent, c’est souvent sa taille qui domine : un modèle plus petit répondra plus vite, indépendamment du Pack Speed.
+
+### Comment rendre les réponses plus fluides (premier token rapide, texte qui défile) ?
+
+La fluidité se mesure, elle ne se devine pas :
+
+1. Mesure : `ola bench --stream` — temps avant le 1er token visible et régularité du flux, en local et via l’URL publique, pour chaque modèle présent ; `ola fluid` donne l’état (modèle chargé, expiration, keep-alive, RAM/swap).
+2. Pendant une session, garde un seul modèle chaud : `ola fluid warm [modèle]` ; après la session, `ola unload` libère la RAM.
+3. Envoie toujours le même preset stable à ce modèle (`ola fluid preset [modèle]`) : `stream:true`, `think:false` si le modèle l’accepte, même `num_ctx` à chaque requête, début de prompt stable pour profiter du cache du prompt.
+4. Si le démarrage reste lent après chaque pause, rallonge le keep-alive du serveur (`ola fluid keepalive 30m`, retour avec `ola fluid keepalive reset`) en surveillant la RAM : le modèle reste chargé entre les requêtes, mais il occupe sa mémoire.
+5. Si le local est fluide mais pas le public, le problème est le chemin tunnel/client, pas le serveur : compare les deux TTFT du bench streaming avant de changer un réglage.
+
+Détail complet : [Fluidité : premier token et streaming](#fluidité--premier-token-et-streaming).
 
 ### `ola speed apply` peut-il casser Ollama ?
 
