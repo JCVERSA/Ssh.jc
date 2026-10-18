@@ -12,6 +12,7 @@ CF_CONF_DIR="/etc/cloudflared"
 CF_CLI_HOME="${HOME:-/root}/.cloudflared"
 URL_FILE="/etc/ollama-cloudflare-url"
 MODEL_FILE="/etc/ollama-cloudflare-model"
+SPEED_FILE="/etc/ollama-cloudflare-speed"
 MODEL_DEFAULT="qwen3:1.7b"
 OLLAMA_USER="ollama"
 CLOUDFLARED_USER="cloudflared"
@@ -35,12 +36,13 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
+  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|bench|speed|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, start, recover, use, unload, delete, restart and stop require root; status, doctor, test, models, ps, logs and watchdog are read-only."
+  echo "setup, start, recover, use, unload, delete, restart, stop and 'speed apply|reset' require root; status, doctor, test, bench, speed, models, ps, logs and watchdog are read-only."
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."
   echo "ola delete (alias: ola rm) unloads the model from RAM first, then permanently deletes it from disk."
+  echo "ola bench [model] measures real generation speed (thinking on/off); ola speed shows CPU/RAM tuning, 'ola speed apply' enables the safe Pack Speed (Flash Attention + q8_0 KV cache), 'ola speed reset' restores the defaults. Parallel requests and context size are never raised by Pack Speed."
   echo "In an interactive terminal, ola models opens a model manager: u=use, d=delete, l=unload from RAM, a=add+use, q=quit."
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
@@ -911,6 +913,130 @@ stop_unmanaged_ollama(){
   fi
 }
 
+# Pack Speed mode is persisted in SPEED_FILE ("balanced" or "speed") so a
+# later setup keeps the choice. "balanced" is exactly the historical
+# configuration. "speed" only adds Flash Attention and a q8_0 KV cache; it
+# deliberately never raises OLLAMA_NUM_PARALLEL, OLLAMA_MAX_LOADED_MODELS or
+# the context length, which would cost RAM on small sandboxes.
+saved_speed_mode(){
+  local mode=""
+  if [[ -r "$SPEED_FILE" ]]; then
+    mode=$(head -n 1 "$SPEED_FILE" 2>/dev/null || true)
+  fi
+  case "$mode" in
+    speed) printf '%s' "speed" ;;
+    *) printf '%s' "balanced" ;;
+  esac
+}
+
+save_speed_mode(){
+  local mode=$1
+  printf '%s\n' "$mode" > "$SPEED_FILE" || die "Could not save the speed mode to $SPEED_FILE."
+  chmod 600 "$SPEED_FILE" || die "Could not set permissions on $SPEED_FILE."
+}
+
+ollama_environment_line(){
+  local mode=$1 env
+  env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"5m\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\""
+  if [[ "$mode" == "speed" ]]; then
+    env="${env},OLLAMA_FLASH_ATTENTION=\"1\",OLLAMA_KV_CACHE_TYPE=\"q8_0\""
+  fi
+  env="${env},HOME=\"$OLLAMA_HOME\""
+  printf '%s' "$env"
+}
+
+write_ollama_supervisor_config(){
+  local ollama_bin=$1 mode=$2 env_line
+  env_line=$(ollama_environment_line "$mode")
+  cat > "$SUP_DIR/ollama.conf" <<EOF
+[program:ollama]
+command=$ollama_bin serve
+user=$OLLAMA_USER
+environment=$env_line
+autostart=true
+autorestart=true
+startsecs=5
+startretries=10
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/supervisor/ollama.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile=/var/log/supervisor/ollama-error.log
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
+EOF
+  chmod 600 "$SUP_DIR/ollama.conf"
+}
+
+# Reads one OLLAMA_* value from the generated Supervisor config. Prints an
+# empty string when the file or the key is unavailable (for example when a
+# non-root user cannot read the root-only config file).
+ollama_config_value(){
+  local key=$1 file="$SUP_DIR/ollama.conf" line
+  [[ -r "$file" ]] || return 0
+  line=$(grep '^environment=' "$file" 2>/dev/null | head -n 1 || true)
+  [[ -n "$line" ]] || return 0
+  printf '%s' "$line" | tr ',' '\n' | sed -n "s/^${key}=\"\\(.*\\)\"$/\\1/p" | head -n 1
+}
+
+speed_config_matches(){
+  local mode=$1 flash
+  [[ -r "$SUP_DIR/ollama.conf" ]] || return 1
+  flash=$(ollama_config_value OLLAMA_FLASH_ATTENTION)
+  if [[ "$mode" == "speed" ]]; then
+    [[ "$flash" == "1" ]] || return 1
+    [[ "$(ollama_config_value OLLAMA_KV_CACHE_TYPE)" == "q8_0" ]] || return 1
+  else
+    [[ -z "$flash" ]] || return 1
+    [[ -z "$(ollama_config_value OLLAMA_KV_CACHE_TYPE)" ]] || return 1
+  fi
+  return 0
+}
+
+cpu_logical_cores(){
+  local n
+  n=$(nproc 2>/dev/null || printf '%s' "1")
+  [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || n=1
+  printf '%s' "$n"
+}
+
+cpu_physical_cores(){
+  local logical per sockets cores
+  logical=$(cpu_logical_cores)
+  per=""
+  sockets=""
+  if command -v lscpu >/dev/null 2>&1; then
+    per=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ { v=$2; gsub(/[[:space:]]/, "", v); print v; exit }')
+    sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ { v=$2; gsub(/[[:space:]]/, "", v); print v; exit }')
+  fi
+  if [[ "$per" =~ ^[0-9]+$ && "$sockets" =~ ^[0-9]+$ ]]; then
+    cores=$((per * sockets))
+    if [[ "$cores" -ge 1 && "$cores" -le "$logical" ]]; then
+      printf '%s' "$cores"
+      return 0
+    fi
+  fi
+  per=$(awk -F: '/^cpu cores/ { v=$2; gsub(/[[:space:]]/, "", v); print v; exit }' /proc/cpuinfo 2>/dev/null || true)
+  if [[ "$per" =~ ^[0-9]+$ && "$per" -ge 1 && "$per" -le "$logical" ]]; then
+    printf '%s' "$per"
+    return 0
+  fi
+  printf '%s' "$logical"
+}
+
+cpu_speed_summary(){
+  local flags
+  flags=$(awk -F: '/^flags/ { print $2; exit }' /proc/cpuinfo 2>/dev/null || true)
+  case " $flags " in
+    *" avx512f "*) printf '%s' "AVX-512 détecté (meilleur backend CPU Ollama attendu)" ;;
+    *" avx2 "*) printf '%s' "AVX2 détecté (bon backend CPU Ollama : cpu_avx2)" ;;
+    *" avx "*) printf '%s' "AVX détecté, sans AVX2 (backend CPU Ollama intermédiaire)" ;;
+    *) printf '%s' "ni AVX2 ni AVX détectés (backend CPU générique, plus lent)" ;;
+  esac
+}
+
 install_ollama(){
   local ollama_bin
   if ollama_bin=$(ollama_bin_path); then
@@ -929,26 +1055,10 @@ install_ollama(){
   # headers, while its Host check rejects public tunnel hostnames. The
   # origin allow-list is opened here, and cloudflared rewrites the Host
   # header to localhost:11434 in both tunnel modes below.
-  cat > "$SUP_DIR/ollama.conf" <<EOF
-[program:ollama]
-command=$ollama_bin serve
-user=$OLLAMA_USER
-environment=OLLAMA_HOST="127.0.0.1:11434",OLLAMA_ORIGINS="*",OLLAMA_CONTEXT_LENGTH="$OLLAMA_CONTEXT_LENGTH",OLLAMA_KEEP_ALIVE="5m",OLLAMA_MAX_LOADED_MODELS="1",OLLAMA_NUM_PARALLEL="1",HOME="$OLLAMA_HOME"
-autostart=true
-autorestart=true
-startsecs=5
-startretries=10
-stopsignal=TERM
-stopasgroup=true
-killasgroup=true
-stdout_logfile=/var/log/supervisor/ollama.log
-stdout_logfile_maxbytes=10MB
-stdout_logfile_backups=3
-stderr_logfile=/var/log/supervisor/ollama-error.log
-stderr_logfile_maxbytes=10MB
-stderr_logfile_backups=3
-EOF
-  chmod 600 "$SUP_DIR/ollama.conf"
+  write_ollama_supervisor_config "$ollama_bin" "$(saved_speed_mode)"
+  if [[ "$(saved_speed_mode)" == "speed" ]]; then
+    info "Pack Speed is enabled for Ollama (Flash Attention + q8_0 KV cache; context and parallel requests unchanged)."
+  fi
 
   stop_unmanaged_ollama "$ollama_bin"
   supervisor_apply
@@ -1566,9 +1676,293 @@ show_watchdog(){
   done
 }
 
+wait_for_ollama_api(){
+  local seconds=$1 i
+  for ((i=1; i<=seconds; i++)); do
+    if ollama_api_ready; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Runs one short, identical generation request and prints a TSV line:
+# total_ms, load_ms, prompt tok/s, generation tok/s, generated tokens,
+# prompt tokens, response snippet. think_mode is "off" (think:false) or
+# "default" (no think field, so thinking models may spend tokens thinking).
+bench_run(){
+  local model=$1 think_mode=$2 payload response raw total_ns load_ns p_count p_ns e_count e_ns content
+  if [[ "$think_mode" == "off" ]]; then
+    payload=$(jq -cn --arg model "$model" --argjson nctx "$OLLAMA_CONTEXT_LENGTH" \
+      '{model:$model, messages:[{role:"user", content:"Réponds en une phrase courte : pourquoi le ciel est bleu ?"}], stream:false, think:false, options:{num_ctx:$nctx, num_predict:48, temperature:0}}') || return 1
+  else
+    payload=$(jq -cn --arg model "$model" --argjson nctx "$OLLAMA_CONTEXT_LENGTH" \
+      '{model:$model, messages:[{role:"user", content:"Réponds en une phrase courte : pourquoi le ciel est bleu ?"}], stream:false, options:{num_ctx:$nctx, num_predict:48, temperature:0}}') || return 1
+  fi
+  response=$(curl -fsS --max-time 300 http://127.0.0.1:11434/api/chat \
+    -H 'Content-Type: application/json' -d "$payload" 2>/dev/null) || return 1
+  raw=$(printf '%s' "$response" | jq -r '[ (.total_duration // 0), (.load_duration // 0), (.prompt_eval_count // 0), (.prompt_eval_duration // 0), (.eval_count // 0), (.eval_duration // 0) ] | @tsv' 2>/dev/null) || return 1
+  IFS=$'\t' read -r total_ns load_ns p_count p_ns e_count e_ns <<< "$raw"
+  content=$(printf '%s' "$response" | jq -r '.message.content // .response // ""' 2>/dev/null | tr '\n\t' '  ' | tr -d '\134' | cut -c1-90 || true)
+  awk -v t="$total_ns" -v l="$load_ns" -v pc="$p_count" -v pd="$p_ns" -v ec="$e_count" -v ed="$e_ns" -v c="$content" \
+    'BEGIN { printf "%d\t%d\t%.1f\t%.1f\t%d\t%d\t%s", t / 1000000, l / 1000000, (pd > 0 ? pc / (pd / 1000000000) : 0), (ed > 0 ? ec / (ed / 1000000000) : 0), ec, pc, c }'
+}
+
+bench_print_line(){
+  local label=$1 res=$2 total_ms load_ms p_tps e_tps e_count p_count content total_s load_s
+  IFS=$'\t' read -r total_ms load_ms p_tps e_tps e_count p_count content <<< "$res"
+  total_s=$(awk -v ms="${total_ms:-0}" 'BEGIN { printf "%.1f", ms / 1000 }')
+  load_s=$(awk -v ms="${load_ms:-0}" 'BEGIN { printf "%.1f", ms / 1000 }')
+  printf '%s : total %s s · chargement %s s · prompt %s tok/s · génération %s tok/s (%s tokens générés)\n' \
+    "$label" "$total_s" "$load_s" "${p_tps:-0}" "${e_tps:-0}" "${e_count:-0}"
+  if [[ -n "${content:-}" ]]; then
+    printf '   Réponse : %s\n' "$content"
+  fi
+}
+
+run_bench(){
+  local requested=${1:-} model installed loaded mem_kb base public_url threads
+  local res_default="" res_off="" have_default=0 have_off=0 d_total o_total gain
+  require_commands curl jq
+  ollama_api_ready || die "Ollama API is not answering, so the benchmark cannot run. Try: ola recover"
+  model=${requested:-$(saved_model_name)}
+  is_valid_model_name "$model" || die "Invalid model name: $model (example: qwen3:1.7b)"
+  installed=$(installed_model_names) || die "Could not read the installed model list from Ollama."
+  model_names_contain "$installed" "$model" \
+    || die "Model is not downloaded on disk: $model. Install and load it first with: ola use $model"
+  threads=$(cpu_physical_cores)
+
+  echo "--- Ola bench ---"
+  info "Modèle : $model"
+  info "CPU : $(cpu_logical_cores) logique(s), environ $threads physique(s) — $(cpu_speed_summary)"
+  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    info "RAM disponible : environ $((mem_kb / 1024)) MB"
+  fi
+  loaded=$(loaded_model_names 2>/dev/null || true)
+  if model_names_contain "$loaded" "$model"; then
+    info "Le modèle est déjà chargé en RAM."
+  else
+    info "Le modèle n'est pas encore chargé : le premier run inclura son temps de chargement."
+  fi
+  echo "Test identique pour les deux runs : même question courte, 48 tokens max, num_ctx $OLLAMA_CONTEXT_LENGTH, température 0."
+  echo
+
+  info "Run 1/2 : thinking par défaut (sans think:false)..."
+  if res_default=$(bench_run "$model" default); then
+    have_default=1
+    bench_print_line "Thinking par défaut" "$res_default"
+  else
+    err "Le run avec thinking par défaut a échoué pour le modèle : $model"
+  fi
+  echo
+  info "Run 2/2 : think:false..."
+  if res_off=$(bench_run "$model" off); then
+    have_off=1
+    bench_print_line "think:false        " "$res_off"
+  else
+    warn "think:false a été refusé par ce modèle (modèle sans mode réflexion, probablement) : ignore ce réglage pour lui."
+  fi
+  [[ "$have_default" -eq 1 || "$have_off" -eq 1 ]] \
+    || die "Benchmark failed for model: $model. Check: ola logs"
+
+  echo
+  if [[ "$have_default" -eq 1 && "$have_off" -eq 1 ]]; then
+    d_total=$(printf '%s' "$res_default" | cut -f1)
+    o_total=$(printf '%s' "$res_off" | cut -f1)
+    if [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$d_total" -gt 0 && "$o_total" -lt "$d_total" ]]; then
+      gain=$(awk -v d="$d_total" -v o="$o_total" 'BEGIN { printf "%.0f", (d - o) / d * 100 }')
+      ok "Verdict mesuré : think:false a été environ ${gain}% plus rapide sur ce test. Pour les questions simples, c'est le gain le plus facile."
+    elif [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$o_total" -gt "$d_total" ]]; then
+      warn "Verdict mesuré : think:false n'a pas été plus rapide sur ce test (le premier run inclut parfois le chargement du modèle ; relance ola bench pour confirmer)."
+    else
+      info "Verdict mesuré : pas de différence nette entre les deux runs sur ce test."
+    fi
+  fi
+
+  base="http://127.0.0.1:11434"
+  if [[ -r "$URL_FILE" ]]; then
+    public_url=$(head -n 1 "$URL_FILE" 2>/dev/null || true)
+    [[ -n "$public_url" ]] && base="$public_url"
+  fi
+  cat <<EOF
+
+Conseils vitesse, du plus efficace au plus fin :
+  1. Questions simples : envoie "think": false (mesuré ci-dessus) et limite la longueur avec options.num_predict (ex. 128 ou 256).
+  2. Utilise "stream": true dans tes applis : la génération n'est pas plus rapide, mais les tokens s'affichent au fur et à mesure.
+  3. Côté client, essaie options.num_thread ≈ $threads (cœurs physiques estimés) et compare ; options.num_batch ne sert surtout qu'aux très longs prompts.
+  4. Garde un seul modèle chargé (ola ps / ola unload) : sur un petit sandbox, la RAM libre évite les lenteurs.
+  5. Le keep-alive actuel (5m) garde le modèle en RAM 5 minutes : réponses suivantes plus rapides, mais RAM occupée. ola unload libère tout de suite.
+
+Exemple rapide à copier (remplace l'URL par la tienne si besoin) :
+curl -fsS $base/api/chat -H 'Content-Type: application/json' -d '{
+  "model": "$model",
+  "messages": [{"role": "user", "content": "Dis bonjour en une phrase."}],
+  "stream": true,
+  "think": false,
+  "options": {"num_predict": 128, "num_thread": $threads}
+}'
+EOF
+}
+
+show_speed(){
+  local mode flash kv mem_kb loaded
+  select_supervisor_paths
+  mode=$(saved_speed_mode)
+  echo "--- Ola speed (Pack Speed) ---"
+  if [[ -f "$SPEED_FILE" && ! -r "$SPEED_FILE" ]]; then
+    echo "Mode enregistré : non lisible sans root (fichier $SPEED_FILE)"
+  else
+    echo "Mode enregistré : $mode (fichier $SPEED_FILE)"
+  fi
+  echo "Configuration Supervisor effective ($SUP_DIR/ollama.conf) :"
+  if [[ -r "$SUP_DIR/ollama.conf" ]]; then
+    flash=$(ollama_config_value OLLAMA_FLASH_ATTENTION)
+    kv=$(ollama_config_value OLLAMA_KV_CACHE_TYPE)
+    echo "  OLLAMA_FLASH_ATTENTION : ${flash:-non défini (désactivé)}"
+    echo "  OLLAMA_KV_CACHE_TYPE   : ${kv:-non défini (f16 par défaut)}"
+    echo "  OLLAMA_CONTEXT_LENGTH  : $(ollama_config_value OLLAMA_CONTEXT_LENGTH)"
+    echo "  OLLAMA_KEEP_ALIVE      : $(ollama_config_value OLLAMA_KEEP_ALIVE)"
+    echo "  OLLAMA_MAX_LOADED_MODELS : $(ollama_config_value OLLAMA_MAX_LOADED_MODELS)"
+    echo "  OLLAMA_NUM_PARALLEL    : $(ollama_config_value OLLAMA_NUM_PARALLEL)"
+  else
+    echo "  Non lisible par cet utilisateur (relance en root pour le détail)."
+  fi
+  echo "CPU : $(cpu_logical_cores) logique(s), environ $(cpu_physical_cores) physique(s) — $(cpu_speed_summary)"
+  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    echo "RAM disponible : environ $((mem_kb / 1024)) MB"
+  fi
+  if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && ollama_api_ready; then
+    loaded=$(loaded_model_names 2>/dev/null || true)
+    if [[ -n "$loaded" ]]; then
+      echo "Modèle(s) chargé(s) en RAM : $(printf '%s' "$loaded" | tr '\n' ' ')"
+    else
+      echo "Aucun modèle chargé en RAM pour le moment."
+    fi
+  else
+    echo "API Ollama locale non joignable : état RAM du modèle inconnu."
+  fi
+  cat <<'EOF'
+
+Ce que "ola speed apply" change (avec mesure avant/après et retour arrière auto si Ollama ne répond plus) :
+  OLLAMA_FLASH_ATTENTION=1 et OLLAMA_KV_CACHE_TYPE=q8_0 (cache KV ~2x plus léger que f16, gain RAM et vitesse possible).
+Ce qu'il ne change jamais : OLLAMA_NUM_PARALLEL=1, OLLAMA_MAX_LOADED_MODELS=1, le contexte et le keep-alive (5m),
+car les augmenter coûterait de la RAM sans rendre une requête seule plus rapide.
+Revenir en arrière : ola speed reset
+Mesurer avant/après : ola bench
+EOF
+}
+
+rollback_speed_config(){
+  local backup=$1 prev_existed=$2 prev_value=$3
+  cp -a "$backup" "$SUP_DIR/ollama.conf" 2>/dev/null || true
+  chmod 600 "$SUP_DIR/ollama.conf" 2>/dev/null || true
+  if [[ "$prev_existed" -eq 1 ]]; then
+    printf '%s\n' "$prev_value" > "$SPEED_FILE" 2>/dev/null || true
+    chmod 600 "$SPEED_FILE" 2>/dev/null || true
+  else
+    rm -f "$SPEED_FILE"
+  fi
+  supervisor_apply >/dev/null 2>&1 || true
+  supervisor_ctl start ollama >/dev/null 2>&1 || true
+  wait_for_supervisor_program ollama 30 >/dev/null 2>&1 || true
+  wait_for_ollama_api 30 || true
+}
+
+apply_speed_mode(){
+  local target=$1 ollama_bin current model installed backup prev_speed_existed=0 prev_speed_value=""
+  local before_res="" after_res="" before_tps="" after_tps="" verify_payload model_installed=0
+  select_supervisor_paths
+  [[ -f "$SUP_DIR/ollama.conf" ]] || die "Ollama Supervisor config not found: $SUP_DIR/ollama.conf. Run setup first: ola setup"
+  ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
+  require_commands curl jq
+  ensure_service_users
+  current=$(saved_speed_mode)
+  if [[ "$current" == "$target" ]] && speed_config_matches "$target"; then
+    ok "Speed mode is already set: $target (Supervisor config already matches)."
+    show_speed
+    return 0
+  fi
+
+  if ! supervisor_program_running ollama; then
+    info "Ollama is not RUNNING; starting it before applying the speed mode..."
+    supervisor_ctl start ollama 2>/dev/null || supervisor_ctl restart ollama \
+      || die "Could not start Ollama. Check: ola logs"
+    wait_for_supervisor_program ollama 30 || die "Ollama did not reach RUNNING. Check: ola logs"
+  fi
+  ollama_api_ready || die "Ollama API is not answering. Try: ola recover"
+
+  model=$(saved_model_name)
+  installed=$(installed_model_names) || die "Could not read the installed model list from Ollama."
+  if model_names_contain "$installed" "$model"; then
+    model_installed=1
+    info "Measuring current speed before the change (think:false, 48 tokens max)..."
+    if before_res=$(bench_run "$model" off); then
+      before_tps=$(printf '%s' "$before_res" | cut -f4)
+      info "Before: generation ${before_tps} tok/s for $model"
+    else
+      warn "Pre-change benchmark failed; continuing without a before/after comparison."
+      before_res=""
+    fi
+  else
+    warn "Default model $model is not downloaded; skipping the before/after benchmark and the chat verification."
+  fi
+
+  backup=$(mktemp) || die "Could not create a temporary backup of the Ollama Supervisor config."
+  cp -a "$SUP_DIR/ollama.conf" "$backup" || { rm -f "$backup"; die "Could not back up $SUP_DIR/ollama.conf."; }
+  if [[ -f "$SPEED_FILE" ]]; then
+    prev_speed_existed=1
+    prev_speed_value=$(head -n 1 "$SPEED_FILE" 2>/dev/null || true)
+  fi
+
+  info "Applying speed mode: $target"
+  save_speed_mode "$target"
+  write_ollama_supervisor_config "$ollama_bin" "$target"
+  supervisor_apply
+  supervisor_ctl start ollama >/dev/null 2>&1 || true
+  if ! wait_for_supervisor_program ollama 30 || ! wait_for_ollama_api 30; then
+    warn "Ollama did not come back after applying speed mode $target; restoring the previous configuration..."
+    rollback_speed_config "$backup" "$prev_speed_existed" "$prev_speed_value"
+    rm -f "$backup"
+    die "Speed mode $target could not be applied; the previous Ollama configuration was restored. Check: ola logs"
+  fi
+
+  if [[ "$model_installed" -eq 1 ]]; then
+    verify_payload=$(jq -cn --arg model "$model" '{model:$model, messages:[{role:"user", content:"Reply only with OK."}], stream:false, options:{num_predict:16}}') \
+      || { rollback_speed_config "$backup" "$prev_speed_existed" "$prev_speed_value"; rm -f "$backup"; die "Could not build the verification request; the previous Ollama configuration was restored."; }
+    if ! curl -fsS --max-time 180 http://127.0.0.1:11434/api/chat \
+      -H 'Content-Type: application/json' -d "$verify_payload" >/dev/null 2>&1; then
+      warn "The verification chat failed after applying speed mode $target; restoring the previous configuration..."
+      rollback_speed_config "$backup" "$prev_speed_existed" "$prev_speed_value"
+      rm -f "$backup"
+      die "Speed mode $target failed verification; the previous Ollama configuration was restored. Check: ola logs"
+    fi
+    ok "Verification chat passed with speed mode: $target"
+  fi
+
+  if [[ -n "$before_res" ]]; then
+    info "Measuring speed after the change (same test)..."
+    if after_res=$(bench_run "$model" off); then
+      after_tps=$(printf '%s' "$after_res" | cut -f4)
+      echo "Avant : génération ${before_tps} tok/s · Après : génération ${after_tps} tok/s (test court think:false, 48 tokens max; la variance CPU peut masquer les petits écarts)."
+    else
+      warn "Post-change benchmark failed; run: ola bench"
+    fi
+  fi
+  rm -f "$backup"
+  ok "Speed mode is now: $target. Full comparison anytime with: ola bench"
+  if [[ "$target" == "speed" ]]; then
+    echo "Actif : OLLAMA_FLASH_ATTENTION=1, OLLAMA_KV_CACHE_TYPE=q8_0. Inchangés : contexte $OLLAMA_CONTEXT_LENGTH, 1 modèle chargé, 1 requête parallèle, keep-alive 5m."
+  else
+    echo "Configuration équilibrée restaurée (pas de Flash Attention, cache KV par défaut). Inchangés : contexte, parallélisme et keep-alive."
+  fi
+}
+
 show_doctor(){
   local failures=0 warnings=0 cmd program version_json ollama_version tags_json ps_json model_names loaded_names
-  local model home_dir mem_kb disk_kb log_bytes public_url state validate_output
+  local model home_dir mem_kb disk_kb log_bytes public_url state validate_output speed_flash speed_kv
   select_supervisor_paths
   echo "--- Ola doctor ---"
 
@@ -1706,6 +2100,10 @@ show_doctor(){
     warn "Could not determine available RAM"
     warnings=$((warnings + 1))
   fi
+
+  speed_flash=$(ollama_config_value OLLAMA_FLASH_ATTENTION)
+  speed_kv=$(ollama_config_value OLLAMA_KV_CACHE_TYPE)
+  info "Speed mode: $(saved_speed_mode) (Flash Attention: ${speed_flash:-off}, KV cache: ${speed_kv:-default f16}) — details: ola speed, measure: ola bench"
 
   disk_kb=$(free_kb "$home_dir")
   if [[ "$disk_kb" -gt 0 && "$disk_kb" -lt 1048576 ]]; then
@@ -1931,6 +2329,34 @@ case "${1:-}" in
   test)
     run_ola_test
     ;;
+  bench)
+    run_bench "${2:-}"
+    ;;
+  speed)
+    case "${2:-status}" in
+      status)
+        show_speed
+        ;;
+      apply)
+        require_root
+        install_ola_command
+        require_supervisor_running
+        ensure_watchdog
+        apply_speed_mode speed
+        ;;
+      reset|off)
+        require_root
+        install_ola_command
+        require_supervisor_running
+        ensure_watchdog
+        apply_speed_mode balanced
+        ;;
+      *)
+        err "Usage: ola speed [status|apply|reset]"
+        exit 1
+        ;;
+    esac
+    ;;
   use)
     require_root
     if [[ -z "${2:-}" ]]; then
@@ -2027,9 +2453,11 @@ case "${1:-}" in
     echo "9) Unload loaded model(s) from RAM"
     echo "10) Delete a model from disk"
     echo "11) Watchdog status"
-    echo "12) Stop tunnel"
-    echo "13) Exit"
-    if ! choice=$(prompt_value "Choice [13]: " "13"); then
+    echo "12) Benchmark vitesse (ola bench)"
+    echo "13) Vitesse / Pack Speed (état)"
+    echo "14) Stop tunnel"
+    echo "15) Exit"
+    if ! choice=$(prompt_value "Choice [15]: " "15"); then
       warn "No input received; exiting."
       exit 0
     fi
@@ -2078,8 +2506,10 @@ case "${1:-}" in
         delete_model_command "$model_choice" "$delete_force"
         ;;
       11) show_watchdog ;;
-      12) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
-      13) exit 0 ;;
+      12) run_bench "" ;;
+      13) show_speed ;;
+      14) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
+      15) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
     ;;
