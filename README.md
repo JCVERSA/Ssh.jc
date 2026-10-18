@@ -878,9 +878,40 @@ curl -fsS https://ton-hostname.example/api/chat \
 
 Le keep-alive de 5 minutes est un compromis : le modèle reste en RAM pour des réponses suivantes rapides, puis la RAM est libérée. `ola unload` force la libération immédiate si tu as besoin de RAM pour autre chose.
 
+### Résultats mesurés sur un petit sandbox
+
+Mesures de référence obtenues avec `ola bench` et `ola speed apply` sur un sandbox d’environ 2 Go de RAM, 2 vCPU avec AVX-512 détecté, Ollama `0.40.6`, modèle `qwen3:1.7b` et contexte `1024`. Test : même question courte, 48 tokens maximum, température 0.
+
+| Configuration | Run | Temps total | Chargement | Génération | Tokens générés | Réponse visible |
+|---|---|---:|---:|---:|---:|---|
+| `balanced`, modèle pas encore chargé | Thinking par défaut | 9,3 s | 5,1 s | 12,6 tok/s | 48 | **vide** |
+| `balanced`, premier run suivant | `think:false` | 3,6 s | 0,0 s | 12,7 tok/s | 43 | oui |
+| `speed`, modèle déjà chargé | Thinking par défaut | 3,5 s | 0,0 s | 14,1 tok/s | 48 | **vide** |
+| `speed`, modèle déjà chargé | `think:false` | 2,9 s | 0,0 s | 14,4 tok/s | 40 | oui |
+
+La mesure intégrée à `ola speed apply` a donné, sur son test court : **15,1 tok/s avant** puis **13,7 tok/s après**. Le bench complet suivant, à chaud, a mesuré **14,4 tok/s** en mode `speed`. Ces valeurs courtes varient sensiblement d’un run à l’autre.
+
+Interprétation honnête :
+
+- **Le gain clairement démontré vient de `think:false`, pas d’une génération brute plus rapide.** La génération reste autour de 12,6 à 14,4 tok/s dans ces tests ; `think:false` supprime surtout les tokens de réflexion invisibles, donc la réponse utile arrive plus tôt.
+- **Une réponse peut être vide si le thinking consomme tout le budget de tokens.** Dans les deux runs avec thinking par défaut, les 48 tokens ont été utilisés avant la réponse visible. Pour une question simple, utilise `think:false` ; si tu gardes le thinking, prévois un `options.num_predict` nettement plus large.
+- Le premier verdict de `ola bench` affichait environ 61 % plus rapide pour `think:false`, mais ce run incluait aussi 5,1 s de chargement du modèle. À chaud, le même bench affichait environ 18 %. Compare donc plutôt des benchs à chaud, dans la même configuration.
+- **Le gain de Flash Attention + cache KV `q8_0` n’est pas démontré sur ces prompts courts.** Le cache KV est alors très petit ; l’intérêt principal du `q8_0` est de réduire la RAM du cache quand les conversations et le contexte grandissent. Le mode `speed` peut être conservé s’il reste stable, et `ola speed reset` permet de revenir en arrière.
+- La RAM disponible est passée d’environ 1799 Mo (modèle non chargé) à environ 378–379 Mo (modèle chargé). Cette baisse correspond principalement au chargement normal de `qwen3:1.7b`, pas au Pack Speed.
+
+Pour reproduire une comparaison serveur plus propre :
+
+```bash
+ola bench          # attendre que le modèle soit chaud, noter le run think:false
+ola speed reset
+ola bench          # comparer le run think:false à chaud
+ola speed apply
+ola bench          # comparer à nouveau ; répéter si les écarts sont faibles
+```
+
 ### Limites honnêtes
 
-- Aucun réglage ne promet un gain précis : l’effet de Flash Attention et du cache `q8_0` dépend du modèle, du CPU et de la version d’Ollama ; c’est pour cela que `ola speed apply` mesure avant/après au lieu de promettre un chiffre.
+- Aucun réglage ne promet un gain précis : l’effet de Flash Attention et du cache `q8_0` dépend du modèle, du CPU et de la version d’Ollama ; c’est pour cela que `ola speed apply` mesure avant/après au lieu de promettre un chiffre. Sur le sandbox de référence ci-dessus, aucun gain `speed` n’a été démontré sur prompts courts.
 - La qualité peut très légèrement varier avec un cache KV quantifié ; `q8_0` est le réglage prudent (le `q4_0`, plus agressif, n’est pas utilisé ici).
 - Si le modèle ne supporte pas le mode réflexion, `think:false` peut être refusé : `ola bench` te le signale et il suffit d’ignorer ce réglage pour ce modèle.
 - Le levier le plus radical reste un modèle plus petit, par exemple `ola use qwen3:0.6b` (environ 523 Mo) si la qualité suffit.
