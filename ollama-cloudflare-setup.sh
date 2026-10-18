@@ -590,21 +590,39 @@ EOF
   cloudflared tunnel route dns "$uuid" "$hostname" \
     || die "Could not create/update the Cloudflare DNS route for $hostname."
 
-  local i public_url="https://${hostname}"
+  local i public_url="https://${hostname}" public_verified=0
+  info "Waiting up to 2 minutes for ${public_url}/api/version (DNS/Cloudflare propagation)..."
   for i in $(seq 1 60); do
-    if curl -fsS "${public_url}/api/version" >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "${public_url}/api/version" >/dev/null 2>&1; then
+      public_verified=1
       break
     fi
-    if [[ "$i" -eq 60 ]]; then
-      die "Named tunnel is running, but ${public_url}/api/version did not answer in time. Check DNS, Cloudflare and $LOG_DIR/cloudflared-ollama-error.log"
+    if [[ "$i" -eq 20 || "$i" -eq 40 ]]; then
+      info "Still waiting for the public hostname to answer..."
     fi
-    sleep 1
+    sleep 2
   done
 
   printf '%s\n' "$public_url" > "$URL_FILE"
   chmod 600 "$URL_FILE"
   tighten_log_permissions
-  ok "Named tunnel configured and verified: $public_url"
+  if [[ "$public_verified" -eq 1 ]]; then
+    ok "Named tunnel configured and verified: $public_url"
+  else
+    # The connector is RUNNING, ingress was validated and Cloudflare accepted
+    # the DNS route. A probe from the same server can still fail because of
+    # DNS propagation/cache or hairpin routing, so do not throw away an
+    # otherwise working tunnel: save the URL and report the probe honestly.
+    warn "Named tunnel is configured and its DNS route was created, but the public probe from this server did not confirm ${public_url}/api/version yet."
+    warn "Test it from a browser or another device: ${public_url}/api/version"
+    supervisor_ctl status || true
+    cloudflared tunnel info "$uuid" 2>/dev/null || true
+    if [[ -r "$LOG_DIR/cloudflared-ollama-error.log" ]]; then
+      echo "--- Last cloudflared log lines ---"
+      tail -n 30 "$LOG_DIR/cloudflared-ollama-error.log" || true
+    fi
+    ok "Named tunnel configured: $public_url (public answer not yet confirmed from this server)"
+  fi
   warn "No Access policy was added. The Ollama API is public at this hostname without authentication."
 }
 
