@@ -35,10 +35,11 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|logs|restart|stop|watchdog]"
+  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|use|ps|unload|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, start, recover, restart and stop require root; status, doctor, test, logs and watchdog are read-only."
-  echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola start | ola logs"
+  echo "setup, start, recover, use, unload, restart and stop require root; status, doctor, test, ps, logs and watchdog are read-only."
+  echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola start | ola logs"
+  echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
 
@@ -435,6 +436,185 @@ ollama_api_ready(){
   curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1
 }
 
+
+is_valid_model_name(){
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]]
+}
+
+normalize_model_name(){
+  local model=$1 last_part
+  last_part=${model##*/}
+  if [[ "$last_part" == *:* ]]; then
+    printf '%s' "$model"
+  else
+    printf '%s:latest' "$model"
+  fi
+}
+
+loaded_model_names(){
+  curl -fsS --max-time 10 http://127.0.0.1:11434/api/ps 2>/dev/null \
+    | jq -r '.models[]?.name // empty'
+}
+
+installed_model_names(){
+  curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags 2>/dev/null \
+    | jq -r '.models[]?.name // empty'
+}
+
+model_names_contain(){
+  local names=$1 target=$2 name target_norm
+  target_norm=$(normalize_model_name "$target")
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$(normalize_model_name "$name")" == "$target_norm" ]] && return 0
+  done <<< "$names"
+  return 1
+}
+
+unload_model(){
+  local model=$1 payload names i
+  is_valid_model_name "$model" || return 1
+  payload=$(jq -cn --arg model "$model" '{model:$model, keep_alive:0}') || return 1
+  curl -fsS --max-time 30 http://127.0.0.1:11434/api/generate \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1 || return 1
+  for i in $(seq 1 30); do
+    names=$(loaded_model_names) || return 1
+    model_names_contain "$names" "$model" || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Unloads every model currently held in RAM except, optionally, one target.
+# This frees RAM; it does not delete model files from disk.
+stop_loaded_models_except(){
+  local target=${1:-} target_norm="__none__" loaded_names loaded
+  if [[ -n "$target" ]]; then
+    target_norm=$(normalize_model_name "$target")
+  fi
+  loaded_names=$(loaded_model_names) \
+    || die "Could not read the list of models currently loaded in RAM from Ollama. Refusing to switch models blindly."
+  while IFS= read -r loaded; do
+    [[ -n "$loaded" ]] || continue
+    if [[ "$(normalize_model_name "$loaded")" != "$target_norm" ]]; then
+      info "Unloading current model from RAM first: $loaded"
+      unload_model "$loaded" \
+        || die "Could not unload the currently loaded model: $loaded. It may be busy; try again in a moment."
+      ok "Model unloaded from RAM: $loaded"
+    fi
+  done <<< "$loaded_names"
+}
+
+pull_model_with_retry(){
+  local model=$1 ollama_bin=$2 models_kb pull_attempt
+  models_kb=$(free_kb "$OLLAMA_HOME")
+  if [[ "$models_kb" -gt 0 && "$models_kb" -lt 2000000 ]]; then
+    warn "Less than about 2 GB free on $OLLAMA_HOME. A larger model may fail while pulling; free disk space if needed."
+  fi
+  info "Pulling model $model (this may take a while)..."
+  for pull_attempt in 1 2; do
+    if "$ollama_bin" pull "$model"; then
+      return 0
+    fi
+    if [[ "$pull_attempt" -eq 2 ]]; then
+      die "Failed to pull Ollama model: $model (check network, disk space and the exact model name)."
+    fi
+    warn "Model pull failed (attempt 1/2); retrying in 5 seconds..."
+    sleep 5
+  done
+}
+
+show_loaded_models(){
+  local names
+  if ! names=$(loaded_model_names); then
+    die "Ollama API is not answering, so loaded models cannot be listed. Try: ola recover"
+  fi
+  if [[ -z "$names" ]]; then
+    echo "No model is currently loaded in RAM."
+  else
+    echo "Models currently loaded in RAM:"
+    printf '%s\n' "$names"
+  fi
+}
+
+unload_models_command(){
+  local target=${1:-} loaded_names
+  require_commands curl jq
+  ollama_api_ready || die "Ollama API is not answering. Try: ola recover"
+  if [[ -n "$target" ]]; then
+    is_valid_model_name "$target" || die "Invalid model name: $target"
+    loaded_names=$(loaded_model_names) || die "Could not list loaded models."
+    if ! model_names_contain "$loaded_names" "$target"; then
+      ok "Model is not currently loaded in RAM: $target"
+      return 0
+    fi
+    info "Unloading model from RAM: $target"
+    unload_model "$target" || die "Could not unload model: $target"
+    ok "Model unloaded from RAM: $target"
+  else
+    stop_loaded_models_except ""
+    ok "All loaded models have been unloaded from RAM. The Ollama service itself is still running."
+  fi
+}
+
+switch_model(){
+  local target=$1 ollama_bin installed_names loaded_names payload response content mem_kb
+  is_valid_model_name "$target" || die "Invalid model name: $target (example: llama3.2:1b)"
+  require_commands curl jq
+  ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
+  ensure_service_users
+
+  if ! supervisor_program_running ollama; then
+    info "Ollama is not RUNNING; starting it before switching models..."
+    supervisor_ctl start ollama 2>/dev/null || supervisor_ctl restart ollama \
+      || die "Could not start Ollama. Check: ola logs"
+    wait_for_supervisor_program ollama 30 || die "Ollama did not reach RUNNING. Check: ola logs"
+  fi
+  ollama_api_ready || die "Ollama API is not answering. Try: ola recover"
+
+  info "Switching to model: $target"
+  stop_loaded_models_except "$target"
+
+  installed_names=$(installed_model_names) \
+    || die "Could not read the installed model list from Ollama."
+  if model_names_contain "$installed_names" "$target"; then
+    ok "Model already downloaded: $target"
+  else
+    pull_model_with_retry "$target" "$ollama_bin"
+  fi
+
+  # Pulling does not load a model, but stop again in case another request
+  # loaded a different model while the download was running.
+  stop_loaded_models_except "$target"
+  loaded_names=$(loaded_model_names) || die "Could not verify loaded models after download."
+  if model_names_contain "$loaded_names" "$target"; then
+    ok "Model already loaded in RAM: $target"
+  else
+    info "Loading model into RAM: $target"
+    payload=$(jq -cn --arg model "$target" '{model:$model, messages:[{role:"user", content:"Reply only with OK."}], stream:false}') \
+      || die "Could not build the model loading request."
+    if ! response=$(curl -fsS --max-time 180 http://127.0.0.1:11434/api/chat \
+      -H 'Content-Type: application/json' -d "$payload" 2>/dev/null); then
+      die "Model $target was downloaded but could not be loaded. Check RAM and: ola logs"
+    fi
+    content=$(printf '%s' "$response" | jq -r '.message.content // .response // empty' 2>/dev/null || true)
+    ok "Model loaded and answered: ${content:-OK}"
+  fi
+
+  stop_loaded_models_except "$target"
+  loaded_names=$(loaded_model_names) || die "Could not verify the final loaded model list."
+  model_names_contain "$loaded_names" "$target" \
+    || die "Model $target did not remain loaded. Check: ola logs"
+
+  printf '%s\n' "$target" > "$MODEL_FILE" || die "Could not save the default model to $MODEL_FILE."
+  chmod 600 "$MODEL_FILE" || die "Could not set permissions on $MODEL_FILE."
+  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  ok "Default model is now: $target (previous models were unloaded from RAM, not deleted from disk)."
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    info "Available RAM now: about $((mem_kb / 1024)) MB"
+  fi
+}
+
 stop_unmanaged_ollama(){
   local ollama_bin=$1 expected_exe pid exe cmdline unknown=0 i pid_list p
   supervisor_program_running ollama && return 0
@@ -539,24 +719,9 @@ EOF
   if ! model=$(prompt_value "Ollama model [$MODEL_DEFAULT]: " "$MODEL_DEFAULT"); then
     die "No input received for the Ollama model; aborting instead of silently using the default."
   fi
-  [[ -n "$model" ]] || die "Invalid empty Ollama model."
-  local models_kb
-  models_kb=$(free_kb "$OLLAMA_HOME")
-  if [[ "$models_kb" -gt 0 && "$models_kb" -lt 2000000 ]]; then
-    warn "Less than about 2 GB free on $OLLAMA_HOME. A larger model may fail while pulling; free disk space if needed."
-  fi
-  info "Pulling model $model (this may take a while)..."
-  local pull_attempt
-  for pull_attempt in 1 2; do
-    if "$ollama_bin" pull "$model"; then
-      break
-    fi
-    if [[ "$pull_attempt" -eq 2 ]]; then
-      die "Failed to pull Ollama model: $model (check network, disk space and the exact model name)."
-    fi
-    warn "Model pull failed (attempt 1/2); retrying in 5 seconds..."
-    sleep 5
-  done
+  is_valid_model_name "$model" || die "Invalid Ollama model name: $model"
+  stop_loaded_models_except "$model"
+  pull_model_with_retry "$model" "$ollama_bin"
   printf '%s\n' "$model" > "$MODEL_FILE"
   chmod 600 "$MODEL_FILE"
   ok "Model ready: $model"
@@ -1515,6 +1680,27 @@ case "${1:-}" in
   test)
     run_ola_test
     ;;
+  use)
+    require_root
+    if [[ -z "${2:-}" ]]; then
+      err "Usage: ola use <model> (example: ola use llama3.2:1b)"
+      exit 1
+    fi
+    install_ola_command
+    require_supervisor_running
+    ensure_watchdog
+    switch_model "$2"
+    ;;
+  ps)
+    show_loaded_models
+    ;;
+  unload)
+    require_root
+    install_ola_command
+    require_supervisor_running
+    ensure_watchdog
+    unload_models_command "${2:-}"
+    ;;
   watchdog)
     show_watchdog
     ;;
@@ -1561,10 +1747,12 @@ case "${1:-}" in
     echo "5) Show logs"
     echo "6) Start/restart Ollama and tunnel"
     echo "7) Recover stopped/unhealthy services"
-    echo "8) Watchdog status"
-    echo "9) Stop tunnel"
-    echo "10) Exit"
-    if ! choice=$(prompt_value "Choice [10]: " "10"); then
+    echo "8) Use another model (unload current from RAM first)"
+    echo "9) Unload loaded model(s) from RAM"
+    echo "10) Watchdog status"
+    echo "11) Stop tunnel"
+    echo "12) Exit"
+    if ! choice=$(prompt_value "Choice [12]: " "12"); then
       warn "No input received; exiting."
       exit 0
     fi
@@ -1576,9 +1764,29 @@ case "${1:-}" in
       5) show_logs ;;
       6) require_root; install_ola_command; require_supervisor_running; ensure_watchdog; restart_services ;;
       7) require_root; install_ola_command; require_supervisor_running; ensure_watchdog; recover_services ;;
-      8) show_watchdog ;;
-      9) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
-      10) exit 0 ;;
+      8)
+        require_root
+        install_ola_command
+        require_supervisor_running
+        ensure_watchdog
+        if ! model_choice=$(prompt_value "Model to use (example llama3.2:1b): " ""); then
+          die "No model received; cancelling model switch."
+        fi
+        switch_model "$model_choice"
+        ;;
+      9)
+        require_root
+        install_ola_command
+        require_supervisor_running
+        ensure_watchdog
+        if ! model_choice=$(prompt_value "Model to unload (blank = all loaded): " ""); then
+          die "No input received; cancelling unload."
+        fi
+        unload_models_command "$model_choice"
+        ;;
+      10) show_watchdog ;;
+      11) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
+      12) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
     ;;
