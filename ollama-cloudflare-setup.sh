@@ -15,7 +15,11 @@ MODEL_FILE="/etc/ollama-cloudflare-model"
 MODEL_DEFAULT="llama3.2:1b"
 OLLAMA_USER="ollama"
 CLOUDFLARED_USER="cloudflared"
+OLLAMA_GROUP=""
+CLOUDFLARED_GROUP=""
 OLLAMA_HOME=""
+OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
+CF_TUNNEL_PROTOCOL="${CF_TUNNEL_PROTOCOL:-auto}"
 
 info(){ printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -24,9 +28,10 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|status|logs|restart|stop]"
+  echo "Usage: bash $0 [setup|start|status|logs|restart|stop]"
   echo "No argument opens an interactive menu."
   echo "setup, restart and stop require root; status and logs are read-only."
+  echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
 
 require_root(){
@@ -61,11 +66,91 @@ is_valid_hostname(){
 }
 
 apt_update(){
-  apt-get update
+  apt-get -o DPkg::Lock::Timeout=120 update
 }
 
 apt_install(){
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y "$@"
+}
+
+free_kb(){
+  local path=$1 kb
+  kb=$(df -Pk "$path" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+  printf '%s' "$kb"
+}
+
+require_commands(){
+  local cmd missing=0
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      err "Required command not found: $cmd"
+      missing=1
+    fi
+  done
+  [[ "$missing" -eq 0 ]] || die "Missing required commands. Install the base packages first (see setup output above)."
+}
+
+nologin_shell(){
+  local candidate
+  for candidate in /usr/sbin/nologin /sbin/nologin /usr/bin/false /bin/false; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s' "/bin/false"
+}
+
+# Verifies an HTTPS URL even when the container resolver cannot resolve the
+# public hostname: falls back to Cloudflare DNS-over-HTTPS plus --resolve.
+https_url_ready(){
+  local url=$1 host json ips ip
+  if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v jq >/dev/null 2>&1 || return 1
+  host=${url#*://}
+  host=${host%%/*}
+  [[ -n "$host" && "$host" != "$url" ]] || return 1
+  json=$(curl -fsS --max-time 10 "https://1.1.1.1/dns-query?name=${host}&type=A" -H 'accept: application/dns-json' 2>/dev/null) || return 1
+  ips=$(printf '%s' "$json" | jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null || true)
+  for ip in $ips; do
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    if curl -fsS --max-time 10 --resolve "${host}:443:${ip}" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+ollama_pids(){
+  local proc comm
+  for proc in /proc/[0-9]*; do
+    [[ -r "$proc/comm" ]] || continue
+    comm=$(<"$proc/comm")
+    if [[ "$comm" == "ollama" ]]; then
+      printf '%s\n' "${proc#/proc/}"
+    fi
+  done
+}
+
+any_ollama_process(){
+  [[ -n "$(ollama_pids)" ]]
+}
+
+select_supervisor_paths(){
+  if [[ -f /etc/supervisor/supervisord.conf ]]; then
+    SUP_CONF="/etc/supervisor/supervisord.conf"
+    SUP_DIR="/etc/supervisor/conf.d"
+  elif [[ -f /etc/supervisord.conf ]]; then
+    SUP_CONF="/etc/supervisord.conf"
+    if [[ -d /etc/supervisord.d ]]; then
+      SUP_DIR="/etc/supervisord.d"
+    elif [[ -d /etc/supervisor/conf.d ]]; then
+      SUP_DIR="/etc/supervisor/conf.d"
+    fi
+  fi
 }
 
 supervisor_ctl(){
@@ -91,6 +176,7 @@ tighten_log_permissions(){
 }
 
 ensure_supervisor_running(){
+  select_supervisor_paths
   install -d -m 0750 "$SUP_DIR" "$LOG_DIR"
   if ! command -v supervisord >/dev/null || ! command -v supervisorctl >/dev/null; then
     apt_update
@@ -110,6 +196,7 @@ ensure_supervisor_running(){
 }
 
 require_supervisor_running(){
+  select_supervisor_paths
   command -v supervisorctl >/dev/null 2>&1 || die "Supervisor is not installed. Run setup first: sudo bash $0 setup"
   [[ -f "$SUP_CONF" ]] || die "Supervisor config not found: $SUP_CONF. Run setup first."
   if ! supervisor_is_running; then
@@ -132,17 +219,23 @@ supervisor_apply(){
 }
 
 ensure_service_users(){
+  local shell_path
+  shell_path=$(nologin_shell)
   if ! id -u "$OLLAMA_USER" >/dev/null 2>&1; then
-    useradd --system --create-home --home-dir /var/lib/ollama --shell /usr/sbin/nologin "$OLLAMA_USER" \
+    useradd --system --create-home --home-dir /var/lib/ollama --shell "$shell_path" "$OLLAMA_USER" \
       || die "Could not create the dedicated '$OLLAMA_USER' system user."
   fi
   if ! id -u "$CLOUDFLARED_USER" >/dev/null 2>&1; then
-    useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$CLOUDFLARED_USER" \
+    useradd --system --no-create-home --home-dir /nonexistent --shell "$shell_path" "$CLOUDFLARED_USER" \
       || die "Could not create the dedicated '$CLOUDFLARED_USER' system user."
   fi
+  OLLAMA_GROUP=$(id -gn "$OLLAMA_USER" 2>/dev/null || printf '%s' "$OLLAMA_USER")
+  CLOUDFLARED_GROUP=$(id -gn "$CLOUDFLARED_USER" 2>/dev/null || printf '%s' "$CLOUDFLARED_USER")
   OLLAMA_HOME=$(getent passwd "$OLLAMA_USER" | cut -d: -f6)
-  [[ -n "$OLLAMA_HOME" ]] || OLLAMA_HOME="/var/lib/ollama"
-  install -d -o "$OLLAMA_USER" -g "$OLLAMA_USER" -m 0750 "$OLLAMA_HOME"
+  case "$OLLAMA_HOME" in
+    ""|"/"|"/nonexistent"|"/root") OLLAMA_HOME="/var/lib/ollama" ;;
+  esac
+  install -d -o "$OLLAMA_USER" -g "$OLLAMA_GROUP" -m 0750 "$OLLAMA_HOME"
 }
 
 ollama_version_text(){
@@ -187,39 +280,70 @@ large_tmp_parent(){
   printf '%s' "$best"
 }
 
+checksum_for_asset(){
+  local sums=$1 asset=$2
+  awk -v a="$asset" '{ f=$2; sub(/\r$/, "", f); sub(/^\*\/?/, "", f); sub(/^\.\//, "", f); if (f == a) { print $1; exit } }' "$sums"
+}
+
 install_ollama_binary(){
-  local dpkg_arch asset tmp_dir archive sums expected actual
+  local dpkg_arch tmp_dir archive sums expected actual candidate tmp_parent tmp_kb usr_kb tmp_dev usr_dev
   dpkg_arch=$(dpkg --print-architecture 2>/dev/null || true)
   case "$dpkg_arch" in
-    amd64|arm64) asset="ollama-linux-${dpkg_arch}.tar.zst" ;;
+    amd64|arm64) ;;
     *) die "Unsupported dpkg architecture for the verified Ollama tarball install: ${dpkg_arch:-unknown} (supported: amd64, arm64)." ;;
   esac
 
   apt_update
-  apt_install curl ca-certificates zstd tar
+  apt_install curl ca-certificates tar
 
-  local tmp_parent avail_kb
-  tmp_parent=$(large_tmp_parent) || die "Could not find a writable temporary directory. Set OLLAMA_TMPDIR to a directory on a disk with at least 2 GB free."
-  avail_kb=$(df -Pk "$tmp_parent" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  tmp_parent=$(large_tmp_parent) || die "Could not find a writable temporary directory. Set OLLAMA_TMPDIR to a directory on a disk with at least 3 GB free."
   tmp_dir=$(mktemp -d "$tmp_parent/ollama-install-XXXXXX") || die "Could not create a temporary directory in $tmp_parent."
-  archive="$tmp_dir/$asset"
   sums="$tmp_dir/sha256sum.txt"
-  info "Downloading Ollama release asset: $asset (temporary directory: $tmp_dir)"
-  if [[ "${avail_kb:-0}" =~ ^[0-9]+$ && "$avail_kb" -lt 1800000 ]]; then
-    warn "Only about $((avail_kb / 1024)) MB free on $tmp_parent. The Ollama archive is over 1 GB; if the download fails, free disk space or set OLLAMA_TMPDIR to a larger disk."
+  info "Downloading Ollama checksum list (temporary directory: $tmp_dir)..."
+  if ! curl -fsSL --retry 3 "https://github.com/ollama/ollama/releases/latest/download/sha256sum.txt" -o "$sums"; then
+    rm -rf "$tmp_dir"
+    die "Could not download the Ollama checksum file. Check DNS/network access to GitHub. Refusing to install an unverified archive."
   fi
+
+  local asset=""
+  for candidate in "ollama-linux-${dpkg_arch}.tar.zst" "ollama-linux-${dpkg_arch}.tgz" "ollama-linux-${dpkg_arch}.tar.gz"; do
+    expected=$(checksum_for_asset "$sums" "$candidate")
+    if [[ "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+      asset="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$asset" ]]; then
+    rm -rf "$tmp_dir"
+    die "No compatible published Ollama archive found for architecture '$dpkg_arch' in sha256sum.txt."
+  fi
+  if [[ "$asset" == *.tar.zst ]]; then
+    apt_install zstd
+  fi
+
+  # Download + extraction together need roughly 3 GB when both live on the
+  # same filesystem (compressed archive plus extracted binaries/libraries).
+  tmp_kb=$(free_kb "$tmp_parent")
+  usr_kb=$(free_kb /usr/local)
+  tmp_dev=$(stat -c %d "$tmp_parent" 2>/dev/null || printf '?')
+  usr_dev=$(stat -c %d /usr/local 2>/dev/null || printf '?')
+  if [[ "$tmp_dev" == "$usr_dev" ]]; then
+    if [[ "$tmp_kb" -gt 0 && "$tmp_kb" -lt 3000000 ]]; then
+      rm -rf "$tmp_dir"
+      die "Not enough free disk space on $tmp_parent for the Ollama download plus extraction (need about 3 GB free). Free space or set OLLAMA_TMPDIR to a larger disk."
+    fi
+  else
+    if [[ "$tmp_kb" -gt 0 && "$tmp_kb" -lt 1700000 ]] || [[ "$usr_kb" -gt 0 && "$usr_kb" -lt 1700000 ]]; then
+      rm -rf "$tmp_dir"
+      die "Not enough free disk space for Ollama (need about 1.7 GB free in the temp dir and on /usr/local). Check 'df -h'."
+    fi
+  fi
+
+  archive="$tmp_dir/$asset"
+  info "Downloading Ollama release asset: $asset"
   if ! curl -fL --retry 3 "https://github.com/ollama/ollama/releases/latest/download/${asset}" -o "$archive"; then
     rm -rf "$tmp_dir"
-    die "Could not download Ollama. This is usually a network error or not enough free disk space; check 'df -h' (especially /tmp and /var/tmp) and outbound access to GitHub."
-  fi
-  if ! curl -fsSL "https://github.com/ollama/ollama/releases/latest/download/sha256sum.txt" -o "$sums"; then
-    rm -rf "$tmp_dir"
-    die "Could not download the Ollama checksum file. Refusing to install an unverified archive."
-  fi
-  expected=$(awk -v a="$asset" '{ f=$2; sub(/^\*\/?/, "", f); sub(/^\.\//, "", f); if (f == a) print $1 }' "$sums" | head -1)
-  if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
-    rm -rf "$tmp_dir"
-    die "No published SHA-256 found for $asset. Refusing to install an unverified archive."
+    die "Could not download Ollama. This is usually a network/DNS error or not enough free disk space; check 'df -h' and outbound access to GitHub."
   fi
   actual=$(sha256sum "$archive" | awk '{print $1}')
   if [[ "$actual" != "$expected" ]]; then
@@ -228,9 +352,9 @@ install_ollama_binary(){
   fi
   ok "Ollama archive checksum verified (sha256)."
 
-  if ! tar --zstd -xf "$archive" -C /usr/local; then
+  if ! tar -xaf "$archive" -C /usr/local; then
     rm -rf "$tmp_dir"
-    die "Could not extract the Ollama archive into /usr/local."
+    die "Could not extract the Ollama archive into /usr/local (disk full or unsupported archive format)."
   fi
   rm -rf "$tmp_dir"
   hash -r 2>/dev/null || true
@@ -249,8 +373,8 @@ stop_unmanaged_ollama(){
   local pids=()
   # Do not use Bash process substitution here: some minimal containers do not
   # provide /dev/fd, which made the previous mapfile line abort the setup.
-  pid_list=$(pgrep -x ollama 2>/dev/null || true)
-  # shellcheck disable=SC2086 # pgrep output is a list of numeric PIDs.
+  pid_list=$(ollama_pids)
+  # shellcheck disable=SC2086 # ollama_pids prints a list of numeric PIDs.
   for p in $pid_list; do pids+=("$p"); done
   if [[ ${#pids[@]} -eq 0 ]]; then
     if ollama_api_ready; then
@@ -272,13 +396,13 @@ stop_unmanaged_ollama(){
   done
 
   for i in $(seq 1 15); do
-    if ! ollama_api_ready && ! pgrep -x ollama >/dev/null 2>&1; then
+    if ! ollama_api_ready && ! any_ollama_process; then
       return 0
     fi
     sleep 1
   done
 
-  if ollama_api_ready || pgrep -x ollama >/dev/null 2>&1; then
+  if ollama_api_ready || any_ollama_process; then
     if [[ "$unknown" -eq 1 ]]; then
       die "An unverified process is still using Ollama/port 11434. Stop it manually, then re-run setup."
     fi
@@ -308,7 +432,7 @@ install_ollama(){
 [program:ollama]
 command=$ollama_bin serve
 user=$OLLAMA_USER
-environment=OLLAMA_HOST="127.0.0.1:11434",OLLAMA_ORIGINS="*",OLLAMA_CONTEXT_LENGTH="1024",OLLAMA_KEEP_ALIVE="5m",HOME="$OLLAMA_HOME"
+environment=OLLAMA_HOST="127.0.0.1:11434",OLLAMA_ORIGINS="*",OLLAMA_CONTEXT_LENGTH="$OLLAMA_CONTEXT_LENGTH",OLLAMA_KEEP_ALIVE="5m",OLLAMA_MAX_LOADED_MODELS="1",OLLAMA_NUM_PARALLEL="1",HOME="$OLLAMA_HOME"
 autostart=true
 autorestart=true
 startsecs=5
@@ -317,7 +441,11 @@ stopsignal=TERM
 stopasgroup=true
 killasgroup=true
 stdout_logfile=/var/log/supervisor/ollama.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
 stderr_logfile=/var/log/supervisor/ollama-error.log
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
 EOF
   chmod 600 "$SUP_DIR/ollama.conf"
 
@@ -342,16 +470,29 @@ EOF
     die "No input received for the Ollama model; aborting instead of silently using the default."
   fi
   [[ -n "$model" ]] || die "Invalid empty Ollama model."
-  info "Pulling model $model (this may take a while)..."
-  if ! "$ollama_bin" pull "$model"; then
-    die "Failed to pull Ollama model: $model"
+  local models_kb
+  models_kb=$(free_kb "$OLLAMA_HOME")
+  if [[ "$models_kb" -gt 0 && "$models_kb" -lt 2000000 ]]; then
+    warn "Less than about 2 GB free on $OLLAMA_HOME. A larger model may fail while pulling; free disk space if needed."
   fi
+  info "Pulling model $model (this may take a while)..."
+  local pull_attempt
+  for pull_attempt in 1 2; do
+    if "$ollama_bin" pull "$model"; then
+      break
+    fi
+    if [[ "$pull_attempt" -eq 2 ]]; then
+      die "Failed to pull Ollama model: $model (check network, disk space and the exact model name)."
+    fi
+    warn "Model pull failed (attempt 1/2); retrying in 5 seconds..."
+    sleep 5
+  done
   printf '%s\n' "$model" > "$MODEL_FILE"
   chmod 600 "$MODEL_FILE"
   ok "Model ready: $model"
 }
 
-install_cloudflared(){
+install_cloudflared_github_verified(){
   if command -v cloudflared >/dev/null; then
     ok "cloudflared already installed: $(cloudflared --version 2>&1 | head -1)"
     return
@@ -366,8 +507,10 @@ install_cloudflared(){
     *) die "Unsupported dpkg architecture: $(dpkg --print-architecture)" ;;
   esac
   asset="cloudflared-linux-${arch}.deb"
-  tmp_deb="$(mktemp /tmp/cloudflared-XXXXXX.deb)"
-  tmp_json="$(mktemp /tmp/cloudflared-release-XXXXXX.json)"
+  local tmp_parent
+  tmp_parent=$(large_tmp_parent || printf '%s' "/tmp")
+  tmp_deb="$(mktemp "$tmp_parent/cloudflared-XXXXXX.deb")"
+  tmp_json="$(mktemp "$tmp_parent/cloudflared-release-XXXXXX.json")"
   info "Downloading Cloudflare cloudflared package for $arch..."
 
   if ! curl -fsSL "https://api.github.com/repos/cloudflare/cloudflared/releases/latest" -o "$tmp_json"; then
@@ -394,13 +537,46 @@ install_cloudflared(){
   dpkg_status=0
   dpkg -i "$tmp_deb" || dpkg_status=1
   if [[ "$dpkg_status" -ne 0 ]]; then
-    apt-get install -f -y || dpkg_status=1
+    apt_install -f || dpkg_status=1
     dpkg -i "$tmp_deb" || dpkg_status=1
   fi
   rm -f "$tmp_deb"
   [[ "$dpkg_status" -eq 0 ]] || die "cloudflared package installation failed."
   command -v cloudflared >/dev/null || die "cloudflared installation failed."
   ok "$(cloudflared --version 2>&1 | head -1)"
+}
+
+
+install_cloudflared_official_repo(){
+  if command -v cloudflared >/dev/null; then
+    return 0
+  fi
+  apt_install curl gnupg ca-certificates apt-transport-https || return 1
+  install -d -m 0755 /usr/share/keyrings || return 1
+  info "Adding the official Cloudflare apt repository..."
+  if ! curl -fsSL "https://pkg.cloudflare.com/cloudflare-main.gpg" | gpg --batch --yes --dearmor -o /usr/share/keyrings/cloudflare-main.gpg; then
+    return 1
+  fi
+  chmod 644 /usr/share/keyrings/cloudflare-main.gpg || return 1
+  printf '%s\n' "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+    | tee /etc/apt/sources.list.d/cloudflared.list >/dev/null || return 1
+  apt_update || return 1
+  apt_install cloudflared || return 1
+  command -v cloudflared >/dev/null
+}
+
+install_cloudflared(){
+  if command -v cloudflared >/dev/null; then
+    ok "cloudflared already installed: $(cloudflared --version 2>&1 | head -1)"
+    return
+  fi
+  info "Trying the official Cloudflare apt repository first..."
+  if install_cloudflared_official_repo; then
+    ok "cloudflared installed: $(cloudflared --version 2>&1 | head -1)"
+    return
+  fi
+  warn "The official Cloudflare repository method failed. Falling back to the verified GitHub .deb..."
+  install_cloudflared_github_verified
 }
 
 file_size(){
@@ -433,10 +609,13 @@ wait_for_supervisor_program(){
 configure_quick_tunnel(){
   info "Configuring a temporary Cloudflare Quick Tunnel..."
   install -d -m 0750 "$LOG_DIR"
-  install -d -o root -g "$CLOUDFLARED_USER" -m 0750 "$CF_CONF_DIR"
+  install -d -o root -g "$CLOUDFLARED_GROUP" -m 0750 "$CF_CONF_DIR"
   rm -f "$URL_FILE"
-  local cloudflared_bin out_log err_log out_offset err_offset url i
+  local cloudflared_bin out_log err_log out_offset err_offset url i protocol_flag=""
   cloudflared_bin=$(command -v cloudflared) || die "cloudflared binary not found."
+  if [[ "$CF_TUNNEL_PROTOCOL" != "auto" ]]; then
+    protocol_flag=" --protocol=$CF_TUNNEL_PROTOCOL"
+  fi
   out_log="$LOG_DIR/cloudflared-ollama.log"
   err_log="$LOG_DIR/cloudflared-ollama-error.log"
   touch "$out_log" "$err_log"
@@ -446,7 +625,7 @@ configure_quick_tunnel(){
 
   cat > "$SUP_DIR/cloudflared-ollama.conf" <<EOF
 [program:cloudflared-ollama]
-command=$cloudflared_bin tunnel --no-autoupdate --url http://127.0.0.1:11434 --http-host-header=localhost:11434
+command=$cloudflared_bin tunnel --no-autoupdate$protocol_flag --url http://127.0.0.1:11434 --http-host-header=localhost:11434
 user=$CLOUDFLARED_USER
 environment=HOME="$CF_CONF_DIR"
 autostart=true
@@ -457,7 +636,11 @@ stopsignal=TERM
 stopasgroup=true
 killasgroup=true
 stdout_logfile=/var/log/supervisor/cloudflared-ollama.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
 stderr_logfile=/var/log/supervisor/cloudflared-ollama-error.log
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
 EOF
   chmod 600 "$SUP_DIR/cloudflared-ollama.conf"
   supervisor_apply
@@ -470,7 +653,7 @@ EOF
     if supervisor_program_running cloudflared-ollama; then
       url=$( { new_log_content "$out_log" "$out_offset"; new_log_content "$err_log" "$err_offset"; } \
         | grep -hEo 'https://[[:alnum:]-]+\.trycloudflare\.com' | tail -1 || true )
-      if [[ -n "$url" ]] && curl -fsS "${url}/api/version" >/dev/null 2>&1; then
+      if [[ -n "$url" ]] && https_url_ready "${url}/api/version"; then
         break
       fi
     fi
@@ -507,7 +690,7 @@ refresh_named_tunnel_uuid(){
 }
 
 configure_named_tunnel(){
-  local tunnel_name hostname uuid source_cred cred_file
+  local tunnel_name hostname uuid source_cred cred_file protocol_line="" candidate_home alt_home
   echo ""
   warn "This mode uses your Cloudflare account and a domain/subdomain. It does not configure Cloudflare Access."
   if ! tunnel_name=$(prompt_value "Tunnel name [ollama-vps]: " "ollama-vps"); then
@@ -521,13 +704,31 @@ configure_named_tunnel(){
   is_valid_hostname "$hostname" || die "Invalid hostname."
 
   ensure_service_users
+  if [[ ! -f "$CF_CLI_HOME/cert.pem" ]]; then
+    for candidate_home in "/root/.cloudflared" "${HOME:-}/.cloudflared"; do
+      if [[ -n "$candidate_home" && "$candidate_home" != "$CF_CLI_HOME" && -f "$candidate_home/cert.pem" ]]; then
+        install -d -m 700 "$CF_CLI_HOME"
+        install -m 0600 "$candidate_home/cert.pem" "$CF_CLI_HOME/cert.pem"
+        info "Using the existing Cloudflare login certificate from $candidate_home."
+        break
+      fi
+    done
+  fi
+  if [[ ! -f "$CF_CLI_HOME/cert.pem" && -n "${SUDO_USER:-}" ]]; then
+    alt_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+    if [[ -n "$alt_home" && -f "$alt_home/.cloudflared/cert.pem" ]]; then
+      install -d -m 700 "$CF_CLI_HOME"
+      install -m 0600 "$alt_home/.cloudflared/cert.pem" "$CF_CLI_HOME/cert.pem"
+      info "Using the existing Cloudflare login certificate from $alt_home/.cloudflared."
+    fi
+  fi
   rm -f "$URL_FILE"
   install -d -m 700 "$CF_CLI_HOME"
-  install -d -o root -g "$CLOUDFLARED_USER" -m 0750 "$CF_CONF_DIR"
+  install -d -o root -g "$CLOUDFLARED_GROUP" -m 0750 "$CF_CONF_DIR"
 
   if [[ ! -f "$CF_CLI_HOME/cert.pem" ]]; then
     info "Cloudflare will print a login URL. Open it in your browser, sign in, and authorize the domain."
-    cloudflared tunnel login
+    cloudflared tunnel login || die "Cloudflare login failed or was cancelled. Re-run setup and complete the browser authorization."
   fi
   [[ -f "$CF_CLI_HOME/cert.pem" ]] || die "Cloudflare login certificate not found at $CF_CLI_HOME/cert.pem"
   chmod 600 "$CF_CLI_HOME/cert.pem"
@@ -548,13 +749,17 @@ configure_named_tunnel(){
   [[ -f "$source_cred" ]] || die "Tunnel credentials missing: $source_cred"
   chmod 600 "$source_cred"
   cred_file="$CF_CONF_DIR/${uuid}.json"
-  install -o "$CLOUDFLARED_USER" -g "$CLOUDFLARED_USER" -m 0600 "$source_cred" "$cred_file" \
+  install -o "$CLOUDFLARED_USER" -g "$CLOUDFLARED_GROUP" -m 0600 "$source_cred" "$cred_file" \
     || die "Could not copy the tunnel credentials into $CF_CONF_DIR for the dedicated cloudflared user."
 
+  if [[ "$CF_TUNNEL_PROTOCOL" != "auto" ]]; then
+    protocol_line="protocol: $CF_TUNNEL_PROTOCOL"
+  fi
   cat > "$CF_CONF_DIR/config.yml" <<EOF
 tunnel: $uuid
 credentials-file: $cred_file
 no-autoupdate: true
+$protocol_line
 ingress:
   - hostname: $hostname
     service: http://127.0.0.1:11434
@@ -562,7 +767,7 @@ ingress:
       httpHostHeader: "localhost:11434"
   - service: http_status:404
 EOF
-  chown root:"$CLOUDFLARED_USER" "$CF_CONF_DIR/config.yml"
+  chown root:"$CLOUDFLARED_GROUP" "$CF_CONF_DIR/config.yml"
   chmod 640 "$CF_CONF_DIR/config.yml"
   cloudflared tunnel --config "$CF_CONF_DIR/config.yml" ingress validate \
     || die "Cloudflare ingress config is invalid: $CF_CONF_DIR/config.yml"
@@ -582,7 +787,11 @@ stopsignal=TERM
 stopasgroup=true
 killasgroup=true
 stdout_logfile=/var/log/supervisor/cloudflared-ollama.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
 stderr_logfile=/var/log/supervisor/cloudflared-ollama-error.log
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
 EOF
   chmod 600 "$SUP_DIR/cloudflared-ollama.conf"
   supervisor_apply
@@ -595,12 +804,12 @@ EOF
   ollama_api_ready || die "Ollama is not answering locally, so the named tunnel cannot be verified."
 
   cloudflared tunnel route dns "$uuid" "$hostname" \
-    || die "Could not create/update the Cloudflare DNS route for $hostname."
+    || die "Could not create/update the Cloudflare DNS route for $hostname. If a DNS record already exists for this hostname, delete/repoint it in Cloudflare DNS, then re-run setup."
 
   local i public_url="https://${hostname}" public_verified=0
   info "Waiting up to 2 minutes for ${public_url}/api/version (DNS/Cloudflare propagation)..."
   for i in $(seq 1 60); do
-    if curl -fsS --max-time 5 "${public_url}/api/version" >/dev/null 2>&1; then
+    if https_url_ready "${public_url}/api/version"; then
       public_verified=1
       break
     fi
@@ -634,6 +843,7 @@ EOF
 }
 
 show_status(){
+  select_supervisor_paths
   echo "--- Supervisor ---"
   if command -v supervisorctl >/dev/null 2>&1 && [[ -f "$SUP_CONF" ]]; then
     supervisor_ctl status || true
@@ -655,6 +865,9 @@ show_status(){
   echo "--- Public URL ---"
   if [[ -r "$URL_FILE" ]]; then
     cat "$URL_FILE"
+    if command -v supervisorctl >/dev/null 2>&1 && [[ -f "$SUP_CONF" ]] && ! supervisor_program_running cloudflared-ollama; then
+      echo "(saved URL, but cloudflared-ollama is not RUNNING right now)"
+    fi
   elif [[ -f "$URL_FILE" ]]; then
     echo "A URL is saved but is not readable by this user (run status as root)."
   else
@@ -694,8 +907,13 @@ restart_services(){
 }
 
 setup_all(){
+  case "$CF_TUNNEL_PROTOCOL" in
+    auto|http2|quic) ;;
+    *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
+  esac
   apt_update
-  apt_install curl ca-certificates gnupg jq
+  apt_install curl ca-certificates gnupg jq tar
+  require_commands curl jq sha256sum tar awk sed grep find stat df
   ensure_service_users
   ensure_supervisor_running
   install_ollama
@@ -736,7 +954,7 @@ case "${1:-}" in
     check_system
     setup_all
     ;;
-  restart)
+  start|restart)
     require_root
     require_supervisor_running
     restart_services
@@ -753,7 +971,7 @@ case "${1:-}" in
     echo "1) Full setup (Ollama + model + tunnel)"
     echo "2) Status"
     echo "3) Show logs"
-    echo "4) Restart Ollama and tunnel"
+    echo "4) Start/restart Ollama and tunnel"
     echo "5) Stop tunnel"
     echo "6) Exit"
     if ! choice=$(prompt_value "Choice [6]: " "6"); then
