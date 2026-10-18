@@ -1086,13 +1086,13 @@ Si l’installation de la TUI échoue, le setup continue et toutes les commandes
 
 L’écran affiche :
 
-- l’état de l’API Ollama et, quand Supervisor les expose, les états `ollama`, `cloudflared-ollama` et `ollama-watchdog` ;
+- l’état de l’API Ollama et, sur une ligne compacte, les états Supervisor `Ollama`, `Tunnel` et `Watchdog` quand ils sont exposés ;
 - l’URL publique enregistrée, le mode Pack Speed et le keep-alive ;
-- la RAM et le swap disponibles ;
+- la RAM, le swap et le niveau d’accès (root ou non-root) ;
 - un tableau actualisé des modèles : état disque/RAM, taille, modèle par défaut, expiration keep-alive et contexte chargé ;
-- un détail du modèle sélectionné : paramètres, famille, quantification et capacités déclarées par `/api/show`.
+- un détail du modèle sélectionné : état, caractère par défaut, paramètres, famille, quantification et capacités déclarées par `/api/show`.
 
-Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle.
+Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle. S’il n’y a aucun modèle, le tableau et le panneau de détail affichent explicitement l’état vide et proposent la touche `a` pour en ajouter un.
 
 ### Touches
 
@@ -1114,7 +1114,7 @@ Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de mod
 | `r` | Rafraîchir maintenant |
 | `q` | Quitter ou fermer l’écran courant |
 
-Les actions longues s’exécutent en arrière-plan de l’interface et leur sortie complète s’affiche dans un écran de résultat. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. En utilisateur non-root, l’affichage reste utile, tandis que `ola` refusera les actions protégées et affichera son erreur.
+Les actions longues s’exécutent en arrière-plan de l’interface et leur sortie complète s’affiche dans un écran de résultat. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. Dans toutes les confirmations, le focus initial est placé sur **Annuler** : appuyer immédiatement sur `Entrée` annule, et il faut choisir explicitement le bouton d’exécution pour lancer l’action. Seul le bouton de suppression utilise la couleur de danger. En utilisateur non-root, l’affichage reste utile, tandis que `ola` refusera les actions protégées et affichera son erreur.
 
 ### Limites de la TUI
 

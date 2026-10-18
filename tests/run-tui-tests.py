@@ -92,10 +92,22 @@ async def wait_until(pilot, predicate, label: str) -> None:
 
 async def main() -> None:
     app = mod.OlaTui()
-    async with app.run_test(size=(130, 42)) as pilot:
+    async with app.run_test(size=(120, 38)) as pilot:
         await wait_until(pilot, lambda: app.query_one("#models").row_count == 2, "model rows")
         assert app.selected_model_name() == "qwen3:1.7b"
         print("PASS: initial table and default-last selection")
+
+        summary_text = str(app.query_one("#summary").render())
+        details_text = str(app.query_one("#details").render())
+        assert "Services :" in summary_text
+        assert "Swap :" in summary_text
+        assert "Accès :" in summary_text
+        assert "Capacités :" in details_text
+        assert "Défaut ola : oui" in details_text
+        rendered = app.export_screenshot().replace("\xa0", " ")
+        for expected in ("Services", "Swap", "Accès", "Capacités", "Actions", "préchauffer", "bench"):
+            assert expected in rendered, f"Missing visible panel text at 120x38: {expected}"
+        print("PASS: summary and details essentials are visible at 120x38")
 
         await pilot.press("up")
         await wait_until(
@@ -121,20 +133,60 @@ async def main() -> None:
             "output screen close",
         )
 
+        await pilot.press("u")
+        await wait_until(
+            pilot,
+            lambda: app.screen.__class__.__name__ == "ConfirmScreen",
+            "use confirmation",
+        )
+        assert app.focused is not None and app.focused.id == "cancel"
+        assert app.screen.query_one("#confirm").variant == "primary"
+        await pilot.press("enter")
+        await wait_until(
+            pilot,
+            lambda: app.screen.__class__.__name__ != "ConfirmScreen",
+            "use cancellation by Enter",
+        )
+        assert not any(call[:1] == ["use"] for call in CLI_CALLS), CLI_CALLS
+        print("PASS: confirmation focus starts on Cancel and Enter cancels use")
+
         await pilot.press("d")
         await wait_until(
             pilot,
             lambda: app.screen.__class__.__name__ == "ConfirmScreen",
             "delete confirmation",
         )
-        await pilot.click("#cancel")
+        assert app.focused is not None and app.focused.id == "cancel"
+        assert app.screen.query_one("#confirm").variant == "error"
+        await pilot.press("enter")
         await wait_until(
             pilot,
             lambda: app.screen.__class__.__name__ != "ConfirmScreen",
-            "delete cancellation",
+            "delete cancellation by Enter",
         )
         assert not any(call[:1] == ["delete"] for call in CLI_CALLS), CLI_CALLS
-        print("PASS: cancelled deletion does not call the CLI")
+        print("PASS: Enter on a fresh delete confirmation cancels safely")
+
+        await pilot.press("d")
+        await wait_until(
+            pilot,
+            lambda: app.screen.__class__.__name__ == "ConfirmScreen",
+            "delete confirmation reopened",
+        )
+        await pilot.click("#confirm")
+        await wait_until(
+            pilot,
+            lambda: app.screen.__class__.__name__ == "OutputScreen",
+            "confirmed deletion output",
+        )
+        assert CLI_CALLS[-1] == ["delete", "llama3.2:1b"], CLI_CALLS
+        print("PASS: explicit confirmation still executes deletion")
+        await pilot.press("q")
+        await wait_until(
+            pilot,
+            lambda: app.screen.__class__.__name__ != "OutputScreen",
+            "delete output close",
+        )
 
         await pilot.press("a")
         await wait_until(
@@ -173,6 +225,37 @@ async def main() -> None:
         await pilot.pause()
         print(f"PASS: theme action ({before} -> {app.theme})")
 
+        await pilot.press("q")
+
+    mod.fetch_snapshot = lambda: mod.Snapshot(
+        api_ok=True,
+        version="0.40.6",
+        models=[],
+        default_model="qwen3:1.7b",
+        public_url="",
+        speed_mode="balanced",
+        keepalive="5m",
+        services={},
+        cloudflared_ready=None,
+        mem_total=2_000_000_000,
+        mem_available=1_000_000_000,
+        swap_total=0,
+        swap_free=0,
+    )
+    empty_app = mod.OlaTui()
+    async with empty_app.run_test(size=(120, 38)) as pilot:
+        await wait_until(
+            pilot,
+            lambda: empty_app.query_one("#models").row_count == 1,
+            "initial empty-state row",
+        )
+        assert empty_app.selected_model_name() == ""
+        details_text = str(empty_app.query_one("#details").render())
+        assert "Aucun modèle téléchargé." in details_text
+        assert "Touche a : ajouter et utiliser un modèle." in details_text
+        rendered = empty_app.export_screenshot().replace("\xa0", " ").replace("&#160;", " ")
+        assert "Aucun" in rendered
+        print("PASS: initial empty state is visible and actionable")
         await pilot.press("q")
 
     print("ALL TUI PILOT TESTS PASS")

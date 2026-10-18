@@ -3418,19 +3418,32 @@ class ConfirmScreen(ModalScreen[bool]):
         Binding("q", "cancel", "Annuler"),
     ]
 
-    def __init__(self, title: str, message: str, confirm_label: str = "Confirmer"):
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        confirm_label: str = "Confirmer",
+        confirm_variant: str = "primary",
+    ):
         super().__init__()
         self.dialog_title = title
         self.dialog_message = message
         self.confirm_label = confirm_label
+        self.confirm_variant = confirm_variant
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
             yield Static(self.dialog_title, classes="dialog-title")
             yield Static(self.dialog_message, classes="dialog-message")
             with Horizontal(classes="dialog-buttons"):
-                yield Button(self.confirm_label, id="confirm", variant="error")
                 yield Button("Annuler", id="cancel", variant="primary")
+                yield Button(self.confirm_label, id="confirm", variant=self.confirm_variant)
+
+    def on_mount(self) -> None:
+        # Safe default for every confirmation: pressing Enter immediately
+        # after the dialog opens cancels instead of executing the action.
+        # The user must deliberately move to the confirmation button.
+        self.query_one("#cancel", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm")
@@ -3571,9 +3584,9 @@ class OlaTui(App):
         text-style: bold;
         content-align: left middle;
     }
-    #top { height: 10; }
+    #top { height: 14; }
     #summary, #details {
-        height: 10;
+        height: 14;
         padding: 0 1;
         border: solid $primary;
         overflow-y: auto;
@@ -3653,7 +3666,10 @@ class OlaTui(App):
         self.details_widget: Static | None = None
         self.models_table: DataTable | None = None
         self.status_widget: Static | None = None
-        self.table_signature: tuple[object, ...] = ()
+        # None means "the table has never been rendered". It must differ
+        # from the signature of an empty model list, otherwise the initial
+        # empty-state row is never added.
+        self.table_signature: tuple[object, ...] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -3705,14 +3721,24 @@ class OlaTui(App):
         summary.append("Ollama : ", style="bold")
         summary.append("● API OK" if snap.api_ok else "● API injoignable", style=api_style)
         summary.append(f"  ·  version {snap.version}\n")
-        for program in ("ollama", "cloudflared-ollama", "ollama-watchdog"):
+        summary.append("Services : ", style="bold")
+        for index, (label, program) in enumerate(
+            (
+                ("Ollama", "ollama"),
+                ("Tunnel", "cloudflared-ollama"),
+                ("Watchdog", "ollama-watchdog"),
+            )
+        ):
+            if index:
+                summary.append(" · ")
             state = snap.services.get(program, "état inconnu")
             style = "green" if state == "RUNNING" else "yellow" if state == "état inconnu" else "red"
-            summary.append(f"{program} : ", style="bold")
-            summary.append(f"{state}\n", style=style)
+            summary.append(f"{label} ", style="bold")
+            summary.append(state, style=style)
+        summary.append("\n")
         summary.append("Tunnel local : ", style="bold")
         summary.append(
-            "ready\n" if snap.cloudflared_ready == 200 else f"non confirmé ({snap.cloudflared_ready or 'aucune réponse'})\n"
+            "prêt\n" if snap.cloudflared_ready == 200 else f"non confirmé ({snap.cloudflared_ready or 'aucune réponse'})\n"
         )
         summary.append("URL publique : ", style="bold")
         summary.append(f"{snap.public_url or 'non enregistrée'}\n")
@@ -3772,7 +3798,16 @@ class OlaTui(App):
                     key=model.name,
                 )
             if not snap.models:
-                table.add_row("—", "Aucun modèle téléchargé", "—", "—", "—", "—", "—", key="__empty__")
+                table.add_row(
+                    "—",
+                    "Aucun modèle téléchargé — touche a pour ajouter",
+                    "—",
+                    "—",
+                    "—",
+                    "—",
+                    "—",
+                    key="__empty__",
+                )
                 self.current_model = ""
             else:
                 names = [model.name for model in snap.models]
@@ -3808,18 +3843,26 @@ class OlaTui(App):
         name = self.selected_model_name()
         details_widget = self.details_widget
         if not name:
-            details_widget.update("Aucun modèle sélectionné.")
+            if not self.snapshot.models:
+                details_widget.update(
+                    "Aucun modèle téléchargé.\n\nTouche a : ajouter et utiliser un modèle."
+                )
+            else:
+                details_widget.update("Aucun modèle sélectionné.")
             return
         model = next((item for item in self.snapshot.models if item.name == name), None)
         show = self.show_cache.get(name, {})
         show_details = show.get("details") or {}
         capabilities = show.get("capabilities") or []
         text = Text()
+        is_default_model = normalize_model(name) == normalize_model(self.snapshot.default_model)
         text.append("Modèle sélectionné\n", style="bold underline")
-        text.append(f"{name}\n\n", style="bold")
+        text.append(f"{name}\n", style="bold")
         if model:
             text.append("État : ", style="bold")
-            text.append("chargé en RAM\n" if model.loaded else "sur disque seulement\n")
+            text.append("chargé en RAM" if model.loaded else "sur disque seulement")
+            text.append(" · Défaut ola : ", style="bold")
+            text.append("oui\n" if is_default_model else "non\n")
             text.append("Taille disque : ", style="bold")
             text.append(f"{format_bytes(model.size)}\n")
             if model.loaded:
@@ -3842,10 +3885,10 @@ class OlaTui(App):
         if capabilities:
             text.append("Capacités : ", style="bold")
             text.append(", ".join(str(value) for value in capabilities) + "\n")
-        default_norm = normalize_model(self.snapshot.default_model)
-        text.append("Défaut ola : ", style="bold")
-        text.append("oui\n" if normalize_model(name) == default_norm else "non\n")
-        text.append("\nActions : u utiliser · d supprimer · l libérer RAM · w préchauffer · p preset · b bench")
+        if not model:
+            text.append("Défaut ola : ", style="bold")
+            text.append("oui\n" if is_default_model else "non\n")
+        text.append("Actions : u utiliser · d supprimer · l libérer RAM · w préchauffer · p preset · b bench")
         details_widget.update(text)
 
     async def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
@@ -3933,6 +3976,7 @@ class OlaTui(App):
                 "Suppression définitive",
                 f"Supprimer définitivement {model} du disque ?\n\n{consequence}\n\nCette action est irréversible sans nouveau téléchargement.",
                 "Supprimer",
+                confirm_variant="error",
             ),
             done,
         )
