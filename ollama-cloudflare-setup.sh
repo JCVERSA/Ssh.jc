@@ -38,11 +38,11 @@ die(){ err "$*"; exit 1; }
 usage(){
   echo "Usage: bash $0 [setup|start|recover|status|doctor|test|bench|speed|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, start, recover, use, unload, delete, restart, stop and 'speed apply|reset' require root; status, doctor, test, bench, speed, models, ps, logs and watchdog are read-only."
+  echo "setup, start, recover, use, unload, delete, restart, stop and 'speed apply|reset' require root; status, doctor, test, speed, models, ps, logs and watchdog are read-only. Bench does not change config or disk files, but may load/unload models in RAM while testing."
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."
   echo "ola delete (alias: ola rm) unloads the model from RAM first, then permanently deletes it from disk."
-  echo "ola bench [model] measures real generation speed (thinking on/off); ola speed shows CPU/RAM tuning, 'ola speed apply' enables the safe Pack Speed (Flash Attention + q8_0 KV cache), 'ola speed reset' restores the defaults. Parallel requests and context size are never raised by Pack Speed."
+  echo "ola bench (or ola bench all) measures every downloaded model one by one; ola bench <model> measures only that model. ola speed shows CPU/RAM tuning for the whole Ollama server, 'ola speed apply' enables the safe Pack Speed (Flash Attention + q8_0 KV cache) for all models and verifies each present model, 'ola speed reset' restores the defaults. Parallel requests and context size are never raised by Pack Speed."
   echo "In an interactive terminal, ola models opens a model manager: u=use, d=delete, l=unload from RAM, a=add+use, q=quit."
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
@@ -1721,33 +1721,34 @@ bench_print_line(){
   fi
 }
 
-run_bench(){
-  local requested=${1:-} model installed loaded mem_kb base public_url threads
-  local res_default="" res_off="" have_default=0 have_off=0 d_total o_total gain
-  require_commands curl jq
-  ollama_api_ready || die "Ollama API is not answering, so the benchmark cannot run. Try: ola recover"
-  model=${requested:-$(saved_model_name)}
-  is_valid_model_name "$model" || die "Invalid model name: $model (example: qwen3:1.7b)"
-  installed=$(installed_model_names) || die "Could not read the installed model list from Ollama."
-  model_names_contain "$installed" "$model" \
-    || die "Model is not downloaded on disk: $model. Install and load it first with: ola use $model"
-  threads=$(cpu_physical_cores)
+# Prints installed model names with the saved default moved to the end, so
+# a global benchmark finishes on the model the user normally uses.
+ordered_present_model_names(){
+  local names=$1 default_model=$2 name default_norm
+  default_norm=$(normalize_model_name "$default_model")
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$(normalize_model_name "$name")" == "$default_norm" ]] || printf '%s\n' "$name"
+  done <<< "$names"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    [[ "$(normalize_model_name "$name")" == "$default_norm" ]] && printf '%s\n' "$name"
+  done <<< "$names"
+  return 0
+}
 
-  echo "--- Ola bench ---"
-  info "Modèle : $model"
-  info "CPU : $(cpu_logical_cores) logique(s), environ $threads physique(s) — $(cpu_speed_summary)"
-  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
-  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
-    info "RAM disponible : environ $((mem_kb / 1024)) MB"
-  fi
-  loaded=$(loaded_model_names 2>/dev/null || true)
-  if model_names_contain "$loaded" "$model"; then
-    info "Le modèle est déjà chargé en RAM."
-  else
-    info "Le modèle n'est pas encore chargé : le premier run inclura son temps de chargement."
-  fi
-  echo "Test identique pour les deux runs : même question courte, 48 tokens max, num_ctx $OLLAMA_CONTEXT_LENGTH, température 0."
-  echo
+# Populated by bench_one_model for bench_summary_for_last.
+LAST_BENCH_DEFAULT_RES=""
+LAST_BENCH_OFF_RES=""
+LAST_BENCH_HAVE_DEFAULT=0
+LAST_BENCH_HAVE_OFF=0
+
+bench_one_model(){
+  local model=$1 res_default="" res_off="" have_default=0 have_off=0 d_total o_total gain
+  LAST_BENCH_DEFAULT_RES=""
+  LAST_BENCH_OFF_RES=""
+  LAST_BENCH_HAVE_DEFAULT=0
+  LAST_BENCH_HAVE_OFF=0
 
   info "Run 1/2 : thinking par défaut (sans think:false)..."
   if res_default=$(bench_run "$model" default); then
@@ -1764,21 +1765,136 @@ run_bench(){
   else
     warn "think:false a été refusé par ce modèle (modèle sans mode réflexion, probablement) : ignore ce réglage pour lui."
   fi
-  [[ "$have_default" -eq 1 || "$have_off" -eq 1 ]] \
-    || die "Benchmark failed for model: $model. Check: ola logs"
 
-  echo
+  LAST_BENCH_DEFAULT_RES="$res_default"
+  LAST_BENCH_OFF_RES="$res_off"
+  LAST_BENCH_HAVE_DEFAULT="$have_default"
+  LAST_BENCH_HAVE_OFF="$have_off"
+  [[ "$have_default" -eq 1 || "$have_off" -eq 1 ]] || return 1
+
   if [[ "$have_default" -eq 1 && "$have_off" -eq 1 ]]; then
     d_total=$(printf '%s' "$res_default" | cut -f1)
     o_total=$(printf '%s' "$res_off" | cut -f1)
     if [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$d_total" -gt 0 && "$o_total" -lt "$d_total" ]]; then
       gain=$(awk -v d="$d_total" -v o="$o_total" 'BEGIN { printf "%.0f", (d - o) / d * 100 }')
-      ok "Verdict mesuré : think:false a été environ ${gain}% plus rapide sur ce test. Pour les questions simples, c'est le gain le plus facile."
+      ok "Verdict mesuré pour $model : think:false a été environ ${gain}% plus rapide sur ce test."
     elif [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$o_total" -gt "$d_total" ]]; then
-      warn "Verdict mesuré : think:false n'a pas été plus rapide sur ce test (le premier run inclut parfois le chargement du modèle ; relance ola bench pour confirmer)."
+      warn "Verdict mesuré pour $model : think:false n'a pas été plus rapide sur ce test (le premier run inclut parfois le chargement ; relance le bench pour confirmer)."
     else
-      info "Verdict mesuré : pas de différence nette entre les deux runs sur ce test."
+      info "Verdict mesuré pour $model : pas de différence nette entre les deux runs sur ce test."
     fi
+  elif [[ "$have_off" -eq 1 ]]; then
+    warn "Verdict pour $model : seul le run think:false a réussi ; compare avec prudence."
+  else
+    warn "Verdict pour $model : think:false indisponible/refusé ; utilise le comportement par défaut de ce modèle."
+  fi
+  return 0
+}
+
+bench_summary_for_last(){
+  local model=$1 d_tps="-" o_tps="-" d_total o_total conclusion
+  if [[ "$LAST_BENCH_HAVE_DEFAULT" -eq 1 ]]; then
+    d_tps=$(printf '%s' "$LAST_BENCH_DEFAULT_RES" | cut -f4)
+  fi
+  if [[ "$LAST_BENCH_HAVE_OFF" -eq 1 ]]; then
+    o_tps=$(printf '%s' "$LAST_BENCH_OFF_RES" | cut -f4)
+  fi
+  if [[ "$LAST_BENCH_HAVE_DEFAULT" -eq 1 && "$LAST_BENCH_HAVE_OFF" -eq 1 ]]; then
+    d_total=$(printf '%s' "$LAST_BENCH_DEFAULT_RES" | cut -f1)
+    o_total=$(printf '%s' "$LAST_BENCH_OFF_RES" | cut -f1)
+    if [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$o_total" -lt "$d_total" ]]; then
+      conclusion="think:false plus rapide sur ce test"
+    elif [[ "$o_total" =~ ^[0-9]+$ && "$d_total" =~ ^[0-9]+$ && "$o_total" -gt "$d_total" ]]; then
+      conclusion="pas de gain think:false mesuré"
+    else
+      conclusion="pas de différence nette"
+    fi
+  elif [[ "$LAST_BENCH_HAVE_OFF" -eq 1 ]]; then
+    conclusion="seul think:false a répondu"
+  elif [[ "$LAST_BENCH_HAVE_DEFAULT" -eq 1 ]]; then
+    conclusion="think:false refusé/non applicable"
+  else
+    conclusion="ÉCHEC des deux runs"
+  fi
+  printf '%s | génération défaut %s tok/s | génération think:false %s tok/s | %s' "$model" "$d_tps" "$o_tps" "$conclusion"
+}
+
+run_bench(){
+  local requested=${1:-} installed loaded mem_kb base public_url threads saved_default example_model
+  local -a present_models=() models_to_bench=() summary_lines=()
+  local model ordered successes=0 failures=0 global=0 idx
+  require_commands curl jq
+  ollama_api_ready || die "Ollama API is not answering, so the benchmark cannot run. Try: ola recover"
+  installed=$(installed_model_names) || die "Could not read the installed model list from Ollama."
+  [[ -n "$installed" ]] || die "No model is currently downloaded on disk. Install one first with: ola use <model>"
+  saved_default=$(saved_model_name)
+  ordered=$(ordered_present_model_names "$installed" "$saved_default")
+  while IFS= read -r model; do
+    [[ -n "$model" ]] || continue
+    present_models+=("$model")
+  done <<< "$ordered"
+
+  if [[ -n "$requested" && "$requested" != "all" && "$requested" != "--all" ]]; then
+    is_valid_model_name "$requested" || die "Invalid model name: $requested (example: qwen3:1.7b)"
+    model_names_contain "$installed" "$requested" \
+      || die "Model is not downloaded on disk: $requested. Install and load it first with: ola use $requested"
+    models_to_bench=("$requested")
+    example_model="$requested"
+  else
+    global=1
+    models_to_bench=("${present_models[@]}")
+    example_model="${models_to_bench[$((${#models_to_bench[@]} - 1))]}"
+    if model_names_contain "$installed" "$saved_default"; then
+      example_model="$saved_default"
+    fi
+  fi
+  threads=$(cpu_physical_cores)
+
+  echo "--- Ola bench ---"
+  if [[ "$global" -eq 1 ]]; then
+    info "Portée globale : ${#models_to_bench[@]} modèle(s) présent(s) sur le disque, testés un par un."
+    info "Modèles pris en compte : $(printf '%s' "$installed" | tr '\n' ' ')"
+    info "Le modèle par défaut est testé en dernier afin de terminer avec lui : $example_model"
+  else
+    info "Portée ciblée : un seul modèle."
+  fi
+  info "CPU : $(cpu_logical_cores) logique(s), environ $threads physique(s) — $(cpu_speed_summary)"
+  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    info "RAM disponible : environ $((mem_kb / 1024)) MB"
+  fi
+  echo "Chaque modèle est testé séparément ; les autres modèles chargés sont déchargés de la RAM avant son test. Aucun fichier de modèle n'est modifié ni supprimé."
+  echo "Test identique pour les deux runs de chaque modèle : même question courte, 48 tokens max, num_ctx $OLLAMA_CONTEXT_LENGTH, température 0."
+
+  for idx in "${!models_to_bench[@]}"; do
+    model="${models_to_bench[$idx]}"
+    echo
+    echo "=== Modèle $((idx + 1))/${#models_to_bench[@]} : $model ==="
+    stop_loaded_models_except "$model"
+    loaded=$(loaded_model_names 2>/dev/null || true)
+    if model_names_contain "$loaded" "$model"; then
+      info "Le modèle est déjà chargé en RAM."
+    else
+      info "Le modèle n'est pas encore chargé : le premier run inclura son temps de chargement."
+    fi
+    if bench_one_model "$model"; then
+      successes=$((successes + 1))
+    else
+      failures=$((failures + 1))
+    fi
+    summary_lines+=("$(bench_summary_for_last "$model")")
+  done
+
+  if [[ "$global" -eq 1 ]]; then
+    echo
+    echo "--- Synthèse globale ---"
+    printf '%s\n' "${summary_lines[@]}"
+  fi
+  if [[ "$successes" -eq 0 ]]; then
+    die "Benchmark failed for every tested model. Check: ola logs"
+  fi
+  if [[ "$failures" -gt 0 ]]; then
+    warn "Benchmark terminé avec $failures échec(s) et $successes succès. Les modèles en échec sont signalés dans la synthèse."
   fi
 
   base="http://127.0.0.1:11434"
@@ -1789,25 +1905,26 @@ run_bench(){
   cat <<EOF
 
 Conseils vitesse, du plus efficace au plus fin :
-  1. Questions simples : envoie "think": false (mesuré ci-dessus) et limite la longueur avec options.num_predict (ex. 128 ou 256).
+  1. Questions simples : envoie "think": false (mesuré ci-dessus, modèle par modèle) et limite la longueur avec options.num_predict (ex. 128 ou 256). Si un modèle refuse "think": false, ignore ce réglage pour ce modèle précis.
   2. Utilise "stream": true dans tes applis : la génération n'est pas plus rapide, mais les tokens s'affichent au fur et à mesure.
   3. Côté client, essaie options.num_thread ≈ $threads (cœurs physiques estimés) et compare ; options.num_batch ne sert surtout qu'aux très longs prompts.
   4. Garde un seul modèle chargé (ola ps / ola unload) : sur un petit sandbox, la RAM libre évite les lenteurs.
   5. Le keep-alive actuel (5m) garde le modèle en RAM 5 minutes : réponses suivantes plus rapides, mais RAM occupée. ola unload libère tout de suite.
 
-Exemple rapide à copier (remplace l'URL par la tienne si besoin) :
+Exemple rapide à copier (modèle utilisé dans l'exemple : $example_model ; remplace l'URL par la tienne si besoin) :
 curl -fsS $base/api/chat -H 'Content-Type: application/json' -d '{
-  "model": "$model",
+  "model": "$example_model",
   "messages": [{"role": "user", "content": "Dis bonjour en une phrase."}],
   "stream": true,
   "think": false,
   "options": {"num_predict": 128, "num_thread": $threads}
 }'
 EOF
+  [[ "$failures" -eq 0 ]]
 }
 
 show_speed(){
-  local mode flash kv mem_kb loaded
+  local mode flash kv mem_kb loaded installed saved_default model
   select_supervisor_paths
   mode=$(saved_speed_mode)
   echo "--- Ola speed (Pack Speed) ---"
@@ -1835,6 +1952,21 @@ show_speed(){
     echo "RAM disponible : environ $((mem_kb / 1024)) MB"
   fi
   if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 && ollama_api_ready; then
+    installed=$(installed_model_names 2>/dev/null || true)
+    saved_default=$(saved_model_name)
+    if [[ -n "$installed" ]]; then
+      echo "Modèles présents pris en compte par l'optimisation globale :"
+      while IFS= read -r model; do
+        [[ -n "$model" ]] || continue
+        if [[ "$(normalize_model_name "$model")" == "$(normalize_model_name "$saved_default")" ]]; then
+          echo "  - $model [défaut]"
+        else
+          echo "  - $model"
+        fi
+      done <<< "$installed"
+    else
+      echo "Aucun modèle téléchargé présent pour le moment."
+    fi
     loaded=$(loaded_model_names 2>/dev/null || true)
     if [[ -n "$loaded" ]]; then
       echo "Modèle(s) chargé(s) en RAM : $(printf '%s' "$loaded" | tr '\n' ' ')"
@@ -1842,16 +1974,19 @@ show_speed(){
       echo "Aucun modèle chargé en RAM pour le moment."
     fi
   else
-    echo "API Ollama locale non joignable : état RAM du modèle inconnu."
+    echo "API Ollama locale non joignable : liste des modèles présents et état RAM inconnus."
   fi
   cat <<'EOF'
 
+Portée : ces réglages vivent dans le processus serveur Ollama. Ils s'appliquent donc à tous les modèles
+présents servis par Ollama, pas seulement au modèle par défaut. "ola bench" sans nom de modèle les teste
+tous, un par un ; "ola speed apply/reset" mesure et vérifie aussi chaque modèle présent, un par un.
 Ce que "ola speed apply" change (avec mesure avant/après et retour arrière auto si Ollama ne répond plus) :
   OLLAMA_FLASH_ATTENTION=1 et OLLAMA_KV_CACHE_TYPE=q8_0 (cache KV ~2x plus léger que f16, gain RAM et vitesse possible).
 Ce qu'il ne change jamais : OLLAMA_NUM_PARALLEL=1, OLLAMA_MAX_LOADED_MODELS=1, le contexte et le keep-alive (5m),
 car les augmenter coûterait de la RAM sans rendre une requête seule plus rapide.
 Revenir en arrière : ola speed reset
-Mesurer avant/après : ola bench
+Mesurer avant/après : ola bench (tous les modèles présents) ou ola bench <modèle> (un seul)
 EOF
 }
 
@@ -1871,20 +2006,39 @@ rollback_speed_config(){
   wait_for_ollama_api 30 || true
 }
 
+verify_model_chat(){
+  local model=$1 payload
+  is_valid_model_name "$model" || return 1
+  payload=$(jq -cn --arg model "$model" '{model:$model, messages:[{role:"user", content:"Reply only with OK."}], stream:false, options:{num_predict:16}}') || return 1
+  curl -fsS --max-time 180 http://127.0.0.1:11434/api/chat \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1
+}
+
+# One short speed measurement for a model. Prefers think:false, then falls
+# back to the model's default behaviour for models that refuse think:false.
+measure_model_once(){
+  local model=$1 res
+  if res=$(bench_run "$model" off); then
+    printf '%s' "$res"
+    return 0
+  fi
+  if res=$(bench_run "$model" default); then
+    printf '%s' "$res"
+    return 0
+  fi
+  return 1
+}
+
 apply_speed_mode(){
-  local target=$1 ollama_bin current model installed backup prev_speed_existed=0 prev_speed_value=""
-  local before_res="" after_res="" before_tps="" after_tps="" verify_payload model_installed=0
+  local target=$1 ollama_bin current installed saved_default ordered backup prev_speed_existed=0 prev_speed_value=""
+  local -a present_models=() before_labels=() before_ok=() after_labels=()
+  local model res idx regression_models="" verified_after=0 already_failing=0 bench_status=0
   select_supervisor_paths
   [[ -f "$SUP_DIR/ollama.conf" ]] || die "Ollama Supervisor config not found: $SUP_DIR/ollama.conf. Run setup first: ola setup"
   ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
   require_commands curl jq
   ensure_service_users
   current=$(saved_speed_mode)
-  if [[ "$current" == "$target" ]] && speed_config_matches "$target"; then
-    ok "Speed mode is already set: $target (Supervisor config already matches)."
-    show_speed
-    return 0
-  fi
 
   if ! supervisor_program_running ollama; then
     info "Ollama is not RUNNING; starting it before applying the speed mode..."
@@ -1894,20 +2048,52 @@ apply_speed_mode(){
   fi
   ollama_api_ready || die "Ollama API is not answering. Try: ola recover"
 
-  model=$(saved_model_name)
   installed=$(installed_model_names) || die "Could not read the installed model list from Ollama."
-  if model_names_contain "$installed" "$model"; then
-    model_installed=1
-    info "Measuring current speed before the change (think:false, 48 tokens max)..."
-    if before_res=$(bench_run "$model" off); then
-      before_tps=$(printf '%s' "$before_res" | cut -f4)
-      info "Before: generation ${before_tps} tok/s for $model"
+  saved_default=$(saved_model_name)
+  ordered=$(ordered_present_model_names "$installed" "$saved_default")
+  while IFS= read -r model; do
+    [[ -n "$model" ]] || continue
+    if is_valid_model_name "$model"; then
+      present_models+=("$model")
     else
-      warn "Pre-change benchmark failed; continuing without a before/after comparison."
-      before_res=""
+      warn "Ignoring an installed model with an unexpected name: $model"
     fi
+  done <<< "$ordered"
+
+  if [[ "$current" == "$target" ]] && speed_config_matches "$target"; then
+    ok "Speed mode is already set: $target (Supervisor config already matches, server-wide)."
+    if [[ ${#present_models[@]} -eq 0 ]]; then
+      show_speed
+      return 0
+    fi
+    info "No config change or restart is needed; checking every present model in the current mode so newly added models are included..."
+    bench_status=0
+    run_bench "" || bench_status=$?
+    return "$bench_status"
+  fi
+
+  if [[ ${#present_models[@]} -gt 0 ]]; then
+    info "Portée globale : ${#present_models[@]} modèle(s) présent(s) pris en compte, un par un : $(printf '%s' "$installed" | tr '\n' ' ')"
+    info "Measuring current speed for every present model before the change (short test, one model at a time)..."
+    for idx in "${!present_models[@]}"; do
+      model="${present_models[$idx]}"
+      stop_loaded_models_except "$model"
+      if res=$(measure_model_once "$model"); then
+        before_labels[idx]=$(printf '%s' "$res" | cut -f4)
+        before_ok[idx]=1
+        info "Before [$model]: generation ${before_labels[$idx]} tok/s"
+      elif verify_model_chat "$model"; then
+        before_labels[idx]="répond, vitesse non mesurée"
+        before_ok[idx]=1
+        warn "Before [$model]: the model answers, but its short speed measurement failed."
+      else
+        before_labels[idx]="échec avant changement"
+        before_ok[idx]=0
+        warn "Before [$model]: this model did not answer before the change; it will be rechecked after, without forcing a rollback by itself."
+      fi
+    done
   else
-    warn "Default model $model is not downloaded; skipping the before/after benchmark and the chat verification."
+    warn "No downloaded model is present; applying the server-wide speed mode with an API-only verification."
   fi
 
   backup=$(mktemp) || die "Could not create a temporary backup of the Ollama Supervisor config."
@@ -1917,7 +2103,7 @@ apply_speed_mode(){
     prev_speed_value=$(head -n 1 "$SPEED_FILE" 2>/dev/null || true)
   fi
 
-  info "Applying speed mode: $target"
+  info "Applying server-wide speed mode: $target (applies to every model served by Ollama, not only the default)"
   save_speed_mode "$target"
   write_ollama_supervisor_config "$ollama_bin" "$target"
   supervisor_apply
@@ -1929,34 +2115,49 @@ apply_speed_mode(){
     die "Speed mode $target could not be applied; the previous Ollama configuration was restored. Check: ola logs"
   fi
 
-  if [[ "$model_installed" -eq 1 ]]; then
-    verify_payload=$(jq -cn --arg model "$model" '{model:$model, messages:[{role:"user", content:"Reply only with OK."}], stream:false, options:{num_predict:16}}') \
-      || { rollback_speed_config "$backup" "$prev_speed_existed" "$prev_speed_value"; rm -f "$backup"; die "Could not build the verification request; the previous Ollama configuration was restored."; }
-    if ! curl -fsS --max-time 180 http://127.0.0.1:11434/api/chat \
-      -H 'Content-Type: application/json' -d "$verify_payload" >/dev/null 2>&1; then
-      warn "The verification chat failed after applying speed mode $target; restoring the previous configuration..."
+  if [[ ${#present_models[@]} -gt 0 ]]; then
+    info "Verifying and measuring every present model after the change (same short test, one model at a time)..."
+    for idx in "${!present_models[@]}"; do
+      model="${present_models[$idx]}"
+      stop_loaded_models_except "$model"
+      if res=$(measure_model_once "$model"); then
+        after_labels[idx]=$(printf '%s' "$res" | cut -f4)
+        verified_after=$((verified_after + 1))
+      elif verify_model_chat "$model"; then
+        after_labels[idx]="répond, vitesse non mesurée"
+        verified_after=$((verified_after + 1))
+        warn "After [$model]: the model answers, but its short speed measurement failed."
+      else
+        after_labels[idx]="échec après changement"
+        if [[ "${before_ok[$idx]:-0}" -eq 1 ]]; then
+          regression_models="${regression_models} ${model}"
+        else
+          already_failing=$((already_failing + 1))
+        fi
+      fi
+      echo "[$model] Avant : ${before_labels[$idx]:-non mesuré} · Après : ${after_labels[$idx]:-non mesuré}"
+    done
+
+    if [[ -n "$regression_models" ]]; then
+      warn "At least one model that worked before no longer answers after speed mode $target:${regression_models}; restoring the previous configuration..."
       rollback_speed_config "$backup" "$prev_speed_existed" "$prev_speed_value"
       rm -f "$backup"
-      die "Speed mode $target failed verification; the previous Ollama configuration was restored. Check: ola logs"
+      die "Speed mode $target failed verification for:${regression_models}. The previous Ollama configuration was restored. Check: ola logs"
     fi
-    ok "Verification chat passed with speed mode: $target"
+    if [[ "$already_failing" -gt 0 ]]; then
+      warn "$already_failing present model(s) were already failing before the change and still fail; they did not trigger a rollback."
+    fi
+    ok "Verification passed for $verified_after/${#present_models[@]} present model(s) with speed mode: $target"
+  else
+    ok "Ollama API verification passed with speed mode: $target (no downloaded model to chat-test)"
   fi
 
-  if [[ -n "$before_res" ]]; then
-    info "Measuring speed after the change (same test)..."
-    if after_res=$(bench_run "$model" off); then
-      after_tps=$(printf '%s' "$after_res" | cut -f4)
-      echo "Avant : génération ${before_tps} tok/s · Après : génération ${after_tps} tok/s (test court think:false, 48 tokens max; la variance CPU peut masquer les petits écarts)."
-    else
-      warn "Post-change benchmark failed; run: ola bench"
-    fi
-  fi
   rm -f "$backup"
-  ok "Speed mode is now: $target. Full comparison anytime with: ola bench"
+  ok "Speed mode is now: $target, for every model served by Ollama. Full per-model comparison anytime with: ola bench"
   if [[ "$target" == "speed" ]]; then
-    echo "Actif : OLLAMA_FLASH_ATTENTION=1, OLLAMA_KV_CACHE_TYPE=q8_0. Inchangés : contexte $OLLAMA_CONTEXT_LENGTH, 1 modèle chargé, 1 requête parallèle, keep-alive 5m."
+    echo "Actif pour tout le serveur Ollama : OLLAMA_FLASH_ATTENTION=1, OLLAMA_KV_CACHE_TYPE=q8_0. Inchangés : contexte $OLLAMA_CONTEXT_LENGTH, 1 modèle chargé, 1 requête parallèle, keep-alive 5m."
   else
-    echo "Configuration équilibrée restaurée (pas de Flash Attention, cache KV par défaut). Inchangés : contexte, parallélisme et keep-alive."
+    echo "Configuration équilibrée restaurée pour tout le serveur Ollama (pas de Flash Attention, cache KV par défaut). Inchangés : contexte, parallélisme et keep-alive."
   fi
 }
 

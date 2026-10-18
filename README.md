@@ -389,7 +389,7 @@ OLLAMA_FLASH_ATTENTION="1"
 OLLAMA_KV_CACHE_TYPE="q8_0"
 ```
 
-Le mode choisi (`balanced` ou `speed`) est enregistré dans `/etc/ollama-cloudflare-speed` et conservé si tu relances un setup. `ola speed apply` ne modifie jamais `OLLAMA_NUM_PARALLEL`, `OLLAMA_MAX_LOADED_MODELS`, le contexte ni le keep-alive.
+Le mode choisi (`balanced` ou `speed`) est enregistré dans `/etc/ollama-cloudflare-speed` et conservé si tu relances un setup. C’est un mode **global au serveur Ollama** : il s’applique à tous les modèles servis, pas seulement au modèle par défaut de `ola`. `ola speed apply` ne modifie jamais `OLLAMA_NUM_PARALLEL`, `OLLAMA_MAX_LOADED_MODELS`, le contexte ni le keep-alive.
 
 Ces paramètres sont écrits dans la configuration Supervisor au moment du setup. Pour les modifier proprement, ajuste les variables ci-dessous puis relance un setup, ou modifie la configuration Supervisor puis recharge-la avec `ola start`.
 
@@ -483,6 +483,7 @@ ola status
 ola doctor
 ola test
 ola bench
+ola bench <modèle>
 ola speed
 ola speed apply
 ola speed reset
@@ -510,8 +511,10 @@ Les commandes qui modifient les services ou les modèles demandent root :
 
 Les commandes suivantes sont en lecture seule :
 
-- `status`, `doctor`, `test`, `bench`, `speed` (état), `ps`, `logs`, `watchdog` ;
+- `status`, `doctor`, `test`, `speed` (état), `ps`, `logs`, `watchdog` ;
 - `ola models` en affichage simple, ou en mode lecture seule si tu n’es pas root.
+
+Cas particulier : `ola bench` ne modifie ni la configuration ni les fichiers des modèles, mais il peut charger et décharger des modèles en RAM pour les tester un par un.
 
 En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `sudo ola ...` pour les commandes d’écriture.
 
@@ -525,10 +528,11 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola status` | Affiche Supervisor, l’API locale, les modèles connus et l’URL publique enregistrée. |
 | `ola doctor` | Diagnostic complet : binaires, Supervisor, services, API, modèles, tunnel, RAM, disque, logs et URL publique. |
 | `ola test` | Teste l’API locale, vérifie le modèle par défaut, fait une mini-conversation et teste l’URL publique. |
-| `ola bench` | Mesure la vitesse réelle du modèle par défaut : même question courte avec thinking par défaut puis `think:false`, tok/s et verdict mesuré. `ola bench <modèle>` pour un autre modèle téléchargé. |
-| `ola speed` | Affiche le mode vitesse, la configuration Ollama effective, le CPU (AVX/AVX2, cœurs), la RAM et les recommandations. Lecture seule. |
-| `ola speed apply` | Active le Pack Speed : mesure avant, active Flash Attention + cache KV `q8_0`, redémarre Ollama seul, vérifie par un mini-chat, mesure après. Retour arrière automatique en cas d’échec. Root requis. |
-| `ola speed reset` | Désactive le Pack Speed et restaure la configuration équilibrée, avec la même vérification. Root requis. |
+| `ola bench` | Sans argument (ou `ola bench all`), mesure **tous les modèles téléchargés présents**, un par un : même question courte avec thinking par défaut puis `think:false`, tok/s, verdict par modèle et synthèse globale. Le modèle par défaut est testé en dernier. |
+| `ola bench <modèle>` | Mesure uniquement le modèle indiqué. |
+| `ola speed` | Affiche le mode vitesse global du serveur Ollama, la liste des modèles présents concernés, la configuration effective, le CPU (AVX/AVX2, cœurs), la RAM et les recommandations. Lecture seule. |
+| `ola speed apply` | Active le Pack Speed pour **tout le serveur Ollama** : mesure chaque modèle présent avant, active Flash Attention + cache KV `q8_0`, redémarre Ollama seul, puis vérifie et mesure chaque modèle présent après. Retour arrière automatique si un modèle qui fonctionnait ne répond plus. Root requis. |
+| `ola speed reset` | Désactive le Pack Speed pour tout le serveur et restaure la configuration équilibrée, avec mesure/vérification de chaque modèle présent. Root requis. |
 | `ola models` | En terminal interactif, ouvre le gestionnaire de modèles. Sinon, affiche simplement la liste des modèles téléchargés. |
 | `ola use <modèle>` | Change de modèle : décharge d’abord les autres modèles en RAM, télécharge si besoin, charge le modèle demandé et le définit comme défaut pour `ola`. |
 | `ola ps` | Liste les modèles actuellement chargés en RAM. |
@@ -781,21 +785,28 @@ Différence essentielle :
 
 Sur un petit sandbox CPU d’environ 2 Go de RAM, la vitesse dépend surtout du modèle, du CPU et de la façon dont les requêtes sont envoyées. Le Pack Speed suit un principe simple : **mesurer d’abord, ne changer que ce qui est sûr, et pouvoir revenir en arrière**.
 
+**Portée globale :** le Pack Speed n’est pas un réglage par modèle et n’est pas limité à Qwen. Les réglages serveur (`OLLAMA_FLASH_ATTENTION`, `OLLAMA_KV_CACHE_TYPE`, contexte, parallélisme) vivent dans le processus Ollama et s’appliquent à tous les modèles qu’il sert. Les mesures et vérifications prennent en compte **tous les modèles téléchargés présents au moment de la commande**, quel que soit leur nom ou leur famille. Si tu installes un autre modèle plus tard, il bénéficie du même mode serveur, et le prochain `ola bench` le prendra en compte.
+
 ### Mesurer avec `ola bench`
 
 ```bash
 ola bench
-ola bench qwen3:0.6b
+ola bench all
+ola bench <modèle>
 ```
 
-`ola bench` envoie deux fois la même question courte au modèle (48 tokens maximum, température 0) :
+Sans nom de modèle, `ola bench` teste **tous les modèles présents sur le disque**, un par un. Avant le test d’un modèle, les autres modèles chargés sont déchargés de la RAM pour respecter la limite d’un seul modèle chargé. Le modèle par défaut de `ola` est testé en dernier, afin de terminer avec lui. Aucun modèle n’est téléchargé, supprimé ou modifié sur le disque par le bench.
+
+Pour chaque modèle présent, `ola bench` envoie deux fois la même question courte (48 tokens maximum, température 0) :
 
 1. avec le thinking par défaut ;
 2. avec `"think": false`.
 
-Il affiche pour chaque run le temps total, le temps de chargement, la vitesse du prompt et la vitesse de génération en tokens/seconde, puis un verdict mesuré. Le premier run peut inclure le chargement du modèle en RAM ; relance `ola bench` une deuxième fois pour comparer à chaud.
+Il affiche pour chaque run le temps total, le temps de chargement, la vitesse du prompt et la vitesse de génération en tokens/seconde, puis un verdict propre à ce modèle. À la fin, une **synthèse globale** compare les modèles présents. Le premier run d’un modèle peut inclure son chargement en RAM ; relance `ola bench` pour comparer à chaud.
 
-C’est une commande en lecture seule : elle ne change aucune configuration.
+Un modèle peut refuser `think:false` s’il n’a pas de mode réflexion : le bench le signale pour ce modèle précis et continue avec les autres. Si un run échoue, la synthèse le marque sans empêcher les autres modèles d’être testés.
+
+`ola bench` ne change ni la configuration ni les fichiers des modèles, mais il peut charger/décharger des modèles en RAM pendant la séquence.
 
 ### Voir l’état avec `ola speed`
 
@@ -806,9 +817,10 @@ ola speed
 Affiche :
 
 - le mode enregistré : `balanced` (défaut) ou `speed` ;
+- la liste des modèles téléchargés présents concernés par ce mode global, avec le modèle par défaut marqué ;
 - la configuration Ollama réellement écrite dans Supervisor (Flash Attention, cache KV, contexte, keep-alive, parallélisme) ;
 - le CPU : cœurs logiques/physiques estimés et présence d’AVX/AVX2/AVX-512 (AVX2 donne le meilleur backend CPU d’Ollama) ;
-- la RAM disponible et le modèle chargé ;
+- la RAM disponible et le ou les modèles chargés ;
 - les recommandations d’usage.
 
 `ola doctor` affiche aussi une ligne résumant le mode vitesse.
@@ -821,16 +833,16 @@ ola speed apply
 
 Ce que fait la commande, dans l’ordre :
 
-1. mesure la vitesse actuelle (test court `think:false`) ;
+1. inventorie tous les modèles téléchargés présents et mesure leur vitesse actuelle, **un modèle à la fois** (test court `think:false`, avec repli sur le comportement par défaut du modèle si `think:false` est refusé) ;
 2. enregistre le mode `speed` dans `/etc/ollama-cloudflare-speed` ;
-3. ajoute uniquement ces deux réglages à la configuration Supervisor d’Ollama :
+3. ajoute uniquement ces deux réglages à la configuration Supervisor du **serveur Ollama entier** :
    - `OLLAMA_FLASH_ATTENTION="1"` : attention plus efficace quand le modèle et le CPU la supportent ;
    - `OLLAMA_KV_CACHE_TYPE="q8_0"` : cache KV environ deux fois plus léger que le `f16` par défaut, ce qui libère de la RAM et peut aider la vitesse ;
 4. recharge Supervisor et redémarre **Ollama seul** (le tunnel n’est pas redémarré) ;
-5. vérifie qu’Ollama répond et qu’un mini-chat avec le modèle par défaut réussit ;
-6. mesure à nouveau et affiche l’avant/après.
+5. vérifie qu’Ollama répond, puis reteste **chaque modèle présent**, un par un, avec une comparaison avant/après par modèle ;
+6. affiche combien de modèles présents ont passé la vérification.
 
-Si Ollama ne revient pas ou si le mini-chat échoue, la commande **restaure automatiquement l’ancienne configuration** et l’ancien mode, puis redémarre Ollama : tu ne restes pas avec un réglage cassé.
+Si Ollama ne revient pas, ou si un modèle qui répondait avant le changement ne répond plus après, la commande **restaure automatiquement l’ancienne configuration** et l’ancien mode, puis redémarre Ollama : tu ne restes pas avec un réglage cassé. Un modèle qui ne répondait déjà pas avant le changement est signalé, mais ne déclenche pas à lui seul le retour arrière.
 
 Ce que `ola speed apply` ne change **jamais** :
 
@@ -839,7 +851,7 @@ Ce que `ola speed apply` ne change **jamais** :
 - le contexte (`1024`) : un contexte plus grand coûte de la RAM ;
 - le keep-alive (`5m`).
 
-Relancer `ola speed apply` alors que le mode est déjà actif ne fait rien (détection « already set »). Un nouveau setup conserve le mode enregistré.
+Relancer `ola speed apply` alors que le mode est déjà actif ne réécrit pas la configuration et ne redémarre pas Ollama (détection « already set ») ; en revanche, la commande relance un bench global de contrôle afin d’inclure aussi les modèles ajoutés depuis. Même logique pour `ola speed reset` si le mode équilibré est déjà actif. Un nouveau setup conserve le mode enregistré.
 
 ### Revenir en arrière
 
@@ -847,13 +859,13 @@ Relancer `ola speed apply` alors que le mode est déjà actif ne fait rien (dét
 ola speed reset
 ```
 
-Restaure la configuration équilibrée (sans Flash Attention ni cache KV quantifié), avec la même mesure avant/après et la même vérification automatique.
+Restaure la configuration équilibrée du serveur entier (sans Flash Attention ni cache KV quantifié), avec la même mesure et la même vérification automatique pour chaque modèle présent.
 
 ### Optimiser côté client
 
 Les gains les plus importants se jouent souvent dans la requête envoyée par ton application, pas dans le serveur :
 
-- **questions simples** : envoie `"think": false` pour les modèles à réflexion comme Qwen3 (c’est ce que `ola bench` mesure) ;
+- **questions simples** : envoie `"think": false` pour les modèles à réflexion qui le supportent — Qwen3, mais aussi tout autre modèle de ce type (c’est ce que `ola bench` mesure modèle par modèle) ; les modèles sans réflexion peuvent refuser ce champ, dans ce cas ne l’envoie pas pour eux ;
 - **affichage progressif** : envoie `"stream": true` ; la génération n’est pas plus rapide, mais les tokens arrivent au fur et à mesure au lieu d’attendre la fin ;
 - **réponses bornées** : `options.num_predict` (par exemple `128` ou `256`) évite les réponses inutilement longues ;
 - **threads** : `options.num_thread` proche du nombre de cœurs physiques (affiché par `ola speed`) peut aider ; teste et compare ;
@@ -880,7 +892,7 @@ Le keep-alive de 5 minutes est un compromis : le modèle reste en RAM pour des r
 
 ### Résultats mesurés sur un petit sandbox
 
-Mesures de référence obtenues avec `ola bench` et `ola speed apply` sur un sandbox d’environ 2 Go de RAM, 2 vCPU avec AVX-512 détecté, Ollama `0.40.6`, modèle `qwen3:1.7b` et contexte `1024`. Test : même question courte, 48 tokens maximum, température 0.
+Mesures de référence obtenues avec `ola bench` et `ola speed apply` sur un sandbox d’environ 2 Go de RAM, 2 vCPU avec AVX-512 détecté, Ollama `0.40.6`, modèle `qwen3:1.7b` et contexte `1024`. Test : même question courte, 48 tokens maximum, température 0. Au moment de ces mesures, `qwen3:1.7b` était le seul modèle présent sur ce sandbox : ces chiffres sont donc une référence pour **ce modèle précis**, pas une promesse pour les autres. Depuis, `ola bench` sans argument teste tous les modèles présents et donne à chacun son verdict ; ne transpose pas les tok/s d’un modèle à un autre.
 
 | Configuration | Run | Temps total | Chargement | Génération | Tokens générés | Réponse visible |
 |---|---|---:|---:|---:|---:|---|
@@ -1491,17 +1503,19 @@ CF_TUNNEL_PROTOCOL=http2 ./ollama-cloudflare-setup.sh setup
 
 Non. Il sert à `ola test`, au gestionnaire et aux actions `ola`. Les clients API doivent indiquer explicitement le champ `model` à chaque requête Ollama.
 
-### Comment rendre le modèle plus rapide sans ajouter de RAM ?
+### Comment rendre les modèles plus rapides sans ajouter de RAM ?
 
-1. Mesure : `ola bench` (compare thinking par défaut et `think:false`).
-2. Essaie `ola speed apply` (Flash Attention + cache KV `q8_0`, mesuré avant/après, réversible avec `ola speed reset`).
-3. Côté application : `"think": false` pour les questions simples, `"stream": true`, et `options.num_predict` raisonnable.
+L’optimisation est globale : elle concerne le serveur Ollama et tous les modèles présents, pas seulement le modèle par défaut.
+
+1. Mesure : `ola bench` (tous les modèles présents, un par un ; compare pour chacun thinking par défaut et `think:false`). Pour un seul modèle : `ola bench <modèle>`.
+2. Essaie `ola speed apply` (Flash Attention + cache KV `q8_0` pour tout le serveur, mesuré et vérifié modèle présent par modèle présent, réversible avec `ola speed reset`).
+3. Côté application : `"think": false` pour les questions simples si le modèle le supporte, `"stream": true`, et `options.num_predict` raisonnable — le champ `model` reste à indiquer à chaque requête.
 4. Garde un seul modèle en RAM (`ola ps`, `ola unload`).
-5. Si cela ne suffit pas, passe à un modèle plus petit : `ola use qwen3:0.6b`.
+5. Si un modèle reste trop lent, c’est souvent sa taille qui domine : un modèle plus petit répondra plus vite, indépendamment du Pack Speed.
 
 ### `ola speed apply` peut-il casser Ollama ?
 
-La commande est conçue pour ne pas te laisser avec un réglage cassé : sauvegarde de l’ancienne configuration, redémarrage d’Ollama seul, mini-chat de vérification, et restauration automatique de l’ancienne configuration si la vérification échoue. Et `ola speed reset` permet de revenir au mode `balanced` à tout moment.
+La commande est conçue pour ne pas te laisser avec un réglage cassé : sauvegarde de l’ancienne configuration, redémarrage d’Ollama seul, vérification de l’API puis retest de chaque modèle présent, et restauration automatique de l’ancienne configuration si Ollama ne revient pas ou si un modèle qui fonctionnait ne répond plus. Et `ola speed reset` permet de revenir au mode `balanced` à tout moment.
 
 ---
 
