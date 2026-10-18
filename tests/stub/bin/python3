@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Test-only Python stub. It simulates just enough of python3/venv/pip for
+# `ola tui install`; it never installs or executes real Python packages.
+set -u
+
+case "${1:-}" in
+  --version)
+    echo "Python 3.11.0 (test stub)"
+    exit 0
+    ;;
+  -c)
+    code=${2:-}
+    if [[ "$code" == *"importlib.metadata"* ]]; then
+      if [[ -f "${TEST_STATE:-}/tui-pip-installed" ]]; then
+        echo "8.2.8"
+        exit 0
+      fi
+      exit 1
+    fi
+    exit 0
+    ;;
+  -m)
+    module=${2:-}
+    if [[ "$module" == "venv" ]]; then
+      dest=""
+      shift 2
+      for arg in "$@"; do
+        case "$arg" in
+          --clear|--upgrade-deps) ;;
+          *) dest=$arg ;;
+        esac
+      done
+      [[ -n "$dest" ]] || exit 1
+      mkdir -p "$dest/bin"
+      self=$(readlink -f "${BASH_SOURCE[0]}")
+      cp "$self" "$dest/bin/python"
+      chmod +x "$dest/bin/python"
+      exit 0
+    fi
+    if [[ "$module" == "pip" ]]; then
+      printf 'pip %s\n' "$*" >> "${TEST_STATE:-/tmp}/calls.log"
+      if [[ "$*" == *"--version"* ]]; then
+        echo "pip 23.0 (test stub)"
+        exit 0
+      fi
+      # The install invocation must point at an existing requirements file.
+      prev=""
+      for arg in "$@"; do
+        if [[ "$prev" == "-r" ]]; then
+          [[ -f "$arg" ]] || exit 1
+        fi
+        prev=$arg
+      done
+      touch "${TEST_STATE:-/tmp}/tui-pip-installed"
+      exit 0
+    fi
+    if [[ "$module" == "ensurepip" ]]; then
+      exit 0
+    fi
+    ;;
+esac
+
+exit 0

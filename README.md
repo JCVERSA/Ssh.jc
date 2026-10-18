@@ -125,6 +125,7 @@ Principes :
   - `cloudflared-ollama` ;
   - `ollama-watchdog`.
 - La commande courte **`ola`** est installée dans `/usr/local/bin/ola`.
+- Une interface terminal optionnelle, **`ola tui`**, est installée automatiquement par le setup ; le moteur et toutes les commandes texte continuent de fonctionner si son installation échoue.
 - Les téléchargements d’Ollama et de cloudflared sont vérifiés quand un checksum est disponible.
 - Ollama est volontairement limité pour les petits sandboxes : un seul modèle chargé, une requête parallèle et un contexte de 1024 tokens par défaut.
 
@@ -432,6 +433,9 @@ Attention : après avoir changé `OLLAMA_CONTEXT_LENGTH` ou `CF_TUNNEL_PROTOCOL`
 |---|---|
 | `/usr/local/bin/ola` | Commande courte, lien vers le script installé |
 | `/usr/local/lib/ollama-cloudflare/ollama-cloudflare-setup.sh` | Copie stable du gestionnaire |
+| `/usr/local/lib/ollama-cloudflare/ola_tui.py` | Application Textual extraite depuis l’artefact unique |
+| `/usr/local/lib/ollama-cloudflare/tui-requirements.txt` | Versions Python/Textual épinglées pour la TUI |
+| `/usr/local/lib/ollama-cloudflare/tui-venv/` | Environnement Python isolé de la TUI, créé par le setup ou `ola tui install` |
 | `/etc/supervisor/supervisord.conf` | Configuration principale Supervisor, selon la distribution |
 | `/etc/supervisor/conf.d/ollama.conf` | Programme Supervisor Ollama |
 | `/etc/supervisor/conf.d/cloudflared-ollama.conf` | Programme Supervisor du tunnel |
@@ -542,6 +546,9 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola fluid preset [modèle]` | Affiche un preset de requête stable et rapide à copier dans ton client (`stream:true`, `think:false` seulement si le modèle déclare la capacité thinking, `num_ctx`/`num_thread` fixes, keep-alive de session). Lecture seule. |
 | `ola fluid keepalive <durée>` | Change le keep-alive par défaut du serveur (`OLLAMA_KEEP_ALIVE`) pour toutes les requêtes qui ne le précisent pas, par ex. `30m`, `1h`, `2h30m`, `3600` ou `-1`. Enregistré dans `/etc/ollama-cloudflare-keepalive`, vérification de l’API et du modèle, retour arrière automatique. Root requis. |
 | `ola fluid keepalive reset` | Restaure le keep-alive par défaut du serveur : `5m`. Root requis. |
+| `ola tui` | Ouvre l’interface plein écran Textual : tableau de bord et modèles en direct, détail du modèle, actions modèles, preset/bench, journaux et thèmes. Terminal interactif requis. |
+| `ola tui install` | Installe ou répare l’environnement Python/Textual isolé de la TUI. Root et accès PyPI requis. |
+| `ola tui status` | Indique si l’application TUI et son environnement Textual sont prêts. Lecture seule. |
 | `ola models` | En terminal interactif, ouvre le gestionnaire de modèles. Sinon, affiche simplement la liste des modèles téléchargés. |
 | `ola use <modèle>` | Change de modèle : décharge d’abord les autres modèles en RAM, télécharge si besoin, charge le modèle demandé et le définit comme défaut pour `ola`. |
 | `ola ps` | Liste les modèles actuellement chargés en RAM. |
@@ -804,9 +811,7 @@ ola bench all
 ola bench <modèle>
 ```
 
-Sans nom de modèle, `ola bench` teste **tous les modèles présents sur le disque**, un par un. Avant le test d’un modèle, les autres modèles chargés sont déchargés de la RAM pour respecter la limite d’un seul modèle chargé. Le modèle par défaut de `ola` est testé en dernier, afin de terminer avec lui. Aucun modèle n’est téléchargé, supprimé ou modifié sur le disque par le bench.
-
-Pour chaque modèle présent, `ola bench` envoie deux fois la même question courte (48 tokens maximum, température 0) :
+Sans nom de modèle, `ola bench` teste **tous les modèles présents sur le disque**, un par un. Avant le test d’un modèle, les autres modèles) :
 
 1. avec le thinking par défaut ;
 2. avec `"think": false`.
@@ -1016,6 +1021,18 @@ Résultat : **vérification réussie pour 3/3 modèles présents**, aucun retour
 
 Ces écarts positifs restent modestes et ne reposent que sur un seul test court par modèle : ils ne suffisent pas à attribuer un gain précis à Flash Attention ou au cache KV `q8_0`. Le résultat solidement démontré ici est la **couverture globale sans régression mesurée sur ce run** ; pour prouver un gain modèle par modèle, il faudrait répéter plusieurs benchs à chaud en `balanced` puis en `speed`.
 
+#### Bench streaming réel : le chargement domine, le tunnel suit
+
+Le même sandbox a ensuite exécuté `ola bench --stream` sur les trois modèles. Chaque run local démarrait avec le modèle concerné non chargé ; le run public suivait immédiatement avec le même modèle gardé chaud (`keep_alive 30m`). Les deux chemins ne sont donc pas comparés à froid dans les mêmes conditions, mais le run public vérifie si le flux reste progressif après le démarrage.
+
+| Modèle | TTFT local à froid | Chargement local | Génération locale | TTFT public à chaud | Génération publique | Plus grand trou public |
+|---|---:|---:|---:|---:|---:|---:|
+| `qwen2.5-coder:1.5b` | 4,1 s | 3,6 s | 14,7 tok/s | 0,1 s | 14,1 tok/s | 0,1 s |
+| `qwen3:1.7b` | 3,1 s | 2,8 s | 13,2 tok/s | 0,1 s | 13,6 tok/s | 0,1 s |
+| `qwen3:0.6b` | 1,7 s | 1,5 s | 33,5 tok/s | 0,1 s | 33,1 tok/s | 0,0 s |
+
+Lecture mesurée : sur ce run, **le délai avant le premier token visible venait surtout du chargement du modèle**, pas du tunnel. Une fois le modèle chaud, le premier morceau public arrivait en environ 0,1 s et les morceaux restaient réguliers (trous ≤ 0,1 s). Cela ne prouve pas que chaque client externe aura le même comportement, mais cela innocente le chemin public testé ici : pour améliorer le ressenti sur ce sandbox, les leviers prioritaires sont `ola fluid warm`, un modèle gardé chaud pendant la session et, si la qualité suffit, un modèle plus petit comme `qwen3:0.6b`.
+
 Interprétation honnête :
 
 - **Le gain clairement démontré vient de `think:false`, pas d’une génération brute plus rapide.** La génération reste autour de 12,6 à 14,4 tok/s dans ces tests ; `think:false` supprime surtout les tokens de réflexion invisibles, donc la réponse utile arrive plus tôt.
@@ -1040,6 +1057,71 @@ ola bench          # comparer à nouveau ; répéter si les écarts sont faibles
 - La qualité peut très légèrement varier avec un cache KV quantifié ; `q8_0` est le réglage prudent (le `q4_0`, plus agressif, n’est pas utilisé ici).
 - Si le modèle ne supporte pas le mode réflexion, `think:false` peut être refusé : `ola bench` te le signale et il suffit d’ignorer ce réglage pour ce modèle.
 - Le levier le plus radical reste un modèle plus petit, par exemple `ola use qwen3:0.6b` (environ 523 Mo) si la qualité suffit.
+
+## Interface TUI `ola tui`
+
+`ola tui` ouvre une interface terminal plein écran construite avec **Textual**, dans l’esprit de wifit3 : état visible en un coup d’œil, tableau mis à jour en direct, navigation au clavier, panneau de détail et barre de touches. Le moteur reste le programme Bash `ola` : la TUI lit l’API Ollama locale et délègue les actions aux commandes `ola` existantes, au lieu de réimplémenter leurs sécurités.
+
+### Lancer et réparer
+
+```bash
+ola tui
+ola tui status
+sudo ola tui install
+```
+
+Le setup installe automatiquement l’environnement TUI dans un environnement Python isolé :
+
+```text
+/usr/local/lib/ollama-cloudflare/ola_tui.py
+/usr/local/lib/ollama-cloudflare/tui-requirements.txt
+/usr/local/lib/ollama-cloudflare/tui-venv/
+```
+
+Il faut Python 3.9 ou plus, le paquet système `python3-venv` si la création du venv le demande, et un accès à PyPI pendant l’installation. Les versions Python sont épinglées dans `tui-requirements.txt` (Textual `8.2.8` au moment de l’introduction). L’environnement de référence occupait environ 47 Mo. Contrairement aux binaires Ollama/cloudflared, ces paquets PyPI ne sont pas vérifiés par une somme SHA-256 dans ce projet : c’est une limite explicite du choix Textual.
+
+Si l’installation de la TUI échoue, le setup continue et toutes les commandes classiques restent disponibles. `ola doctor` signale alors la TUI comme un avertissement, pas comme une panne du moteur. `sudo ola tui install` permet de réessayer sans refaire tout le setup.
+
+### Écran principal
+
+L’écran affiche :
+
+- l’état de l’API Ollama et, quand Supervisor les expose, les états `ollama`, `cloudflared-ollama` et `ollama-watchdog` ;
+- l’URL publique enregistrée, le mode Pack Speed et le keep-alive ;
+- la RAM et le swap disponibles ;
+- un tableau actualisé des modèles : état disque/RAM, taille, modèle par défaut, expiration keep-alive et contexte chargé ;
+- un détail du modèle sélectionné : paramètres, famille, quantification et capacités déclarées par `/api/show`.
+
+Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle.
+
+### Touches
+
+| Touche | Action |
+|---|---|
+| `↑` / `↓` | Choisir un modèle |
+| `u` | Utiliser le modèle sélectionné (confirmation) |
+| `d` | Supprimer définitivement le modèle sélectionné du disque (confirmation renforcée si c’est le défaut) |
+| `l` | Libérer le modèle sélectionné de la RAM |
+| `a` | Ajouter et utiliser un modèle (saisie du nom) |
+| `w` | Préchauffer le modèle (`ola fluid warm`) |
+| `p` | Afficher son preset fluidité |
+| `b` | Benchmark classique du modèle (confirmation) |
+| `B` | Benchmark streaming du modèle (confirmation) |
+| `s` | Afficher `ola speed` |
+| `f` | Afficher `ola fluid` |
+| `g` | Ouvrir les journaux Supervisor (touches `1` à `5`, `r`, `q`) |
+| `t` | Changer de thème Textual |
+| `r` | Rafraîchir maintenant |
+| `q` | Quitter ou fermer l’écran courant |
+
+Les actions longues s’exécutent en arrière-plan de l’interface et leur sortie complète s’affiche dans un écran de résultat. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. En utilisateur non-root, l’affichage reste utile, tandis que `ola` refusera les actions protégées et affichera son erreur.
+
+### Limites de la TUI
+
+- Elle nécessite un vrai terminal interactif ; dans un pipe ou un script, `ola tui` refuse de démarrer et renvoie vers les commandes texte.
+- Elle ne remplace ni le menu `ola`, ni les commandes scriptables.
+- Les actions passent par le CLI : un bench lancé depuis la TUI a donc les mêmes effets RAM que `ola bench` en ligne de commande.
+- Le rendu exact dépend du terminal (taille, couleurs, police). Un terminal d’au moins environ 100 colonnes est recommandé.
 
 ## Utiliser l’API Ollama
 
@@ -1239,6 +1321,16 @@ ola watchdog
 
 `start` redémarre brièvement Ollama et cloudflared. La copie stable de `ola` est remplacée par la nouvelle version.
 
+Pour la première installation de l’interface TUI après une mise à jour, crée ensuite son environnement Python isolé, puis lance-la :
+
+```bash
+ola tui install
+ola tui status
+ola tui
+```
+
+Les mises à jour suivantes remplacent automatiquement le fichier `ola_tui.py` en même temps que `ola`. L’environnement `tui-venv` reste en place tant que les dépendances épinglées ne changent pas ; en cas de doute, `ola tui install` le répare.
+
 Si une mise à jour modifie les paramètres de génération des configurations — par exemple `OLLAMA_CONTEXT_LENGTH`, `CF_TUNNEL_PROTOCOL`, les paramètres Supervisor d’Ollama ou la configuration du tunnel — relance plutôt un setup pour régénérer proprement les fichiers concernés :
 
 ```bash
@@ -1354,6 +1446,25 @@ Vérifie aussi la RAM et les modèles chargés :
 ola doctor
 ola ps
 ```
+
+### `ola tui` ne démarre pas ou signale Textual absent
+
+Vérifie l’état, puis répare l’environnement isolé :
+
+```bash
+ola tui status
+sudo ola tui install
+ola tui status
+```
+
+Causes fréquentes :
+
+- lancement dans un pipe, un script ou un terminal non interactif : la TUI refuse volontairement et les commandes texte restent la bonne interface ;
+- première mise à jour effectuée seulement avec `start` : le fichier Python a été extrait, mais le venv doit être créé une fois par `ola tui install` (ou par un setup complet) ;
+- Python 3.9+, `python3-venv` ou l’accès réseau à PyPI manquant pendant l’installation ;
+- paquets Python épinglés non installés ou venv incomplet : `ola tui install` recrée proprement un venv sans pip et réinstalle les versions de `tui-requirements.txt`.
+
+Si la réparation échoue, le moteur n’est pas en panne : `ola status`, `ola doctor`, `ola models` et le menu texte continuent de fonctionner.
 
 ### RAM saturée ou réponses très lentes
 
@@ -1675,23 +1786,101 @@ La fluidité se mesure, elle ne se devine pas :
 
 Détail complet : [Fluidité : premier token et streaming](#fluidité--premier-token-et-streaming).
 
+### La TUI remplace-t-elle les commandes `ola` ?
+
+Non. `ola tui` est un habitacle plein écran au-dessus du même moteur. Elle lit l’API locale et appelle les commandes `ola` existantes pour les actions, donc les protections de `ola use`, `ola delete`, des benchs et des packs restent centralisées dans le moteur Bash. Le menu texte, `ola models` et toutes les commandes scriptables restent disponibles, y compris si Textual n’est pas installée.
+
 ### `ola speed apply` peut-il casser Ollama ?
 
 La commande est conçue pour ne pas te laisser avec un réglage cassé : sauvegarde de l’ancienne configuration, redémarrage d’Ollama seul, vérification de l’API puis retest de chaque modèle présent, et restauration automatique de l’ancienne configuration si Ollama ne revient pas ou si un modèle qui fonctionnait ne répond plus. Et `ola speed reset` permet de revenir au mode `balanced` à tout moment.
 
 ---
 
-# Fichiers du dépôt
+# Fichiers et développement du projet
 
-| Fichier | Description |
+Le gestionnaire Ollama est maintenant développé comme un petit projet modulaire, tout en conservant un **artefact unique** pour l’installation sur le sandbox.
+
+| Chemin | Rôle |
 |---|---|
-| `Install.sh` | Installeur interactif SSH + Cloudflare Tunnel / fxTunnel et pack d’outils VPS essentiels. |
+| `Install.sh` | Installeur interactif SSH + Cloudflare Tunnel / fxTunnel et pack d’outils VPS essentiels. N’a pas été restructuré dans cette étape. |
+| `src/00-core.sh` | Constantes, utilitaires, Supervisor, binaires et commande `ola`. |
+| `src/10-models.sh` | Modèles présents/chargés, déchargement, gestion interactive, suppression et changement de modèle. |
+| `src/20-server-config.sh` | Configuration Supervisor Ollama, Pack Speed et keep-alive persistants. |
+| `src/30-install-tunnels.sh` | Installation Ollama/cloudflared, tunnels Quick/Named et statut. |
+| `src/40-runtime-watchdog.sh` | Modèle enregistré, watchdog et attentes de disponibilité. |
+| `src/50-bench.sh` | Bench classique de génération, modèles présents et synthèse globale. |
+| `src/55-fluid.sh` | Bench streaming/TTFT, état fluidité, préchauffage, preset et keep-alive serveur. |
+| `src/58-speed.sh` | État, application, vérification et retour arrière du Pack Speed. |
+| `src/60-diagnostics-setup.sh` | Doctor, test, récupération et setup complet. |
+| `src/70-tui.sh` | Intégration Bash de la TUI : extraction, environnement Python, statut, réparation et lancement. |
+| `src/90-main.sh` | Dispatch des commandes et menu texte historique. |
+| `tui/ola_tui.py` | Application Textual `ola tui`. |
+| `tui/requirements.txt` | Versions Python/Textual épinglées, embarquées dans l’artefact au build. |
+| `build.sh` | Assemble `src/*.sh`, embarque `tui/ola_tui.py` et `tui/requirements.txt` dans `src/70-tui.sh`, vérifie la syntaxe et régénère l’artefact unique. |
+| `ollama-cloudflare-setup.sh` | **Artefact généré par `build.sh`** : fichier unique téléchargé/installé sur le sandbox ; devient la commande `ola`. |
+| `tests/run-tests.sh` | Suite isolée Bash + Textual Pilot ; utilise uniquement des stubs et des namespaces temporaires. |
+| `tests/run-tui-tests.py` | Tests headless de navigation et d’actions TUI simulées. |
+| `tests/stub/` et `tests/fixtures/` | Faux `curl`, Ollama, Supervisor, Python/pip et faux fichiers système utilisés par les tests. |
+| `README.md` | Documentation d’installation, d’utilisation et de développement. |
+
+### Construire
+
+Après toute modification dans `src/` ou `tui/`, régénère l’artefact distribué :
+
+```bash
+./build.sh
+bash -n ollama-cloudflare-setup.sh
+git diff --check
+```
+
+Ne modifie pas directement `ollama-cloudflare-setup.sh` pour un changement durable : modifie le module source correspondant, puis relance `./build.sh`. Les commits doivent contenir à la fois les sources et l’artefact régénéré, afin que le téléchargement direct du fichier unique reste toujours à jour.
+
+### Tester
+
+La suite complète utilise des commandes factices et un namespace de montage : elle ne contacte ni un vrai Ollama, ni Cloudflare, ni PyPI pour les scénarios Bash.
+
+```bash
+tests/run-tests.sh
+```
+
+Options de validation renforcée :
+
+```bash
+SHELLCHECK=/path/to/shellcheck tests/run-tests.sh
+python3 -m venv /tmp/ola-tui-dev
+/tmp/ola-tui-dev/bin/pip install textual==8.2.8
+OLA_TUI_TEST_PYTHON=/tmp/ola-tui-dev/bin/python tests/run-tests.sh
+```
+
+Sans Python/Textual disponible, les tests Bash s’exécutent et les tests Pilot sont explicitement signalés `SKIP`, pas comptés comme réussis. Avec `KEEP_TEST_WORK=1`, le dossier temporaire des tests est conservé pour inspection.
+
+Pour la partie Ollama, les commandes à retenir sont :
+
+```bash
+ola status
+ola doctor
+ola test
+ola bench
+ola speed
+ola fluid
+ola tui
+ola models
+```
+tils VPS essentiels. |
 | `ollama-cloudflare-setup.sh` | Installeur et gestionnaire Ollama + Cloudflare Tunnel ; devient la commande `ola` après installation. |
 | `README.md` | Documentation d’installation, de configuration et d’utilisation. |
 
 Pour la partie Ollama, les commandes à retenir sont :
 
 ```bash
+ola status
+ola doctor
+ola test
+ola bench
+ola speed
+ola models
+```
+h
 ola status
 ola doctor
 ola test

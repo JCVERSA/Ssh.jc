@@ -1,0 +1,10 @@
+tunnel: 00000000-0000-4000-8000-000000000000
+credentials-file: /etc/cloudflared/00000000-0000-4000-8000-000000000000.json
+no-autoupdate: true
+
+ingress:
+  - hostname: ollama.example.com
+    service: http://127.0.0.1:11434
+    originRequest:
+      httpHostHeader: "localhost:11434"
+  - service: http_status:404

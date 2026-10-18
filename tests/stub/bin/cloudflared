@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+echo "cloudflared $*" >> "${TEST_STATE}/calls.log"
+UUID="123e4567-e89b-12d3-a456-426614174000"
+if [[ "${1:-}" == "--version" ]]; then echo 'cloudflared version stub'; exit 0; fi
+if [[ "${1:-} ${2:-}" == "tunnel login" ]]; then mkdir -p ${HOME}/.cloudflared; printf 'CERT\n' > ${HOME}/.cloudflared/cert.pem; exit 0; fi
+if [[ "${1:-} ${2:-}" == "tunnel list" ]]; then
+  if [[ -f "${TEST_STATE}/tunnel.created" ]]; then printf '[{"name":"ollama-vps","id":"%s"}]\n' "$UUID"; else printf '[]\n'; fi
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "tunnel create" ]]; then mkdir -p ${HOME}/.cloudflared; printf '{"AccountTag":"stub"}\n' > "${HOME}/.cloudflared/${UUID}.json"; touch "${TEST_STATE}/tunnel.created"; exit 0; fi
+if [[ "${1:-} ${2:-}" == "tunnel route" ]]; then exit 0; fi
+if [[ "$*" == *"ingress validate"* ]]; then exit 0; fi
+exit 0

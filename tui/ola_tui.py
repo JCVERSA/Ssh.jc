@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""Ola terminal interface (Textual).
+
+The Bash ``ola`` program remains the engine and the safety boundary. This
+application only reads the local Ollama HTTP API and delegates actions to the
+installed ``ola`` CLI. It deliberately does not reimplement model deletion,
+model switching, Supervisor management or Pack Speed/Fluidité logic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import subprocess
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static, TextArea
+
+API_URL = os.environ.get("OLA_TUI_API_URL", "http://127.0.0.1:11434").rstrip("/")
+CLI = os.environ.get("OLA_TUI_CLI") or shutil.which("ola") or "/usr/local/bin/ola"
+URL_FILE = Path("/etc/ollama-cloudflare-url")
+MODEL_FILE = Path("/etc/ollama-cloudflare-model")
+SPEED_FILE = Path("/etc/ollama-cloudflare-speed")
+KEEPALIVE_FILE = Path("/etc/ollama-cloudflare-keepalive")
+DEFAULT_MODEL = "qwen3:1.7b"
+LOG_FILES = [
+    ("Ollama", Path("/var/log/supervisor/ollama.log")),
+    ("Ollama erreurs", Path("/var/log/supervisor/ollama-error.log")),
+    ("cloudflared", Path("/var/log/supervisor/cloudflared-ollama.log")),
+    ("cloudflared erreurs", Path("/var/log/supervisor/cloudflared-ollama-error.log")),
+    ("Watchdog", Path("/var/log/supervisor/ollama-watchdog.log")),
+]
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+THEME_CYCLE = [
+    "textual-dark",
+    "catppuccin-mocha",
+    "dracula",
+    "nord",
+    "tokyo-night",
+    "gruvbox",
+    "textual-light",
+]
+
+
+def normalize_model(name: str) -> str:
+    name = name.strip()
+    last = name.rsplit("/", 1)[-1]
+    return name if ":" in last else f"{name}:latest"
+
+
+def valid_model(name: str) -> bool:
+    return bool(MODEL_RE.fullmatch(name.strip()))
+
+
+def read_first_line(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return ""
+
+
+def format_bytes(value: Any) -> str:
+    try:
+        size = float(value or 0)
+    except (TypeError, ValueError):
+        return "inconnue"
+    if size <= 0:
+        return "inconnue"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return "inconnue"
+
+
+def format_expiry(value: str) -> str:
+    if not value:
+        return "—"
+    return value.replace("T", " ")[:19]
+
+
+def http_json(path: str, payload: dict[str, Any] | None = None, timeout: float = 6) -> Any:
+    data = None
+    headers = {"Content-Type": "application/json"}
+    method = "GET"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        method = "POST"
+    request = urllib.request.Request(
+        f"{API_URL}{path}", data=data, headers=headers, method=method
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def http_status(url: str, timeout: float = 2) -> int | None:
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except (OSError, ValueError):
+        return None
+
+
+def parse_meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if ":" not in line:
+                continue
+            key, raw = line.split(":", 1)
+            parts = raw.strip().split()
+            if parts and parts[0].isdigit():
+                values[key] = int(parts[0]) * 1024
+    except OSError:
+        pass
+    return values
+
+
+def supervisor_status() -> dict[str, str]:
+    executable = shutil.which("supervisorctl")
+    if not executable:
+        return {}
+    try:
+        result = subprocess.run(
+            [executable, "status"],
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    statuses: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            statuses[parts[0]] = parts[1]
+    return statuses
+
+
+@dataclass
+class ModelInfo:
+    name: str
+    size: int = 0
+    digest: str = ""
+    family: str = ""
+    parameter_size: str = ""
+    quantization: str = ""
+    loaded: bool = False
+    loaded_size: int = 0
+    expires_at: str = ""
+    context_length: int | None = None
+
+
+@dataclass
+class Snapshot:
+    api_ok: bool = False
+    version: str = "inconnue"
+    error: str = ""
+    models: list[ModelInfo] = field(default_factory=list)
+    default_model: str = DEFAULT_MODEL
+    public_url: str = ""
+    speed_mode: str = "balanced"
+    keepalive: str = "5m"
+    services: dict[str, str] = field(default_factory=dict)
+    cloudflared_ready: int | None = None
+    mem_total: int = 0
+    mem_available: int = 0
+    swap_total: int = 0
+    swap_free: int = 0
+
+
+def fetch_snapshot() -> Snapshot:
+    snapshot = Snapshot()
+    snapshot.default_model = read_first_line(MODEL_FILE) or DEFAULT_MODEL
+    snapshot.public_url = read_first_line(URL_FILE)
+    snapshot.speed_mode = read_first_line(SPEED_FILE) or "balanced"
+    if snapshot.speed_mode not in {"balanced", "speed"}:
+        snapshot.speed_mode = "balanced"
+    snapshot.keepalive = read_first_line(KEEPALIVE_FILE) or "5m"
+
+    mem = parse_meminfo()
+    snapshot.mem_total = mem.get("MemTotal", 0)
+    snapshot.mem_available = mem.get("MemAvailable", 0)
+    snapshot.swap_total = mem.get("SwapTotal", 0)
+    snapshot.swap_free = mem.get("SwapFree", 0)
+    snapshot.services = supervisor_status()
+    snapshot.cloudflared_ready = http_status("http://127.0.0.1:20241/ready")
+
+    models: dict[str, ModelInfo] = {}
+    try:
+        version_data = http_json("/api/version", timeout=4)
+        snapshot.version = str(version_data.get("version") or "inconnue")
+        snapshot.api_ok = True
+        tags = http_json("/api/tags", timeout=6)
+        for item in tags.get("models") or []:
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            details = item.get("details") or {}
+            models[name] = ModelInfo(
+                name=name,
+                size=int(item.get("size") or 0),
+                digest=str(item.get("digest") or ""),
+                family=str(details.get("family") or ""),
+                parameter_size=str(details.get("parameter_size") or ""),
+                quantization=str(details.get("quantization_level") or ""),
+            )
+        try:
+            running = http_json("/api/ps", timeout=6)
+            for item in running.get("models") or []:
+                name = str(item.get("name") or "")
+                if not name:
+                    continue
+                model = models.setdefault(name, ModelInfo(name=name))
+                model.loaded = True
+                model.loaded_size = int(item.get("size") or 0)
+                model.expires_at = str(item.get("expires_at") or "")
+                context = item.get("context_length")
+                model.context_length = int(context) if context else None
+        except Exception:
+            # The model table remains useful with /api/tags alone.
+            pass
+    except Exception as exc:  # API down / malformed response
+        snapshot.error = str(exc) or exc.__class__.__name__
+
+    default_norm = normalize_model(snapshot.default_model)
+    snapshot.models = sorted(
+        models.values(),
+        key=lambda model: (
+            normalize_model(model.name) == default_norm,
+            model.name.lower(),
+        ),
+    )
+    return snapshot
+
+
+def fetch_show(model: str) -> dict[str, Any]:
+    if not valid_model(model):
+        return {}
+    try:
+        data = http_json("/api/show", {"model": model}, timeout=8)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def run_cli(args: list[str], timeout: int = 900) -> tuple[int, str]:
+    if not CLI:
+        return 127, "Commande ola introuvable."
+    try:
+        result = subprocess.run(
+            [CLI, *args],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 127, f"Commande ola introuvable : {CLI}"
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="ignore")
+        return 124, f"{output}\n\nCommande interrompue après {timeout} secondes."
+    except OSError as exc:
+        return 1, f"Impossible de lancer ola : {exc}"
+    output = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+    return result.returncode, output or "(aucune sortie)"
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Annuler"),
+        Binding("q", "cancel", "Annuler"),
+    ]
+
+    def __init__(self, title: str, message: str, confirm_label: str = "Confirmer"):
+        super().__init__()
+        self.dialog_title = title
+        self.dialog_message = message
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Static(self.dialog_title, classes="dialog-title")
+            yield Static(self.dialog_message, classes="dialog-message")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button(self.confirm_label, id="confirm", variant="error")
+                yield Button("Annuler", id="cancel", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class AddModelScreen(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Annuler")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Static("Ajouter et utiliser un modèle", classes="dialog-title")
+            yield Static(
+                "Le modèle sera téléchargé si nécessaire, puis chargé. Les autres modèles seront déchargés de la RAM par ola use.",
+                classes="dialog-message",
+            )
+            yield Input(placeholder="Exemple : qwen3:0.6b", id="model-name")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Télécharger et utiliser", id="add", variant="success")
+                yield Button("Annuler", id="cancel", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#model-name", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def submit(self) -> None:
+        value = self.query_one("#model-name", Input).value.strip()
+        if not valid_model(value):
+            self.app.notify("Nom de modèle invalide.", severity="error")
+            return
+        self.dismiss(value)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "add":
+            self.submit()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
+        self.submit()
+
+
+class OutputScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "close", "Fermer"),
+        Binding("q", "close", "Fermer"),
+    ]
+
+    def __init__(self, title: str, content: str):
+        super().__init__()
+        self.output_title = title
+        self.output_content = content
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical():
+            yield Static(self.output_title, id="output-title")
+            yield RichLog(id="output-log", highlight=False, markup=False, wrap=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        log = self.query_one("#output-log", RichLog)
+        log.write(self.output_content)
+        log.scroll_home(animate=False)
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
+class LogsScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "close", "Fermer"),
+        Binding("q", "close", "Fermer"),
+        Binding("r", "refresh_log", "Rafraîchir"),
+        Binding("1", "select_log(0)", "Ollama"),
+        Binding("2", "select_log(1)", "Erreurs"),
+        Binding("3", "select_log(2)", "Tunnel"),
+        Binding("4", "select_log(3)", "Tunnel err."),
+        Binding("5", "select_log(4)", "Watchdog"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.current_index = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Vertical():
+            yield Static("", id="log-title")
+            yield TextArea("", id="log-content", read_only=True, show_line_numbers=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.show_current()
+
+    def show_current(self) -> None:
+        name, path = LOG_FILES[self.current_index]
+        self.query_one("#log-title", Static).update(
+            f"Journal {name} — {path}  (touches 1-5, r rafraîchir, q fermer)"
+        )
+        area = self.query_one("#log-content", TextArea)
+        try:
+            data = path.read_bytes()[-150_000:]
+            content = data.decode("utf-8", errors="replace")
+            if not content:
+                content = "(fichier vide)"
+        except OSError as exc:
+            content = f"Journal illisible : {exc}\nEssaie de lancer la TUI avec les droits root."
+        area.load_text(content)
+        area.scroll_end(animate=False)
+
+    def action_refresh_log(self) -> None:
+        self.show_current()
+
+    def action_select_log(self, index: int) -> None:
+        if 0 <= index < len(LOG_FILES):
+            self.current_index = index
+            self.show_current()
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
+class OlaTui(App):
+    TITLE = "Ola"
+    SUB_TITLE = "Ollama + Cloudflare"
+    CSS = """
+    Screen { background: $surface; }
+    #banner {
+        height: 3;
+        padding: 0 1;
+        background: $primary;
+        color: $text;
+        text-style: bold;
+        content-align: left middle;
+    }
+    #top { height: 10; }
+    #summary, #details {
+        height: 10;
+        padding: 0 1;
+        border: solid $primary;
+        overflow-y: auto;
+    }
+    #summary { width: 58%; }
+    #details { width: 42%; border: solid $secondary; }
+    #models { height: 1fr; border: solid $primary; }
+    #status {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
+        color: $text;
+    }
+    #output-title {
+        height: 3;
+        padding: 0 1;
+        background: $primary;
+        color: $text;
+        text-style: bold;
+        content-align: left middle;
+    }
+    #output-log { height: 1fr; border: solid $primary; }
+    #log-title {
+        height: 2;
+        padding: 0 1;
+        background: $primary;
+        color: $text;
+        text-style: bold;
+        content-align: left middle;
+    }
+    #log-content { height: 1fr; border: solid $primary; }
+    .dialog {
+        width: 72;
+        max-width: 92%;
+        height: auto;
+        max-height: 88%;
+        margin: 4 6;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+    .dialog-title { text-style: bold; padding-bottom: 1; }
+    .dialog-message { padding-bottom: 1; }
+    .dialog-buttons { height: 3; align: right middle; }
+    .dialog-buttons Button { margin-left: 1; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quitter"),
+        Binding("r", "refresh", "Rafraîchir"),
+        Binding("u", "use_model", "Utiliser"),
+        Binding("d", "delete_model", "Supprimer"),
+        Binding("l", "unload_model", "Libérer RAM"),
+        Binding("a", "add_model", "Ajouter"),
+        Binding("w", "warm_model", "Préchauffer"),
+        Binding("p", "preset_model", "Preset"),
+        Binding("b", "bench_model", "Bench"),
+        Binding("B", "stream_bench_model", "Bench streaming"),
+        Binding("s", "speed_status", "Speed"),
+        Binding("f", "fluid_status", "Fluidité"),
+        Binding("g", "logs", "Logs"),
+        Binding("t", "cycle_theme", "Thème"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.snapshot = Snapshot()
+        self.current_model = ""
+        self.show_cache: dict[str, dict[str, Any]] = {}
+        self.refreshing = False
+        self.action_running = False
+        self.theme_index = 0
+        # Keep direct references to the main-screen widgets. App.query_one()
+        # searches the currently displayed screen, so background refreshes
+        # would otherwise fail while an output, log or dialog screen is open.
+        self.summary_widget: Static | None = None
+        self.details_widget: Static | None = None
+        self.models_table: DataTable | None = None
+        self.status_widget: Static | None = None
+        self.table_signature: tuple[object, ...] = ()
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Static("OLA  ·  Ollama + Cloudflare Tunnel  ·  interface Textual", id="banner")
+        with Horizontal(id="top"):
+            yield Static("Chargement de l'état…", id="summary")
+            yield Static("Sélectionne un modèle dans le tableau.", id="details")
+        yield DataTable(id="models", zebra_stripes=True, cursor_type="row")
+        yield Static("Démarrage…", id="status")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        self.summary_widget = self.query_one("#summary", Static)
+        self.details_widget = self.query_one("#details", Static)
+        self.models_table = self.query_one("#models", DataTable)
+        self.status_widget = self.query_one("#status", Static)
+        table = self.models_table
+        table.add_columns("État", "Modèle", "Taille", "RAM", "Défaut", "Expiration", "Contexte")
+        self.set_interval(3.0, self._refresh_timer)
+        await self.refresh_snapshot(force=True)
+
+    def _refresh_timer(self) -> None:
+        if not self.refreshing and not self.action_running:
+            self.run_worker(self.refresh_snapshot(), group="refresh", exclusive=True)
+
+    async def refresh_snapshot(self, force: bool = False) -> None:
+        if self.refreshing:
+            return
+        self.refreshing = True
+        try:
+            snapshot = await asyncio.to_thread(fetch_snapshot)
+            self.snapshot = snapshot
+            self._render_snapshot()
+            selected = self.selected_model_name()
+            if selected and (force or selected not in self.show_cache):
+                show = await asyncio.to_thread(fetch_show, selected)
+                if show:
+                    self.show_cache[selected] = show
+                self._render_details()
+        finally:
+            self.refreshing = False
+
+    def _render_snapshot(self) -> None:
+        if self.summary_widget is None or self.models_table is None or self.status_widget is None:
+            return
+        snap = self.snapshot
+        summary = Text()
+        api_style = "bold green" if snap.api_ok else "bold red"
+        summary.append("Ollama : ", style="bold")
+        summary.append("● API OK" if snap.api_ok else "● API injoignable", style=api_style)
+        summary.append(f"  ·  version {snap.version}\n")
+        for program in ("ollama", "cloudflared-ollama", "ollama-watchdog"):
+            state = snap.services.get(program, "état inconnu")
+            style = "green" if state == "RUNNING" else "yellow" if state == "état inconnu" else "red"
+            summary.append(f"{program} : ", style="bold")
+            summary.append(f"{state}\n", style=style)
+        summary.append("Tunnel local : ", style="bold")
+        summary.append(
+            "ready\n" if snap.cloudflared_ready == 200 else f"non confirmé ({snap.cloudflared_ready or 'aucune réponse'})\n"
+        )
+        summary.append("URL publique : ", style="bold")
+        summary.append(f"{snap.public_url or 'non enregistrée'}\n")
+        summary.append("Pack Speed : ", style="bold")
+        summary.append(f"{snap.speed_mode}")
+        summary.append("  ·  Keep-alive : ", style="bold")
+        summary.append(f"{snap.keepalive}\n")
+        if snap.mem_total:
+            free_pct = int(snap.mem_available * 100 / snap.mem_total)
+            filled = min(20, max(0, int((100 - free_pct) * 20 / 100)))
+            bar = "█" * filled + "░" * (20 - filled)
+            summary.append("RAM : ", style="bold")
+            summary.append(
+                f"{format_bytes(snap.mem_available)} libres / {format_bytes(snap.mem_total)} [{bar}] {free_pct}%\n"
+            )
+        if snap.swap_total:
+            summary.append("Swap : ", style="bold")
+            summary.append(f"{format_bytes(snap.swap_free)} libres / {format_bytes(snap.swap_total)}\n")
+        summary.append("Accès : ", style="bold")
+        summary.append(
+            "root (actions actives)" if hasattr(os, "geteuid") and os.geteuid() == 0 else "non-root (ola refusera les actions protégées)"
+        )
+        if snap.error:
+            summary.append(f"\nErreur API : {snap.error}", style="red")
+        self.summary_widget.update(summary)
+
+        table = self.models_table
+        previous = self.current_model
+        default_norm = normalize_model(snap.default_model)
+        table_signature = tuple(
+            (
+                model.name,
+                model.size,
+                model.loaded,
+                model.loaded_size,
+                model.expires_at,
+                model.context_length,
+                normalize_model(model.name) == default_norm,
+            )
+            for model in snap.models
+        )
+        # Avoid rebuilding the table every three seconds when nothing changed:
+        # it would reset the cursor/scroll while the user is navigating.
+        if table_signature != self.table_signature:
+            self.table_signature = table_signature
+            table.clear()
+            for model in snap.models:
+                is_default = normalize_model(model.name) == default_norm
+                table.add_row(
+                    "● RAM" if model.loaded else "○ disque",
+                    model.name,
+                    format_bytes(model.size),
+                    format_bytes(model.loaded_size) if model.loaded else "—",
+                    "défaut" if is_default else "—",
+                    format_expiry(model.expires_at) if model.loaded else "—",
+                    str(model.context_length or "—"),
+                    key=model.name,
+                )
+            if not snap.models:
+                table.add_row("—", "Aucun modèle téléchargé", "—", "—", "—", "—", "—", key="__empty__")
+                self.current_model = ""
+            else:
+                names = [model.name for model in snap.models]
+                target = previous if previous in names else names[-1]
+                self.current_model = target
+                try:
+                    table.move_cursor(row=names.index(target), column=0, animate=False)
+                except Exception:
+                    pass
+        status = (
+            f"{len(snap.models)} modèle(s) · défaut : {snap.default_model} · "
+            f"CLI : {CLI} · r rafraîchir · t thème"
+        )
+        self.status_widget.update(status)
+        self._render_details()
+
+    def selected_model_name(self) -> str:
+        if self.models_table is None:
+            return self.current_model
+        table = self.models_table
+        try:
+            cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+            value = str(cell_key.row_key.value or "")
+            if value and value != "__empty__":
+                self.current_model = value
+        except Exception:
+            pass
+        return self.current_model
+
+    def _render_details(self) -> None:
+        if self.details_widget is None:
+            return
+        name = self.selected_model_name()
+        details_widget = self.details_widget
+        if not name:
+            details_widget.update("Aucun modèle sélectionné.")
+            return
+        model = next((item for item in self.snapshot.models if item.name == name), None)
+        show = self.show_cache.get(name, {})
+        show_details = show.get("details") or {}
+        capabilities = show.get("capabilities") or []
+        text = Text()
+        text.append("Modèle sélectionné\n", style="bold underline")
+        text.append(f"{name}\n\n", style="bold")
+        if model:
+            text.append("État : ", style="bold")
+            text.append("chargé en RAM\n" if model.loaded else "sur disque seulement\n")
+            text.append("Taille disque : ", style="bold")
+            text.append(f"{format_bytes(model.size)}\n")
+            if model.loaded:
+                text.append("Taille RAM déclarée : ", style="bold")
+                text.append(f"{format_bytes(model.loaded_size)}\n")
+                text.append("Expiration keep-alive : ", style="bold")
+                text.append(f"{format_expiry(model.expires_at)}\n")
+        parameter_size = str(show_details.get("parameter_size") or (model.parameter_size if model else ""))
+        family = str(show_details.get("family") or (model.family if model else ""))
+        quantization = str(show_details.get("quantization_level") or (model.quantization if model else ""))
+        if parameter_size:
+            text.append("Paramètres : ", style="bold")
+            text.append(f"{parameter_size}\n")
+        if family:
+            text.append("Famille : ", style="bold")
+            text.append(f"{family}\n")
+        if quantization:
+            text.append("Quantification : ", style="bold")
+            text.append(f"{quantization}\n")
+        if capabilities:
+            text.append("Capacités : ", style="bold")
+            text.append(", ".join(str(value) for value in capabilities) + "\n")
+        default_norm = normalize_model(self.snapshot.default_model)
+        text.append("Défaut ola : ", style="bold")
+        text.append("oui\n" if normalize_model(name) == default_norm else "non\n")
+        text.append("\nActions : u utiliser · d supprimer · l libérer RAM · w préchauffer · p preset · b bench")
+        details_widget.update(text)
+
+    async def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
+        name = self.selected_model_name()
+        if name and name not in self.show_cache:
+            show = await asyncio.to_thread(fetch_show, name)
+            if show:
+                self.show_cache[name] = show
+        self._render_details()
+
+    def _require_model(self) -> str:
+        name = self.selected_model_name()
+        if not name or not valid_model(name):
+            self.notify("Aucun modèle sélectionné.", severity="warning")
+            return ""
+        return name
+
+    async def execute_cli(self, title: str, args: list[str], timeout: int = 900) -> None:
+        if self.action_running:
+            self.notify("Une action est déjà en cours.", severity="warning")
+            return
+        self.action_running = True
+        if self.status_widget is not None:
+            self.status_widget.update(f"Exécution : ola {' '.join(args)} …")
+        try:
+            code, output = await asyncio.to_thread(run_cli, args, timeout)
+            heading = f"{title}\nCommande : ola {' '.join(args)}\nCode de sortie : {code}\n\n"
+            self.push_screen(OutputScreen(title, heading + output))
+            if code == 0:
+                self.notify("Action terminée.")
+            else:
+                self.notify(f"La commande a échoué (code {code}).", severity="error")
+        finally:
+            self.action_running = False
+            await self.refresh_snapshot(force=True)
+
+    def action_refresh(self) -> None:
+        if not self.refreshing and not self.action_running:
+            self.run_worker(self.refresh_snapshot(force=True), group="refresh", exclusive=True)
+
+    def action_use_model(self) -> None:
+        model = self._require_model()
+        if not model:
+            return
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                self.run_worker(
+                    self.execute_cli("Utiliser un modèle", ["use", model]),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmScreen(
+                "Utiliser ce modèle ?",
+                f"ola use {model}\n\nLes autres modèles seront déchargés de la RAM, puis ce modèle sera chargé et deviendra le défaut de ola.",
+                "Utiliser",
+            ),
+            done,
+        )
+
+    def action_delete_model(self) -> None:
+        model = self._require_model()
+        if not model:
+            return
+        is_default = normalize_model(model) == normalize_model(self.snapshot.default_model)
+        args = ["delete", model, "--force"] if is_default else ["delete", model]
+        consequence = (
+            "C'est le modèle par défaut actuel : après suppression, ola choisira un autre modèle restant ou retirera le défaut enregistré."
+            if is_default
+            else "Le modèle sera déchargé de la RAM si nécessaire, puis supprimé du disque."
+        )
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                self.run_worker(
+                    self.execute_cli("Supprimer un modèle", args),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmScreen(
+                "Suppression définitive",
+                f"Supprimer définitivement {model} du disque ?\n\n{consequence}\n\nCette action est irréversible sans nouveau téléchargement.",
+                "Supprimer",
+            ),
+            done,
+        )
+
+    def action_unload_model(self) -> None:
+        model = self._require_model()
+        if model:
+            self.run_worker(
+                self.execute_cli("Libérer la RAM", ["unload", model]),
+                group="actions",
+                exclusive=True,
+            )
+
+    def action_add_model(self) -> None:
+        def done(name: str | None) -> None:
+            if name:
+                self.run_worker(
+                    self.execute_cli("Ajouter et utiliser un modèle", ["use", name]),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(AddModelScreen(), done)
+
+    def action_warm_model(self) -> None:
+        model = self._require_model()
+        if model:
+            self.run_worker(
+                self.execute_cli("Préchauffer un modèle", ["fluid", "warm", model]),
+                group="actions",
+                exclusive=True,
+            )
+
+    def action_preset_model(self) -> None:
+        model = self._require_model()
+        if model:
+            self.run_worker(
+                self.execute_cli("Preset fluidité", ["fluid", "preset", model], timeout=120),
+                group="actions",
+                exclusive=True,
+            )
+
+    def action_bench_model(self) -> None:
+        model = self._require_model()
+        if not model:
+            return
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                self.run_worker(
+                    self.execute_cli("Benchmark classique", ["bench", model], timeout=1200),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmScreen(
+                "Lancer le benchmark ?",
+                f"ola bench {model}\n\nLe test peut prendre du temps et charger/décharger des modèles en RAM. Il ne modifie ni la configuration ni les fichiers des modèles.",
+                "Benchmarker",
+            ),
+            done,
+        )
+
+    def action_stream_bench_model(self) -> None:
+        model = self._require_model()
+        if not model:
+            return
+
+        def done(confirmed: bool) -> None:
+            if confirmed:
+                self.run_worker(
+                    self.execute_cli(
+                        "Benchmark streaming / fluidité",
+                        ["bench", "--stream", model],
+                        timeout=1200,
+                    ),
+                    group="actions",
+                    exclusive=True,
+                )
+
+        self.push_screen(
+            ConfirmScreen(
+                "Lancer le benchmark streaming ?",
+                f"ola bench --stream {model}\n\nLe test mesure le premier token visible et la régularité du flux. Il peut charger/décharger des modèles en RAM, sans modifier la configuration.",
+                "Benchmarker",
+            ),
+            done,
+        )
+
+    def action_speed_status(self) -> None:
+        self.run_worker(
+            self.execute_cli("Pack Speed", ["speed"], timeout=120),
+            group="actions",
+            exclusive=True,
+        )
+
+    def action_fluid_status(self) -> None:
+        self.run_worker(
+            self.execute_cli("Fluidité", ["fluid"], timeout=120),
+            group="actions",
+            exclusive=True,
+        )
+
+    def action_logs(self) -> None:
+        self.push_screen(LogsScreen())
+
+    def action_cycle_theme(self) -> None:
+        available = set(getattr(self, "available_themes", {}) or {})
+        candidates = [name for name in THEME_CYCLE if not available or name in available]
+        if not candidates:
+            self.notify("Aucun thème alternatif disponible.", severity="warning")
+            return
+        self.theme_index = (self.theme_index + 1) % len(candidates)
+        try:
+            self.theme = candidates[self.theme_index]
+            self.notify(f"Thème : {self.theme}")
+        except Exception as exc:
+            self.notify(f"Thème indisponible : {exc}", severity="warning")
+
+
+def main() -> None:
+    OlaTui().run()
+
+
+if __name__ == "__main__":
+    main()

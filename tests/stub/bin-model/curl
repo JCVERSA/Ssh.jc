@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+url=""; payload=""; prev=""
+for a in "$@"; do
+  [[ "$prev" == "-d" ]] && payload=$a
+  case "$a" in http*) url=$a;; esac
+  prev=$a
+done
+models_json(){
+  jq -R -s '{models: (split("\n") | map(select(length > 0) | {name:.}))}' "$1"
+}
+case "$url" in
+  *127.0.0.1:11434/api/ps*)
+    jq -R -s '{models: (split("\n") | map(select(length > 0) | {name:., size:1500000000, expires_at:"2030-01-01T00:00:00Z", context_length:1024}))}' "${TEST_STATE}/loaded-models"; exit 0 ;;
+  *127.0.0.1:11434/api/show*)
+    model=$(printf '%s' "$payload" | jq -r '.model // .name // empty')
+    if printf '%s' "$model" | grep -Fq 'qwen3'; then
+      printf '{"details":{"parameter_size":"1.7B"},"capabilities":["completion","thinking"]}'
+    else
+      printf '{"details":{"parameter_size":"1B"},"capabilities":["completion"]}'
+    fi
+    exit 0 ;;
+  *127.0.0.1:11434/api/tags*) models_json "${TEST_STATE}/installed-models"; exit 0 ;;
+  *127.0.0.1:11434/api/delete*)
+    model=$(printf '%s' "$payload" | jq -r '.model // .name // empty')
+    printf 'DELETE %s\n' "$model" >> "${TEST_STATE}/model-order.log"
+    grep -Fxv "$model" "${TEST_STATE}/installed-models" > "${TEST_STATE}/installed-models.tmp" || true
+    mv "${TEST_STATE}/installed-models.tmp" "${TEST_STATE}/installed-models"
+    grep -Fxv "$model" "${TEST_STATE}/loaded-models" > "${TEST_STATE}/loaded-models.tmp" || true
+    mv "${TEST_STATE}/loaded-models.tmp" "${TEST_STATE}/loaded-models"
+    printf ''; exit 0 ;;
+  *127.0.0.1:11434/api/generate*)
+    model=$(printf '%s' "$payload" | jq -r '.model // empty')
+    printf 'UNLOAD %s\n' "$model" >> "${TEST_STATE}/model-order.log"
+    grep -Fxv "$model" "${TEST_STATE}/loaded-models" > "${TEST_STATE}/loaded-models.tmp" || true
+    mv "${TEST_STATE}/loaded-models.tmp" "${TEST_STATE}/loaded-models"
+    printf '{}'; exit 0 ;;
+  */api/chat*)
+    model=$(printf '%s' "$payload" | jq -r '.model // empty')
+    printf 'LOAD %s\n' "$model" >> "${TEST_STATE}/model-order.log"
+    printf '%s\n' "$payload" >> "${TEST_STATE}/bench-payloads.log"
+    grep -Fxq "$model" "${TEST_STATE}/loaded-models" || printf '%s\n' "$model" >> "${TEST_STATE}/loaded-models"
+    if printf '%s' "$payload" | grep -Fq '"stream":true'; then
+      printf '{"message":{"role":"assistant","content":"Le "},"done":false}\n'
+      printf '{"message":{"role":"assistant","content":"ciel "},"done":false}\n'
+      printf '{"message":{"role":"assistant","content":"bleu."},"done":true,"total_duration":2600000000,"load_duration":100000000,"prompt_eval_count":20,"prompt_eval_cached_count":15,"prompt_eval_duration":200000000,"eval_count":48,"eval_duration":2400000000}\n'
+    elif printf '%s' "$payload" | grep -Fq '"think":false'; then
+      printf '{"message":{"role":"assistant","content":"Le ciel est bleu."},"done":true,"total_duration":2600000000,"load_duration":100000000,"prompt_eval_count":20,"prompt_eval_duration":200000000,"eval_count":48,"eval_duration":2400000000}'
+    else
+      printf '{"message":{"role":"assistant","content":"Le ciel est bleu."},"done":true,"total_duration":5100000000,"load_duration":100000000,"prompt_eval_count":20,"prompt_eval_duration":200000000,"eval_count":48,"eval_duration":4800000000}'
+    fi
+    exit 0 ;;
+  *127.0.0.1:11434/api/version*) printf '{"version":"0.40.6"}'; exit 0 ;;
+  *127.0.0.1:20241/ready*) printf '200'; exit 0 ;;
+  */api/version*) printf '{"version":"0.40.6"}'; exit 0 ;;
+  *) printf '{}'; exit 0 ;;
+esac

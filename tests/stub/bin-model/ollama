@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+case "${1:-}" in
+  --version) echo 'ollama version stub' ;;
+  pull)
+    printf 'PULL %s\n' "$2" >> "${TEST_STATE}/model-order.log"
+    grep -Fxq "$2" "${TEST_STATE}/installed-models" || printf '%s\n' "$2" >> "${TEST_STATE}/installed-models"
+    ;;
+  list) cat "${TEST_STATE}/installed-models" ;;
+  rm)
+    printf 'CLI-RM %s\n' "$2" >> "${TEST_STATE}/model-order.log"
+    grep -Fxv "$2" "${TEST_STATE}/installed-models" > "${TEST_STATE}/installed-models.tmp" || true
+    mv "${TEST_STATE}/installed-models.tmp" "${TEST_STATE}/installed-models"
+    ;;
+esac
+exit 0

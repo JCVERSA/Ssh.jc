@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+if [[ "${1:-}" == "passwd" && "${2:-}" == "ollama" ]]; then echo "ollama:x:999:999::${TEST_HOME_OLLAMA}:/usr/sbin/nologin"; exit 0; fi
+if [[ "${1:-}" == "passwd" && "${2:-}" == "cloudflared" ]]; then echo "cloudflared:x:998:998::/nonexistent:/usr/sbin/nologin"; exit 0; fi
+exec /usr/bin/getent "$@"

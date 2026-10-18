@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# skip -c <conf>
+while [[ $# -gt 0 ]]; do case "$1" in -c) shift 2;; *) break;; esac; done
+cmd=${1:-}; prog=${2:-}
+case "$cmd" in
+  status)
+    if [[ -n "$prog" ]]; then
+      if [[ -f "${TEST_STATE}/${prog}.running" ]]; then echo "$prog RUNNING pid 123"; else echo "$prog STOPPED Not started"; fi
+    else
+      for p in ollama cloudflared-ollama; do if [[ -f "${TEST_STATE}/${p}.running" ]]; then echo "$p RUNNING pid 123"; else echo "$p STOPPED Not started"; fi; done
+    fi
+    exit 0;;
+  reread|update) exit 0;;
+  start) touch "${TEST_STATE}/${prog}.running"; exit 0;;
+  restart)
+    for p in "$@"; do [[ "$p" == restart ]] && continue; touch "${TEST_STATE}/${p}.running"; done
+    if [[ " $* " == *" cloudflared-ollama "* ]]; then printf 'INF new tunnel https://fresh-quick.trycloudflare.com\n' >> /var/log/supervisor/cloudflared-ollama-error.log; fi
+    exit 0;;
+  stop) rm -f "${TEST_STATE}/${prog}.running"; exit 0;;
+esac
+exit 0

@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "apt-get $*" >> "${TEST_STATE}/calls.log"; exit 0

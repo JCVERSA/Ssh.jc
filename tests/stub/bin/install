@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# test stub: honor -d/-m, ignore -o/-g (uids are not mapped in the namespace)
+mode=""; dir=0; operands=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d) dir=1; shift;;
+    -m) mode=$2; shift 2;;
+    -o|-g) shift 2;;
+    --) shift;;
+    -*) shift;;
+    *) operands+=("$1"); shift;;
+  esac
+done
+if [[ $dir -eq 1 ]]; then
+  mkdir -p "${operands[@]}"
+  [[ -n "$mode" ]] && chmod "$mode" "${operands[@]}"
+else
+  cp "${operands[@]}"
+  [[ -n "$mode" ]] && chmod "$mode" "${operands[-1]}"
+fi
+exit 0
