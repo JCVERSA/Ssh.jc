@@ -613,7 +613,7 @@ selected_model_from_prompt(){
 }
 
 model_manager(){
-  local tags_json loaded_names current_default rows name size markers action selected confirm prereqs_done=0 i
+  local tags_json loaded_names current_default rows name size markers action selected prereqs_done=0 i
   require_commands curl jq
   while true; do
     if ! tags_json=$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags 2>/dev/null); then
@@ -711,11 +711,6 @@ model_manager(){
             unload_models_command "$selected" < /dev/null
             ;;
           d)
-            if ! read_manager_value confirm "Suppression définitive du disque. Tape DELETE pour confirmer : " ""; then
-              warn "Suppression annulée."
-              continue
-            fi
-            [[ "$confirm" == "DELETE" ]] || { warn "Suppression annulée."; continue; }
             if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$selected")" ]]; then
               delete_model_command "$selected" 1 < /dev/null
             else
@@ -2078,16 +2073,7 @@ case "${1:-}" in
         delete_force=0
         current_default=$(saved_model_name)
         if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$model_choice")" ]]; then
-          if ! confirm_choice=$(prompt_value "This is the default model. Type DELETE to force deletion: " ""); then
-            die "No confirmation received; cancelling deletion."
-          fi
-          [[ "$confirm_choice" == "DELETE" ]] || die "Deletion cancelled."
           delete_force=1
-        else
-          if ! confirm_choice=$(prompt_value "Type DELETE to confirm permanent disk deletion: " ""); then
-            die "No confirmation received; cancelling deletion."
-          fi
-          [[ "$confirm_choice" == "DELETE" ]] || die "Deletion cancelled."
         fi
         delete_model_command "$model_choice" "$delete_force"
         ;;

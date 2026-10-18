@@ -614,10 +614,9 @@ Exemple pour supprimer le modèle n° 2 :
 ```text
 Action : d
 Numéro du modèle : 2
-Suppression définitive du disque. Tape DELETE pour confirmer : DELETE
 ```
 
-La confirmation `DELETE` est obligatoire dans le gestionnaire interactif.
+Aucune confirmation `DELETE` n’est demandée dans le gestionnaire interactif : le choix de l’action `d` et du numéro du modèle déclenche immédiatement la suppression.
 
 Après chaque action, la liste est réaffichée avec les nouveaux marqueurs.
 
