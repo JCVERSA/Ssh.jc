@@ -144,6 +144,13 @@ ensure_service_users(){
   install -d -o "$OLLAMA_USER" -g "$OLLAMA_USER" -m 0750 "$OLLAMA_HOME"
 }
 
+ollama_version_text(){
+  local bin=$1 ver
+  ver=$("$bin" --version 2>/dev/null | head -1)
+  [[ -n "$ver" ]] || ver="binary at $bin"
+  printf '%s' "$ver"
+}
+
 ollama_bin_path(){
   if command -v ollama >/dev/null 2>&1; then
     command -v ollama
@@ -234,12 +241,16 @@ ollama_api_ready(){
 }
 
 stop_unmanaged_ollama(){
-  local ollama_bin=$1 expected_exe pid exe cmdline unknown=0 i
+  local ollama_bin=$1 expected_exe pid exe cmdline unknown=0 i pid_list p
   supervisor_program_running ollama && return 0
   expected_exe=$(readlink -f "$ollama_bin" 2>/dev/null || printf '%s' "$ollama_bin")
 
   local pids=()
-  mapfile -t pids < <(pgrep -x ollama 2>/dev/null || true)
+  # Do not use Bash process substitution here: some minimal containers do not
+  # provide /dev/fd, which made the previous mapfile line abort the setup.
+  pid_list=$(pgrep -x ollama 2>/dev/null || true)
+  # shellcheck disable=SC2086 # pgrep output is a list of numeric PIDs.
+  for p in $pid_list; do pids+=("$p"); done
   if [[ ${#pids[@]} -eq 0 ]]; then
     if ollama_api_ready; then
       die "Something is answering on 127.0.0.1:11434 but no Ollama process was found. Free the port or stop that service, then re-run setup."
@@ -277,12 +288,12 @@ stop_unmanaged_ollama(){
 install_ollama(){
   local ollama_bin
   if ollama_bin=$(ollama_bin_path); then
-    ok "Ollama already installed: $("$ollama_bin" --version 2>&1 | head -1)"
+    ok "Ollama already installed: $(ollama_version_text "$ollama_bin")"
   else
     info "Installing Ollama from the checksum-verified GitHub release archive..."
     install_ollama_binary
     ollama_bin=$(ollama_bin_path) || die "Ollama binary not found after installation."
-    ok "Ollama installed: $("$ollama_bin" --version 2>&1 | head -1)"
+    ok "Ollama installed: $(ollama_version_text "$ollama_bin")"
   fi
 
   ensure_service_users
