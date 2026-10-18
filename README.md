@@ -546,7 +546,7 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola fluid preset [modèle]` | Affiche un preset de requête stable et rapide à copier dans ton client (`stream:true`, `think:false` seulement si le modèle déclare la capacité thinking, `num_ctx`/`num_thread` fixes, keep-alive de session). Lecture seule. |
 | `ola fluid keepalive <durée>` | Change le keep-alive par défaut du serveur (`OLLAMA_KEEP_ALIVE`) pour toutes les requêtes qui ne le précisent pas, par ex. `30m`, `1h`, `2h30m`, `3600` ou `-1`. Enregistré dans `/etc/ollama-cloudflare-keepalive`, vérification de l’API et du modèle, retour arrière automatique. Root requis. |
 | `ola fluid keepalive reset` | Restaure le keep-alive par défaut du serveur : `5m`. Root requis. |
-| `ola tui` | Ouvre l’interface plein écran Textual : tableau de bord et modèles en direct, détail du modèle, actions modèles, preset/bench, journaux et thèmes. Terminal interactif requis. |
+| `ola tui` | Ouvre l’interface plein écran Textual : tableau de bord et modèles en direct, fraîcheur des données, détail du modèle, actions modèles, preset/bench, journaux recherchables avec suivi et thèmes persistés. Terminal interactif requis. |
 | `ola tui install` | Installe ou répare l’environnement Python/Textual isolé de la TUI. Root et accès PyPI requis. |
 | `ola tui status` | Indique si l’application TUI et son environnement Textual sont prêts. Lecture seule. |
 | `ola models` | En terminal interactif, ouvre le gestionnaire de modèles. Sinon, affiche simplement la liste des modèles téléchargés. |
@@ -1087,12 +1087,14 @@ Si l’installation de la TUI échoue, le setup continue et toutes les commandes
 L’écran affiche :
 
 - l’état de l’API Ollama et, sur une ligne compacte, les états Supervisor `Ollama`, `Tunnel` et `Watchdog` quand ils sont exposés ;
-- l’URL publique enregistrée, le mode Pack Speed et le keep-alive ;
-- la RAM, le swap et le niveau d’accès (root ou non-root) ;
-- un tableau actualisé des modèles : état disque/RAM, taille, modèle par défaut, expiration keep-alive et contexte chargé ;
-- un détail du modèle sélectionné : état, caractère par défaut, paramètres, famille, quantification et capacités déclarées par `/api/show`.
+- l’URL publique enregistrée, suivie de l’avertissement **« API non authentifiée — garde cette URL privée »**, le mode Pack Speed et le keep-alive ;
+- la RAM libre et son pourcentage **utilisé** (la barre représente la RAM utilisée), le swap et le niveau d’accès (root ou non-root) ;
+- un tableau actualisé des modèles : état disque/RAM, taille, modèle par défaut, expiration keep-alive relative (`dans 4 min 05 s`, `dans 2 h 10`, etc.) et contexte chargé ;
+- un détail du modèle sélectionné : état, caractère par défaut, expiration relative complétée par la date et l’heure locales, paramètres, famille, quantification et capacités déclarées par `/api/show`.
 
-Le tableau se rafraîchit périodiquement. Les flèches haut/bas changent de modèle. Au premier affichage, le modèle déjà chargé en RAM est sélectionné en priorité, sinon le modèle par défaut. S’il n’y a aucun modèle, le tableau et le panneau de détail affichent explicitement l’état vide et proposent la touche `a` pour en ajouter un.
+Le tableau se rafraîchit périodiquement. La barre d’état indique l’âge des données (`mis à jour il y a … s`) et signale des données anciennes après quelques secondes sans actualisation réussie. Si l’API locale ne répond plus, le panneau et la barre d’état donnent la marche à suivre : quitter avec `q`, lancer `ola start`, puis `ola doctor` ; la touche `g` ouvre les journaux. Les flèches haut/bas changent de modèle. Au premier affichage, le modèle déjà chargé en RAM est sélectionné en priorité, sinon le modèle par défaut. S’il n’y a aucun modèle, le tableau et le panneau de détail affichent explicitement l’état vide et proposent la touche `a` pour en ajouter un.
+
+Le détail technique `/api/show` est mis en cache par nom de modèle **et par digest** : si un modèle du même nom est retéléchargé avec un contenu différent, la TUI relit son détail au lieu de réutiliser l’ancien ; les entrées des modèles qui n’existent plus sont supprimées du cache.
 
 L’affichage s’adapte à la taille du terminal : mode standard à partir d’environ 95 colonnes ou 29 lignes, mode compact en dessous (bannière masquée, panneaux réduits, noms de modèles raccourcis au milieu), puis mode minimal sur très petit terminal (panneaux masqués pour conserver un tableau utilisable). Les confirmations gardent aussi leurs boutons visibles sur petit écran.
 
@@ -1113,12 +1115,16 @@ L’affichage s’adapte à la taille du terminal : mode standard à partir d’
 | `B` | Benchmark streaming du modèle (confirmation) |
 | `s` | Afficher `ola speed` |
 | `f` | Afficher `ola fluid` |
-| `g` | Ouvrir les journaux Supervisor (touches `1` à `5`, `r`, `q`) |
-| `t` | Changer de thème Textual |
+| `g` | Ouvrir les journaux Supervisor (`1` à `5` : fichier, `/` : recherche, `Entrée` puis `n`/`N` : résultats, `f` : suivi automatique, `r`, `q`) |
+| `t` | Changer de thème parmi `textual-dark`, `nord` et `textual-light` ; le choix est mémorisé |
 | `r` | Rafraîchir maintenant |
 | `q` | Quitter ou fermer l’écran courant |
 
 Les actions longues ouvrent immédiatement un écran d’exécution : la sortie de `ola` y défile en direct, avec le temps écoulé. Pendant l’exécution, `q` ou `Ctrl+C` demande l’annulation du processus (le CLI et ses sous-processus sont arrêtés proprement) ; une fois l’action terminée ou annulée, `q` ferme l’écran. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. Dans toutes les confirmations, le focus initial est placé sur **Annuler** : appuyer immédiatement sur `Entrée` annule, et il faut choisir explicitement le bouton d’exécution pour lancer l’action. Seul le bouton de suppression utilise la couleur de danger. En utilisateur non-root, l’affichage et les lectures restent disponibles, mais `u`, `d`, `l` et `a` sont refusés avant confirmation car ils exigent root.
+
+Dans l’écran des journaux, `/` place le curseur dans la recherche ; `Entrée` valide le terme et positionne le journal sur le premier résultat, puis `n` et `N` parcourent les résultats dans les deux sens, avec le compteur affiché dans le titre. La touche `f` active ou désactive le suivi automatique, qui relit le fichier toutes les deux secondes et se place à la fin ; l’état du suivi reste visible à côté du champ de recherche.
+
+La touche `t` fait défiler trois thèmes Textual choisis pour garder une interface lisible : `textual-dark` (défaut), `nord` et `textual-light`. Le dernier thème utilisé est écrit dans `~/.config/ola-tui/theme` — ou dans le fichier indiqué par `OLA_TUI_THEME_FILE` — et restauré au lancement suivant. Un fichier absent, illisible ou contenant un thème inconnu retombe proprement sur `textual-dark`.
 
 ### Limites de la TUI
 

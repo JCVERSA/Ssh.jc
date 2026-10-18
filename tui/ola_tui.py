@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,15 +49,20 @@ LOG_FILES = [
     ("Watchdog", Path("/var/log/supervisor/ollama-watchdog.log")),
 ]
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
+# Keep only a small set of framework themes with strong default contrast:
+# a dark default, a dark blue variant and a light variant. The last choice
+# is persisted per user in THEME_FILE.
 THEME_CYCLE = [
     "textual-dark",
-    "catppuccin-mocha",
-    "dracula",
     "nord",
-    "tokyo-night",
-    "gruvbox",
     "textual-light",
 ]
+THEME_FILE = Path(
+    os.environ.get(
+        "OLA_TUI_THEME_FILE",
+        str(Path.home() / ".config" / "ola-tui" / "theme"),
+    )
+)
 
 
 def normalize_model(name: str) -> str:
@@ -114,6 +120,78 @@ def format_expiry(value: str) -> str:
     if not value:
         return "—"
     return value.replace("T", " ")[:19]
+
+
+def load_saved_theme() -> str:
+    try:
+        name = THEME_FILE.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        return "textual-dark"
+    return name if name in THEME_CYCLE else "textual-dark"
+
+
+def save_theme(name: str) -> None:
+    if name not in THEME_CYCLE:
+        return
+    try:
+        THEME_FILE.parent.mkdir(parents=True, exist_ok=True)
+        THEME_FILE.write_text(f"{name}\n", encoding="utf-8")
+    except OSError:
+        # Theme persistence is a convenience; never fail the TUI for it.
+        pass
+
+
+def parse_expiry(value: str) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def format_expiry_relative(value: str, now: datetime | None = None) -> str:
+    parsed = parse_expiry(value)
+    if parsed is None:
+        return "non définie"
+    current = now or datetime.now(timezone.utc)
+    seconds = int((parsed - current).total_seconds())
+    if seconds <= 0:
+        return "expirée"
+    if seconds < 90:
+        return f"dans {seconds} s"
+    if seconds < 600:
+        minutes, rest_seconds = divmod(seconds, 60)
+        return f"dans {minutes} min {rest_seconds:02d} s"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"dans {minutes} min"
+    hours, rest_minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"dans {hours} h {rest_minutes:02d}" if rest_minutes else f"dans {hours} h"
+    days = seconds // 86400
+    if days < 730:
+        return f"dans {days} j"
+    years, remaining_days = divmod(days, 365)
+    months = remaining_days // 30
+    return f"dans {years} a {months} mo" if months else f"dans {years} a"
+
+
+def format_expiry_details(value: str) -> str:
+    parsed = parse_expiry(value)
+    if parsed is None:
+        return "non définie"
+    local = parsed.astimezone()
+    return (
+        f"{format_expiry_relative(value)} · le "
+        f"{local.strftime('%d/%m/%Y à %H:%M')} ({local.strftime('%Z')})"
+    )
 
 
 def http_json(path: str, payload: dict[str, Any] | None = None, timeout: float = 6) -> Any:
@@ -208,6 +286,7 @@ class Snapshot:
     mem_available: int = 0
     swap_total: int = 0
     swap_free: int = 0
+    fetched_at: float = 0.0
 
 
 def fetch_snapshot() -> Snapshot:
@@ -272,6 +351,7 @@ def fetch_snapshot() -> Snapshot:
             model.name.lower(),
         ),
     )
+    snapshot.fetched_at = time.time()
     return snapshot
 
 
@@ -556,6 +636,10 @@ class LogsScreen(Screen):
         Binding("escape", "close", "Fermer"),
         Binding("q", "close", "Fermer"),
         Binding("r", "refresh_log", "Rafraîchir"),
+        Binding("/", "focus_search", "Rechercher"),
+        Binding("n", "next_match", "Résultat suivant"),
+        Binding("N", "previous_match", "Résultat précédent"),
+        Binding("f", "toggle_follow", "Suivi"),
         Binding("1", "select_log(0)", "Ollama"),
         Binding("2", "select_log(1)", "Erreurs"),
         Binding("3", "select_log(2)", "Tunnel"),
@@ -566,23 +650,69 @@ class LogsScreen(Screen):
     def __init__(self):
         super().__init__()
         self.current_index = 0
+        self.follow = False
+        self.search_term = ""
+        self.matches: list[tuple[int, int]] = []
+        self.match_index = -1
+        self.current_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
             yield Static("", id="log-title")
+            with Horizontal(id="log-search-row"):
+                yield Input(placeholder="Recherche… (/ saisir, Entrée suivant, n/N naviguer)", id="log-search")
+                yield Static("Suivi : non", id="log-mode")
             yield TextArea("", id="log-content", read_only=True, show_line_numbers=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        self.show_current()
+        self.show_current(goto_end=True)
+        self.query_one("#log-content", TextArea).focus()
+        self.set_interval(2.0, self._follow_tick)
 
-    def show_current(self) -> None:
+    def _update_title(self) -> None:
         name, path = LOG_FILES[self.current_index]
+        search = ""
+        if self.search_term:
+            if self.matches:
+                search = f" · recherche « {self.search_term} » : {self.match_index + 1}/{len(self.matches)}"
+            else:
+                search = f" · recherche « {self.search_term} » : aucun résultat"
         self.query_one("#log-title", Static).update(
-            f"Journal {name} — {path}  (touches 1-5, r rafraîchir, q fermer)"
+            f"Journal {name} — {path}  (1-5 fichiers, / recherche, f suivi, r rafraîchir, q fermer){search}"
         )
+        self.query_one("#log-mode", Static).update(
+            "Suivi : oui (2 s)" if self.follow else "Suivi : non"
+        )
+
+    def _compute_matches(self) -> None:
+        term = self.search_term.strip().lower()
+        self.matches = []
+        if not term:
+            self.match_index = -1
+            return
+        for line_number, line in enumerate(self.current_lines):
+            lowered = line.lower()
+            column = lowered.find(term)
+            while column >= 0:
+                self.matches.append((line_number, column))
+                column = lowered.find(term, column + max(1, len(term)))
+        self.match_index = 0 if self.matches else -1
+
+    def _go_to_match(self) -> None:
+        if not self.matches or self.match_index < 0:
+            self._update_title()
+            return
+        line, column = self.matches[self.match_index]
         area = self.query_one("#log-content", TextArea)
+        area.move_cursor((line, column), center=True)
+        self._update_title()
+
+    def show_current(self, goto_end: bool = False) -> None:
+        _name, path = LOG_FILES[self.current_index]
+        area = self.query_one("#log-content", TextArea)
+        previous_cursor = area.cursor_location
         try:
             data = path.read_bytes()[-150_000:]
             content = data.decode("utf-8", errors="replace")
@@ -590,16 +720,67 @@ class LogsScreen(Screen):
                 content = "(fichier vide)"
         except OSError as exc:
             content = f"Journal illisible : {exc}\nEssaie de lancer la TUI avec les droits root."
+        self.current_lines = content.splitlines()
         area.load_text(content)
-        area.scroll_end(animate=False)
+        self._compute_matches()
+        if self.search_term and self.matches:
+            self._go_to_match()
+        elif goto_end or self.follow:
+            area.scroll_end(animate=False)
+        else:
+            try:
+                area.move_cursor(
+                    (min(previous_cursor[0], max(0, len(self.current_lines) - 1)), previous_cursor[1])
+                )
+            except Exception:
+                pass
+        self._update_title()
+
+    def _follow_tick(self) -> None:
+        if self.follow:
+            self.show_current(goto_end=True)
+
+    def action_focus_search(self) -> None:
+        self.query_one("#log-search", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "log-search":
+            return
+        self.search_term = event.value.strip()
+        self._compute_matches()
+        self._go_to_match()
+        self.query_one("#log-content", TextArea).focus()
+
+    def action_next_match(self) -> None:
+        if not self.search_term:
+            self.action_focus_search()
+            return
+        if self.matches:
+            self.match_index = (self.match_index + 1) % len(self.matches)
+            self._go_to_match()
+
+    def action_previous_match(self) -> None:
+        if not self.search_term:
+            self.action_focus_search()
+            return
+        if self.matches:
+            self.match_index = (self.match_index - 1) % len(self.matches)
+            self._go_to_match()
+
+    def action_toggle_follow(self) -> None:
+        self.follow = not self.follow
+        self._update_title()
+        if self.follow:
+            self.show_current(goto_end=True)
+        self.app.notify(f"Suivi des journaux : {'activé' if self.follow else 'désactivé'}")
 
     def action_refresh_log(self) -> None:
-        self.show_current()
+        self.show_current(goto_end=self.follow)
 
     def action_select_log(self, index: int) -> None:
         if 0 <= index < len(LOG_FILES):
             self.current_index = index
-            self.show_current()
+            self.show_current(goto_end=True)
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -632,7 +813,8 @@ ACTIONS SUR LE MODÈLE SÉLECTIONNÉ
   B  Benchmark streaming / premier token visible (confirmation)
   s  État du Pack Speed
   f  État du Pack Fluidité
-  g  Journaux Supervisor (1-5 pour changer, r rafraîchir)
+  g  Journaux Supervisor (1-5 fichiers, / recherche, Entrée puis n/N pour
+     naviguer entre les résultats, f suivi automatique, r rafraîchir)
 
 CONFIRMATIONS ET SÉCURITÉ
 Le focus initial d'une confirmation est toujours sur Annuler.
@@ -772,6 +954,9 @@ class OlaTui(App):
         content-align: left middle;
     }
     #log-content { height: 1fr; border: solid $primary; }
+    #log-search-row { height: 3; padding: 0 1; }
+    #log-search { width: 1fr; }
+    #log-mode { width: 16; content-align: center middle; }
     .dialog {
         width: 72;
         max-width: 92%;
@@ -831,11 +1016,21 @@ class OlaTui(App):
         super().__init__()
         self.snapshot = Snapshot()
         self.current_model = ""
-        self.show_cache: dict[str, dict[str, Any]] = {}
+        # Cache /api/show by model digest: if the same model name is
+        # downloaded again with different content, the detail is refetched.
+        self.show_cache: dict[str, tuple[str, dict[str, Any]]] = {}
         self.refreshing = False
         self.action_running = False
         self._action_cancel_requested = False
-        self.theme_index = 0
+        self.last_refresh_at: float | None = None
+        self.last_success_at: float | None = None
+        saved_theme = load_saved_theme()
+        self.theme_index = THEME_CYCLE.index(saved_theme) if saved_theme in THEME_CYCLE else 0
+        try:
+            if saved_theme in self.available_themes:
+                self.theme = saved_theme
+        except Exception:
+            pass
         # Keep direct references to the main-screen widgets. App.query_one()
         # searches the currently displayed screen, so background refreshes
         # would otherwise fail while an output, log or dialog screen is open.
@@ -867,6 +1062,7 @@ class OlaTui(App):
         table.add_columns("État", "Modèle", "Taille", "RAM", "Défaut", "Expiration", "Contexte")
         self._apply_responsive_layout()
         self.set_interval(3.0, self._refresh_timer)
+        self.set_interval(1.0, self._tick_status)
         await self.refresh_snapshot(force=True)
 
     def _apply_responsive_layout(self) -> None:
@@ -890,6 +1086,54 @@ class OlaTui(App):
         if not self.refreshing and not self.action_running:
             self.run_worker(self.refresh_snapshot(), group="refresh", exclusive=True)
 
+    def _freshness_text(self) -> str:
+        if self.snapshot.error:
+            if self.last_success_at is None:
+                return "données indisponibles"
+            success_age = max(0, int(time.monotonic() - self.last_success_at))
+            return f"données indisponibles · dernier succès il y a {success_age} s"
+        reference = self.last_success_at or self.last_refresh_at
+        if reference is None:
+            return "pas encore actualisé"
+        age = max(0, int(time.monotonic() - reference))
+        if age > 9:
+            return f"données anciennes ({age} s)"
+        return f"mis à jour il y a {age} s"
+
+    def _status_text(self) -> str:
+        snap = self.snapshot
+        if snap.error:
+            return (
+                "API Ollama injoignable · récupération : ola start, puis ola doctor · "
+                f"g journaux · {self._freshness_text()}"
+            )
+        return (
+            f"{len(snap.models)} modèle(s) · défaut : {snap.default_model} · "
+            f"{self._freshness_text()} · ? aide · m actions"
+        )
+
+    def _tick_status(self) -> None:
+        if self.action_running or self.status_widget is None:
+            return
+        try:
+            self.status_widget.update(self._status_text())
+            self._render_details()
+        except Exception:
+            pass
+
+    def _cached_show(self, name: str) -> dict[str, Any]:
+        model = self._selected_model_info(name)
+        cached = self.show_cache.get(name)
+        if cached is None:
+            return {}
+        cached_digest, show = cached
+        if model is not None and model.digest and cached_digest != model.digest:
+            return {}
+        return show
+
+    def _show_cache_valid(self, name: str) -> bool:
+        return bool(self._cached_show(name))
+
     async def refresh_snapshot(self, force: bool = False) -> None:
         if self.refreshing:
             return
@@ -897,12 +1141,26 @@ class OlaTui(App):
         try:
             snapshot = await asyncio.to_thread(fetch_snapshot)
             self.snapshot = snapshot
+            self.last_refresh_at = time.monotonic()
+            if snapshot.api_ok and not snapshot.error:
+                self.last_success_at = self.last_refresh_at
+            if snapshot.models:
+                present = {model.name for model in snapshot.models}
+                self.show_cache = {
+                    name: cached
+                    for name, cached in self.show_cache.items()
+                    if name in present
+                }
             self._render_snapshot()
             selected = self.selected_model_name()
-            if selected and (force or selected not in self.show_cache):
+            if selected and not self._show_cache_valid(selected):
                 show = await asyncio.to_thread(fetch_show, selected)
                 if show:
-                    self.show_cache[selected] = show
+                    selected_info = self._selected_model_info(selected)
+                    self.show_cache[selected] = (
+                        selected_info.digest if selected_info is not None else "",
+                        show,
+                    )
                 self._render_details()
         finally:
             self.refreshing = False
@@ -937,17 +1195,24 @@ class OlaTui(App):
         )
         summary.append("URL publique : ", style="bold")
         summary.append(f"{snap.public_url or 'non enregistrée'}\n")
+        if snap.public_url:
+            summary.append("Public : ", style="bold")
+            summary.append(
+                "API non authentifiée — garde cette URL privée\n", style="yellow"
+            )
         summary.append("Pack Speed : ", style="bold")
         summary.append(f"{snap.speed_mode}")
         summary.append("  ·  Keep-alive : ", style="bold")
         summary.append(f"{snap.keepalive}\n")
         if snap.mem_total:
             free_pct = int(snap.mem_available * 100 / snap.mem_total)
-            filled = min(20, max(0, int((100 - free_pct) * 20 / 100)))
+            used_pct = 100 - free_pct
+            filled = min(20, max(0, int(used_pct * 20 / 100)))
             bar = "█" * filled + "░" * (20 - filled)
             summary.append("RAM : ", style="bold")
             summary.append(
-                f"{format_bytes(snap.mem_available)} libres / {format_bytes(snap.mem_total)} [{bar}] {free_pct}%\n"
+                f"{format_bytes(snap.mem_available)} libres / {format_bytes(snap.mem_total)} "
+                f"· {used_pct}% utilisée [{bar}]\n"
             )
         if snap.swap_total:
             summary.append("Swap : ", style="bold")
@@ -957,7 +1222,15 @@ class OlaTui(App):
             "root (actions actives)" if running_as_root() else "non-root (lecture seule pour les actions protégées)"
         )
         if snap.error:
-            summary.append(f"\nErreur API : {snap.error}", style="red")
+            detail = " ".join(str(snap.error).split())
+            if len(detail) > 90:
+                detail = f"{detail[:87]}…"
+            summary.append("\nErreur : ", style="bold red")
+            summary.append("Ollama ne répond pas localement.\n", style="red")
+            summary.append("Récupération : ", style="bold")
+            summary.append("quitte (q), lance ola start, puis ola doctor ; journaux ici avec g.\n")
+            summary.append("Détail technique : ", style="bold")
+            summary.append(detail, style="red")
         self.summary_widget.update(summary)
 
         table = self.models_table
@@ -982,7 +1255,7 @@ class OlaTui(App):
                     model.size,
                     model.loaded,
                     model.loaded_size,
-                    model.expires_at,
+                    format_expiry_relative(model.expires_at) if model.loaded else "—",
                     model.context_length,
                     normalize_model(model.name) == default_norm,
                 )
@@ -996,9 +1269,7 @@ class OlaTui(App):
             table.clear()
             for model in snap.models:
                 is_default = normalize_model(model.name) == default_norm
-                expiry = format_expiry(model.expires_at) if model.loaded else "—"
-                if short_expiry and model.loaded:
-                    expiry = expiry[:10]
+                expiry = format_expiry_relative(model.expires_at) if model.loaded else "—"
                 table.add_row(
                     "● RAM" if model.loaded else "○ disque",
                     display_model_name(model.name, model_name_limit),
@@ -1037,11 +1308,7 @@ class OlaTui(App):
                     table.move_cursor(row=names.index(target), column=0, animate=False)
                 except Exception:
                     pass
-        status = (
-            f"{len(snap.models)} modèle(s) · défaut : {snap.default_model} · "
-            f"CLI : {CLI} · r rafraîchir · t thème"
-        )
-        self.status_widget.update(status)
+        self.status_widget.update(self._status_text())
         self._render_details()
 
     def selected_model_name(self) -> str:
@@ -1071,7 +1338,7 @@ class OlaTui(App):
                 details_widget.update("Aucun modèle sélectionné.")
             return
         model = next((item for item in self.snapshot.models if item.name == name), None)
-        show = self.show_cache.get(name, {})
+        show = self._cached_show(name)
         show_details = show.get("details") or {}
         capabilities = show.get("capabilities") or []
         text = Text()
@@ -1089,16 +1356,20 @@ class OlaTui(App):
                 text.append("Taille RAM déclarée : ", style="bold")
                 text.append(f"{format_bytes(model.loaded_size)}\n")
                 text.append("Expiration keep-alive : ", style="bold")
-                text.append(f"{format_expiry(model.expires_at)}\n")
+                text.append(f"{format_expiry_details(model.expires_at)}\n")
         parameter_size = str(show_details.get("parameter_size") or (model.parameter_size if model else ""))
         family = str(show_details.get("family") or (model.family if model else ""))
         quantization = str(show_details.get("quantization_level") or (model.quantization if model else ""))
-        if parameter_size:
-            text.append("Paramètres : ", style="bold")
-            text.append(f"{parameter_size}\n")
-        if family:
-            text.append("Famille : ", style="bold")
-            text.append(f"{family}\n")
+        if parameter_size or family:
+            if parameter_size:
+                text.append("Paramètres : ", style="bold")
+                text.append(parameter_size)
+            if parameter_size and family:
+                text.append(" · ")
+            if family:
+                text.append("Famille : ", style="bold")
+                text.append(family)
+            text.append("\n")
         if quantization:
             text.append("Quantification : ", style="bold")
             text.append(f"{quantization}\n")
@@ -1108,15 +1379,18 @@ class OlaTui(App):
         if not model:
             text.append("Défaut ola : ", style="bold")
             text.append("oui\n" if is_default_model else "non\n")
+        if not show and self.snapshot.api_ok:
+            text.append("Détail technique : chargement…\n")
         text.append("Actions : u utiliser · d supprimer · l libérer RAM · w préchauffer · p preset · b bench")
         details_widget.update(text)
 
     async def on_data_table_row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
         name = self.selected_model_name()
-        if name and name not in self.show_cache:
+        if name and not self._show_cache_valid(name):
             show = await asyncio.to_thread(fetch_show, name)
             if show:
-                self.show_cache[name] = show
+                info = self._selected_model_info(name)
+                self.show_cache[name] = (info.digest if info is not None else "", show)
         self._render_details()
 
     def _require_model(self) -> str:
@@ -1436,7 +1710,8 @@ class OlaTui(App):
         self.theme_index = (self.theme_index + 1) % len(candidates)
         try:
             self.theme = candidates[self.theme_index]
-            self.notify(f"Thème : {self.theme}")
+            save_theme(self.theme)
+            self.notify(f"Thème : {self.theme} (mémorisé)")
         except Exception as exc:
             self.notify(f"Thème indisponible : {exc}", severity="warning")
 

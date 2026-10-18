@@ -12,6 +12,7 @@ import importlib.util
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,8 +90,13 @@ mod.running_as_root = lambda: True
 
 TMP = Path(tempfile.mkdtemp(prefix="ola-tui-tests-"))
 LOG_PATH = TMP / "test.log"
-LOG_PATH.write_text("ligne de journal 1\nligne de journal 2\n", encoding="utf-8")
+LOG_PATH.write_text(
+    "ligne alpha alpha de journal\nligne beta erreur\nligne alpha de retour\n",
+    encoding="utf-8",
+)
 mod.LOG_FILES = [("Test", LOG_PATH)]
+THEME_PATH = TMP / "theme"
+mod.THEME_FILE = THEME_PATH
 
 
 async def wait_until(pilot, predicate, label: str) -> None:
@@ -136,6 +142,32 @@ async def main() -> None:
     assert time.monotonic() - stream_started < 5
     print("PASS: real CLI streaming and process-group cancellation")
 
+    now = datetime.now(timezone.utc)
+    assert mod.format_expiry_relative("") == "non définie"
+    assert mod.format_expiry_relative("date-invalide") == "non définie"
+    assert mod.format_expiry_relative((now + timedelta(minutes=2, seconds=30)).isoformat()).startswith(
+        "dans 2 min"
+    )
+    assert "expirée" in mod.format_expiry_relative((now - timedelta(seconds=5)).isoformat())
+    expiry_details = mod.format_expiry_details((now + timedelta(minutes=2, seconds=30)).isoformat())
+    assert expiry_details.startswith("dans ")
+    assert "· le" in expiry_details
+    print("PASS: keep-alive expiry is formatted relatively with an absolute fallback")
+
+    assert mod.THEME_CYCLE == ["textual-dark", "nord", "textual-light"]
+    mod.save_theme("nord")
+    assert mod.load_saved_theme() == "nord"
+    assert THEME_PATH.read_text(encoding="utf-8") == "nord\n"
+    mod.save_theme("thème-inconnu")
+    assert mod.load_saved_theme() == "nord"
+    THEME_PATH.write_text("thème-inconnu\n", encoding="utf-8")
+    assert mod.load_saved_theme() == "textual-dark"
+    fallback_app = mod.OlaTui()
+    assert fallback_app.theme == "textual-dark"
+    assert fallback_app.theme_index == 0
+    THEME_PATH.unlink()
+    print("PASS: saved theme loads and an unknown saved theme falls back safely")
+
     app = mod.OlaTui()
     async with app.run_test(size=(120, 38)) as pilot:
         await wait_until(pilot, lambda: app.query_one("#models").row_count == 2, "model rows")
@@ -149,6 +181,32 @@ async def main() -> None:
         assert "Accès :" in summary_text
         assert "Capacités :" in details_text
         assert "Défaut ola : oui" in details_text
+        assert "API non authentifiée" in summary_text
+        assert "garde cette URL privée" in summary_text
+        assert "75% utilisée" in summary_text
+        assert "Expiration keep-alive : dans" in details_text
+        assert "· le" in details_text
+        status_text = str(app.query_one("#status").render())
+        assert "mis à jour il y a" in status_text
+        app.last_refresh_at = time.monotonic() - 20
+        app.last_success_at = app.last_refresh_at
+        assert "données anciennes (20 s)" in app._freshness_text()
+        error_snapshot = fake_snapshot()
+        error_snapshot.api_ok = False
+        error_snapshot.error = "Connexion refusée par le service local"
+        app.snapshot = error_snapshot
+        app.last_success_at = time.monotonic() - 42
+        assert "API Ollama injoignable" in app._status_text()
+        assert "récupération : ola start" in app._status_text()
+        assert "dernier succès il y a 42 s" in app._status_text()
+        app._render_snapshot()
+        error_summary = str(app.query_one("#summary").render())
+        assert "Ollama ne répond pas localement." in error_summary
+        assert "Récupération :" in error_summary
+        assert "ola doctor" in error_summary
+        await app.refresh_snapshot(force=True)
+        print("PASS: public URL warning, used-RAM label, freshness and API recovery guidance")
+
         rendered = app.export_screenshot().replace("\xa0", " ")
         for expected in ("Services", "Swap", "Accès", "Capacités", "Actions", "préchauffer", "bench"):
             assert expected in rendered, f"Missing visible panel text at 120x38: {expected}"
@@ -344,16 +402,57 @@ async def main() -> None:
         await wait_until(
             pilot, lambda: app.screen.__class__.__name__ == "LogsScreen", "logs screen"
         )
+        logs_screen = app.screen
+        await pilot.press("/")
+        await wait_until(
+            pilot,
+            lambda: app.focused is not None and app.focused.id == "log-search",
+            "logs search focus",
+        )
+        await pilot.press(*"alpha")
+        await pilot.press("enter")
+        await wait_until(
+            pilot,
+            lambda: logs_screen.search_term == "alpha" and len(logs_screen.matches) == 3,
+            "logs search results",
+        )
+        assert "1/3" in str(logs_screen.query_one("#log-title").render())
+        await pilot.press("n")
+        await wait_until(pilot, lambda: logs_screen.match_index == 1, "next log match")
+        assert "2/3" in str(logs_screen.query_one("#log-title").render())
+        await pilot.press("N")
+        await wait_until(pilot, lambda: logs_screen.match_index == 0, "previous log match")
+        assert logs_screen.follow is False
+        await pilot.press("f")
+        await wait_until(pilot, lambda: logs_screen.follow is True, "logs follow enabled")
+        assert "Suivi : oui" in str(logs_screen.query_one("#log-mode").render())
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write("nouvelle ligne pendant le suivi\n")
+        logs_screen._follow_tick()
+        await wait_until(
+            pilot,
+            lambda: "nouvelle ligne pendant le suivi" in logs_screen.query_one("#log-content").text,
+            "logs follow refresh",
+        )
+        await pilot.press("f")
+        await wait_until(pilot, lambda: logs_screen.follow is False, "logs follow disabled")
         await pilot.press("q")
         await wait_until(
             pilot, lambda: app.screen.__class__.__name__ != "LogsScreen", "logs close"
         )
-        print("PASS: logs screen")
+        print("PASS: logs screen search navigation and follow mode")
 
-        before = app.theme
+        assert app.theme == "textual-dark"
         await pilot.press("t")
-        await pilot.pause()
-        print(f"PASS: theme action ({before} -> {app.theme})")
+        await wait_until(pilot, lambda: app.theme == "nord", "theme cycle to nord")
+        assert THEME_PATH.read_text(encoding="utf-8") == "nord\n"
+        await pilot.press("t")
+        await wait_until(pilot, lambda: app.theme == "textual-light", "theme cycle to light")
+        assert THEME_PATH.read_text(encoding="utf-8") == "textual-light\n"
+        await pilot.press("t")
+        await wait_until(pilot, lambda: app.theme == "textual-dark", "theme cycle wraps")
+        assert THEME_PATH.read_text(encoding="utf-8") == "textual-dark\n"
+        print("PASS: reduced theme cycle persists each choice")
 
         await pilot.press("?")
         await wait_until(
@@ -400,6 +499,12 @@ async def main() -> None:
         )
 
         await pilot.press("q")
+
+    THEME_PATH.write_text("nord\n", encoding="utf-8")
+    persisted_theme_app = mod.OlaTui()
+    assert persisted_theme_app.theme == "nord"
+    assert persisted_theme_app.theme_index == 1
+    print("PASS: a new TUI instance restores the persisted theme")
 
     mod.fetch_snapshot = lambda: mod.Snapshot(
         api_ok=True,
@@ -519,6 +624,72 @@ async def main() -> None:
             assert table_height >= min_table_height, (size, table_height)
             print(f"PASS: responsive {expected_class} layout at {size[0]}x{size[1]}")
             await pilot.press("q")
+
+    digest_state = {"digest": "sha256:ancien"}
+    show_calls: list[str] = []
+
+    def counting_fetch_show(name: str) -> dict:
+        show_calls.append(name)
+        return {
+            "details": {
+                "parameter_size": "1B",
+                "family": "test",
+                "quantization_level": "Q4_K_M",
+            },
+            "capabilities": ["completion"],
+        }
+
+    mod.fetch_show = counting_fetch_show
+    mod.fetch_snapshot = lambda: mod.Snapshot(
+        api_ok=True,
+        version="0.40.6",
+        models=[
+            mod.ModelInfo(
+                name="digest-model:latest",
+                size=1_000_000_000,
+                loaded=True,
+                loaded_size=1_100_000_000,
+                expires_at=(datetime.now(timezone.utc) + timedelta(minutes=4)).isoformat(),
+                context_length=1024,
+                parameter_size="1B",
+                digest=digest_state["digest"],
+            )
+        ],
+        default_model="digest-model:latest",
+        public_url="",
+        speed_mode="balanced",
+        keepalive="5m",
+        services={},
+        cloudflared_ready=200,
+        mem_total=2_000_000_000,
+        mem_available=1_000_000_000,
+        swap_total=0,
+        swap_free=0,
+    )
+    digest_app = mod.OlaTui()
+    async with digest_app.run_test(size=(120, 38)) as pilot:
+        await wait_until(
+            pilot,
+            lambda: digest_app.query_one("#models").row_count == 1 and len(show_calls) == 1,
+            "digest cache initial show fetch",
+        )
+        digest_app.show_cache["modele-absent:latest"] = (
+            "sha256:absent",
+            {"details": {}, "capabilities": []},
+        )
+        await digest_app.refresh_snapshot(force=True)
+        assert show_calls == ["digest-model:latest"], show_calls
+        assert "modele-absent:latest" not in digest_app.show_cache
+        digest_state["digest"] = "sha256:nouveau"
+        await digest_app.refresh_snapshot(force=True)
+        assert show_calls == ["digest-model:latest", "digest-model:latest"], show_calls
+        await digest_app.refresh_snapshot(force=True)
+        assert show_calls == ["digest-model:latest", "digest-model:latest"], show_calls
+        digest_details = str(digest_app.query_one("#details").render())
+        assert "Expiration keep-alive : dans" in digest_details
+        assert "· le" in digest_details
+        print("PASS: /api/show cache is keyed by digest and prunes absent models")
+        await pilot.press("q")
 
     print("ALL TUI PILOT TESTS PASS")
 
