@@ -89,10 +89,12 @@ stop_loaded_models_except_soft(){
 }
 
 pull_model_with_retry(){
-  local model=$1 ollama_bin=$2 models_kb pull_attempt
-  models_kb=$(free_kb "$OLLAMA_HOME")
+  local model=$1 ollama_bin=$2 models_kb pull_attempt models_dir
+  models_dir=$(saved_ollama_models_dir)
+  [[ -n "$models_dir" ]] || models_dir="$OLLAMA_HOME"
+  models_kb=$(free_kb "$models_dir")
   if [[ "$models_kb" -gt 0 && "$models_kb" -lt 2000000 ]]; then
-    warn "Less than about 2 GB free on $OLLAMA_HOME. A larger model may fail while pulling; free disk space if needed."
+    warn "Less than about 2 GB free on $models_dir. A larger model may fail while pulling; free disk space if needed."
   fi
   info "Pulling model $model (this may take a while)..."
   for pull_attempt in 1 2; do

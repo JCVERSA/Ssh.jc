@@ -14,6 +14,7 @@ Ce dépôt contient deux outils indépendants pour les VPS et conteneurs Debian/
   - [Vue d’ensemble](#vue-densemble)
   - [Prérequis](#prérequis)
   - [Installation](#installation)
+  - [Google Colab](#google-colab)
   - [Quick Tunnel ou Named Tunnel](#quick-tunnel-ou-named-tunnel)
   - [Configuration](#configuration)
   - [Guide d’utilisation `ola`](#guide-dutilisation-ola)
@@ -128,6 +129,7 @@ Principes :
 - Une interface terminal optionnelle, **`ola tui`**, est installée automatiquement par le setup ; le moteur et toutes les commandes texte continuent de fonctionner si son installation échoue.
 - Les téléchargements d’Ollama et de cloudflared sont vérifiés quand un checksum est disponible.
 - Ollama est volontairement limité pour les petits sandboxes : un seul modèle chargé, une requête parallèle et un contexte de 1024 tokens par défaut.
+- Le même artefact fonctionne sur **VPS/sandbox Debian/Ubuntu classique** et dans **Google Colab**. Le profil Colab est explicitement activé par le notebook (`OLA_COLAB=1`) : il conserve les modèles et les petits réglages dans Google Drive et utilise le GPU NVIDIA quand Colab en fournit un. Sans ce profil, le comportement VPS/sandbox historique reste inchangé : utilisateurs système dédiés `ollama`/`cloudflared`, stockage local des modèles et aucun chemin NVIDIA Colab ajouté.
 
 ## Prérequis
 
@@ -276,6 +278,93 @@ ola test
 ```text
 --- Doctor summary: 0 failure(s), 0 warning(s) ---
 ```
+
+## Google Colab
+
+Le projet fournit un notebook prêt à exécuter : [`colab/Ola-Colab.ipynb`](colab/Ola-Colab.ipynb).
+
+Ouvrir dans Colab :
+
+```text
+https://colab.research.google.com/github/JCVERSA/Ssh.jc/blob/arena/e89a71aa-ssh-jc/colab/Ola-Colab.ipynb
+```
+
+### Parcours Colab, du début à la fin
+
+1. Dans Colab, choisis éventuellement **Exécution → Modifier le type d'exécution → GPU** (T4 si disponible). Le CPU fonctionne aussi.
+2. Lance les cellules du notebook dans l'ordre.
+3. La première cellule monte Google Drive et prépare `/content/drive/MyDrive/ola-colab`.
+4. La deuxième cellule vérifie le runtime, télécharge `ollama-cloudflare-setup.sh`, contrôle son SHA-256 et le rend exécutable.
+5. La troisième cellule lance le setup complet rapide :
+
+   ```bash
+   ./ollama-cloudflare-setup.sh setup default
+   ```
+
+   Cela installe Ollama, télécharge ou réutilise `qwen3:1.7b`, démarre les services sous Supervisor et crée un **Quick Tunnel**.
+6. Le notebook exécute ensuite `ola colab status`, `ola doctor`, `ola test`, affiche l'URL publique et teste cette URL avec `/api/version`, `/api/tags` et `/api/chat`.
+7. La dernière cellule sauvegarde les réglages `ola` dans Google Drive avec `ola colab save`.
+
+Pendant la session, les commandes habituelles restent disponibles dans une cellule `%%bash` :
+
+```bash
+ola status
+ola doctor
+ola test
+ola logs
+ola recover
+ola colab status
+```
+
+La TUI `ola tui` demande un vrai terminal interactif ; dans les cellules Colab, utilise les commandes texte.
+
+### Ce que le profil Colab change — et ce qu'il ne change pas
+
+Le notebook active explicitement :
+
+```bash
+export OLA_COLAB=1
+export OLA_COLAB_STATE_DIR=/content/drive/MyDrive/ola-colab
+export OLLAMA_MODELS=/content/drive/MyDrive/ola-colab/models
+export LD_LIBRARY_PATH=/usr/lib64-nvidia:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+```
+
+| Sujet | VPS / sandbox classique | Google Colab (`OLA_COLAB=1`) |
+|---|---|---|
+| Utilisateurs des services | `ollama` et `cloudflared` dédiés | `root`, utilisateur unique du runtime et du montage Drive |
+| Modèles Ollama | Stockage local par défaut | `OLLAMA_MODELS` dans Google Drive |
+| GPU NVIDIA | Comportement Ollama standard de la machine | Chemin `/usr/lib64-nvidia` ajouté dans la configuration Supervisor ; repli CPU si aucun GPU |
+| Réglages `ola` | `/etc/ollama-cloudflare-*` | Restaurés depuis Drive au setup, puis sauvegardés par `ola colab save` |
+| Tunnel du parcours garanti | Quick ou Named selon le setup | Quick Tunnel uniquement dans le notebook |
+| Persistance après arrêt | Selon le VPS/sandbox | Modèles et réglages dans Drive ; système et URL recréés |
+
+Sans `OLA_COLAB=1`, un VPS ou un sandbox ne reçoit ni le profil root Colab, ni `OLLAMA_MODELS` forcé, ni le chemin NVIDIA Colab. Le même artefact reste donc utilisable normalement hors Colab.
+
+### Persistance : ce qui est gardé, honnêtement
+
+Google Drive conserve :
+
+- les fichiers modèles Ollama, car Ollama écrit directement dans `OLLAMA_MODELS` ;
+- le modèle par défaut, le mode Pack Speed et le keep-alive `ola`, copiés dans `MyDrive/ola-colab/config/` ;
+- la dernière URL Quick Tunnel à titre d'historique.
+
+Ne peuvent pas survivre à la suppression du runtime Colab :
+
+- les binaires et paquets installés ;
+- `/etc`, Supervisor et les processus ;
+- l'URL Quick Tunnel : un nouveau runtime crée une nouvelle URL.
+
+Au prochain runtime, rouvre le notebook et relance toutes les cellules : Drive est remonté, les modèles déjà présents sont réutilisés, les réglages sont restaurés et une nouvelle URL publique est générée. Colab peut aussi arrêter un runtime inactif ou arrivé en fin de durée de vie ; `ola` ne peut pas transformer Colab en hébergement 24/7.
+
+Commandes Colab spécifiques :
+
+| Commande | Effet |
+|---|---|
+| `ola colab status` | Affiche le profil actif, le dossier Drive, le dossier modèles et le GPU/CPU détecté. |
+| `ola colab save` | Copie les réglages `ola` actuels vers `OLA_COLAB_STATE_DIR/config`. Root requis. |
+| `ola colab restore` | Restaure ces réglages dans le runtime actuel ; relance ensuite `ola setup default` pour régénérer les services. Root requis. |
+
+Le parcours Colab est couvert par la suite de tests isolée du dépôt (profil root, `OLLAMA_MODELS`, chemin NVIDIA, sauvegarde/restauration de l'état et notebook statique). Le runtime Google réel dépend de ton compte et de la machine attribuée par Colab : lance le notebook pour la vérification finale dans ton environnement.
 
 ## Quick Tunnel ou Named Tunnel
 
@@ -436,6 +525,9 @@ Ces variables se placent **avant** la commande de setup ou la commande concerné
 | `OLLAMA_TMPDIR` | Choix automatique | Force le dossier temporaire volumineux utilisé pour l’archive Ollama et les téléchargements cloudflared de secours. Utile si `/tmp` est petit. |
 | `OLLAMA_CONTEXT_LENGTH` | `1024` | Contexte Ollama écrit dans la configuration Supervisor pendant le setup. Augmenter le contexte augmente la RAM utilisée. |
 | `CF_TUNNEL_PROTOCOL` | `auto` | Protocole cloudflared : `auto`, `http2` ou `quic`. Écrit dans la configuration du tunnel pendant le setup. |
+| `OLA_COLAB` | `0` | `1` active le profil Google Colab. Inactif par défaut sur VPS/sandbox. |
+| `OLA_COLAB_STATE_DIR` | Vide | Dossier persistant Colab, normalement `/content/drive/MyDrive/ola-colab`. |
+| `OLLAMA_MODELS` | Vide | Dossier où Ollama stocke les modèles. Le notebook Colab le pointe vers Google Drive ; sur un VPS, ne le définis que si tu veux déplacer volontairement le stockage. |
 
 Exemples :
 
@@ -486,6 +578,7 @@ Attention : après avoir changé `OLLAMA_CONTEXT_LENGTH` ou `CF_TUNNEL_PROTOCOL`
 | `/etc/ollama-cloudflare-model` | Modèle par défaut utilisé par `ola test` et le gestionnaire |
 | `/etc/ollama-cloudflare-speed` | Mode vitesse enregistré : `balanced` ou `speed` (Pack Speed) |
 | `/etc/ollama-cloudflare-keepalive` | Keep-alive par défaut du serveur Ollama enregistré (absent = `5m`), modifié par `ola fluid keepalive` |
+| `/etc/ollama-cloudflare-colab` | Marqueur du profil Colab dans le runtime actuel et chemin de l’état Drive (Colab uniquement) |
 | `/var/lib/ollama/` | Home du service Ollama |
 | `/var/lib/ollama/.ollama/models/` | Modèles téléchargés sur le disque |
 
@@ -570,6 +663,9 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola doctor` | Diagnostic complet : binaires, Supervisor, services, API, modèles, tunnel, RAM, disque, logs et URL publique. |
 | `ola test` | Teste l’API locale, vérifie le modèle par défaut, fait une mini-conversation et teste l’URL publique. |
 | `ola update` | Met à jour le gestionnaire `ola` et les fichiers de la TUI depuis la version publiée sur GitHub : vérification SHA-256, sauvegarde de l’ancienne version, installation atomique, redémarrage des services et retour arrière si le redémarrage ou l’API échoue. Root requis. |
+| `ola colab status` | Affiche le profil Colab/VPS, l’état Google Drive, le dossier modèles et le GPU/CPU. Lecture seule. |
+| `ola colab save` | Sauvegarde les réglages `ola` dans l’état Colab Google Drive. Root requis. |
+| `ola colab restore` | Restaure les réglages `ola` depuis l’état Colab. Root requis. |
 | `ola bench` | Sans argument (ou `ola bench all`), mesure **tous les modèles téléchargés présents**, un par un : même question courte avec thinking par défaut puis `think:false`, tok/s, verdict par modèle et synthèse globale. Le modèle par défaut est testé en dernier. |
 | `ola bench <modèle>` | Mesure uniquement le modèle indiqué. |
 | `ola speed` | Affiche le mode vitesse global du serveur Ollama, la liste des modèles présents concernés, la configuration effective, le CPU (AVX/AVX2, cœurs), la RAM et les recommandations. Lecture seule. |
@@ -1796,6 +1892,10 @@ Le **Named Tunnel** est préférable : hostname stable, credentials persistants 
 - Si le sandbox est recréé depuis zéro : relance le setup complet.
 - Si la plateforme s’arrête complètement : aucun watchdog interne ne peut redémarrer le sandbox lui-même.
 
+### Le même `ola` fonctionne-t-il sur VPS, sandbox et Google Colab ?
+
+Oui. Sur VPS/sandbox Debian/Ubuntu, utilise le parcours classique : profil standard, utilisateurs dédiés et modèles locaux. Dans Google Colab, utilise le notebook `colab/Ola-Colab.ipynb` : il active le profil Colab, monte Google Drive, fait utiliser le GPU si présent et recrée une nouvelle URL Quick Tunnel à chaque runtime. Le profil Colab ne s'active pas par défaut sur un VPS/sandbox.
+
 ### Comment changer de hostname ou passer de Quick à Named ?
 
 Relance le setup et choisis le mode Named Tunnel :
@@ -1879,6 +1979,8 @@ Le gestionnaire Ollama est maintenant développé comme un petit projet modulair
 | `src/58-speed.sh` | État, application, vérification et retour arrière du Pack Speed. |
 | `src/60-diagnostics-setup.sh` | Doctor, test, récupération et setup complet. |
 | `src/65-update.sh` | Auto-mise à jour du gestionnaire : téléchargement, SHA-256, verrou, sauvegarde, installation, redémarrage et retour arrière. |
+| `src/67-colab.sh` | Profil Google Colab : état Google Drive, restauration/sauvegarde des réglages et statut CPU/GPU. |
+| `colab/Ola-Colab.ipynb` | Notebook Colab de bout en bout : Drive, téléchargement vérifié, setup Quick, contrôles et test public. |
 | `src/70-tui.sh` | Intégration Bash de la TUI : extraction, environnement Python, statut, réparation et lancement. |
 | `src/90-main.sh` | Dispatch des commandes et menu texte historique. |
 | `tui/ola_tui.py` | Application Textual `ola tui`. |

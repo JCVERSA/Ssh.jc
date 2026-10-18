@@ -8,6 +8,9 @@ case "${1:-}" in
   update)
     update_ola_command
     ;;
+  colab)
+    colab_command "${2:-status}"
+    ;;
   doctor)
     show_doctor
     ;;

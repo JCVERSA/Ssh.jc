@@ -156,6 +156,10 @@ check "$OUT/help.log" "ola tui opens" "help documents ola tui"
 check "$OUT/help.log" "ola bench --stream" "help documents streaming bench"
 check "$OUT/help.log" "ola update downloads" "help documents ola update"
 check "$OUT/help.log" "ola setup default uses" "help documents quick setup"
+check "$OUT/help.log" "ola colab status/save/restore" "help documents Colab state commands"
+check_file "$ROOT/colab/Ola-Colab.ipynb" "Colab notebook is present"
+check_file_contains "$ROOT/colab/Ola-Colab.ipynb" "OLA_COLAB_STATE_DIR" "Colab notebook configures persistent Drive state"
+check_file_contains "$ROOT/colab/Ola-Colab.ipynb" "setup default" "Colab notebook runs the end-to-end quick setup"
 if (cd "$ROOT" && sha256sum -c ollama-cloudflare-setup.sh.sha256 > "$OUT/artifact-sha256.log" 2>&1); then
   echo "PASS: published artifact SHA-256 matches"
   pass=$((pass + 1))
@@ -305,6 +309,9 @@ check "$OUT/setup-default.log" "Setup rapide : modèle qwen3:1.7b · tunnel 1" "
 check "$OUT/setup-default.log" "Quick Tunnel URL: https://fresh-quick.trycloudflare.com" "setup default configures a Quick Tunnel"
 check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:1.7b" "setup default saves the built-in default model"
 check_file_contains "$TEST_ETC/ollama-cloudflare-url" "https://fresh-quick.trycloudflare.com" "setup default saves the Quick Tunnel URL"
+check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "user=ollama" "standard setup keeps the dedicated Ollama user"
+check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "OLLAMA_MODELS=" "standard setup does not force a Colab models directory"
+check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "LD_LIBRARY_PATH=" "standard setup does not add the Colab NVIDIA library path"
 
 reset_case
 run setup llama3.2:1b account ollama.example.com > "$OUT/setup-named.log" 2>&1; setup_named_exit=$?
@@ -326,6 +333,34 @@ printf '%s\n%s\n' "qwen3:0.6b" "1" | run setup > "$OUT/setup-interactive.log" 2>
 echo "setup interactive exit=$setup_interactive_exit"
 check "$OUT/setup-interactive.log" "Quick Tunnel URL: https://fresh-quick.trycloudflare.com" "interactive setup still prompts for model and tunnel"
 check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:0.6b" "interactive setup saves the prompted model"
+
+# --- Google Colab profile ---------------------------------------------------------
+export OLA_COLAB=1
+export OLA_COLAB_STATE_DIR="$TEST_STATE/colab-state"
+export OLLAMA_MODELS="$TEST_STATE/colab-state/models"
+reset_case
+run setup default > "$OUT/setup-colab.log" 2>&1; setup_colab_exit=$?
+echo "setup colab exit=$setup_colab_exit"
+check "$OUT/setup-colab.log" "État Colab sauvegardé" "Colab setup saves persistent state"
+check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "user=root" "Colab Supervisor runs Ollama as root"
+check_file_contains "$TEST_ETC/supervisor/conf.d/cloudflared-ollama.conf" "user=root" "Colab Supervisor runs cloudflared as root"
+check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "OLLAMA_MODELS=\"$TEST_STATE/colab-state/models\"" "Colab setup writes the persistent models directory"
+check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "LD_LIBRARY_PATH=\"/usr/lib64-nvidia" "Colab setup exposes NVIDIA libraries to Ollama"
+check_file_contains "$TEST_STATE/colab-state/config/ollama-cloudflare-model" "qwen3:1.7b" "Colab state keeps the default model setting"
+check_file "$TEST_ETC/ollama-cloudflare-colab" "Colab setup writes the runtime profile marker"
+run colab status > "$OUT/colab-status.log" 2>&1; colab_status_exit=$?
+echo "colab status exit=$colab_status_exit"
+check "$OUT/colab-status.log" "Mode Colab : activé" "Colab status reports the active Colab profile"
+check "$OUT/colab-status.log" "Dossier modèles Ollama : $TEST_STATE/colab-state/models" "Colab status reports the persistent models directory"
+unset OLA_COLAB OLA_COLAB_STATE_DIR OLLAMA_MODELS
+run colab status > "$OUT/colab-status-marker.log" 2>&1; colab_marker_status_exit=$?
+echo "colab marker status exit=$colab_marker_status_exit"
+check "$OUT/colab-status-marker.log" "Mode Colab : activé" "Colab profile survives a later shell through the runtime marker"
+check "$OUT/colab-status-marker.log" "Dossier modèles Ollama : $TEST_STATE/colab-state/models" "Colab marker restores the persistent state path"
+printf 'qwen3:0.6b\n' > "$TEST_ETC/ollama-cloudflare-model"
+run colab restore > "$OUT/colab-restore.log" 2>&1; colab_restore_exit=$?
+echo "colab restore exit=$colab_restore_exit"
+check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:1.7b" "Colab restore brings back the saved default model"
 
 # --- Self-update -----------------------------------------------------------------
 export OLA_UPDATE_URL="https://updates.example.test/ollama-cloudflare-setup.sh"

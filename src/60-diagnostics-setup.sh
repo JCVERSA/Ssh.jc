@@ -392,6 +392,9 @@ setup_all(){
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
   esac
+  if is_colab_mode; then
+    colab_state_restore || warn "Impossible de restaurer complètement l'état Colab ; le setup continue avec l'état local du runtime."
+  fi
   install_ola_command
   apt_update
   apt_install curl ca-certificates gnupg jq tar
@@ -422,6 +425,9 @@ setup_all(){
   esac
   echo
   show_status
+  if is_colab_mode; then
+    colab_state_save || warn "Impossible de sauvegarder complètement l'état Colab dans Google Drive ; les services restent utilisables dans ce runtime."
+  fi
   echo
   ok "Setup finished. Try: ola doctor, ola test, ola recover, ola logs"
   warn "Supervisor can restart processes, but 24/7 uptime still depends on the hosting platform keeping this container alive and starting Supervisor again after container restart."

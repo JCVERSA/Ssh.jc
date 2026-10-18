@@ -10,6 +10,7 @@ install_ollama(){
   fi
 
   ensure_service_users
+  ensure_ollama_models_dir
 
   # The tunnel deliberately exposes Ollama without Cloudflare Access. Ollama
   # has two separate 403 guards: OLLAMA_ORIGINS controls browser Origin

@@ -21,6 +21,28 @@ FLUID_WARM_KEEP_ALIVE="30m"
 MODEL_DEFAULT="qwen3:1.7b"
 OLLAMA_USER="ollama"
 CLOUDFLARED_USER="cloudflared"
+# Colab support is opt-in. A normal VPS or sandbox keeps the historical
+# dedicated service users and local model storage unless OLA_COLAB=1 (or a
+# previous Colab setup marker) explicitly selects the Colab runtime profile.
+COLAB_RUNTIME_FILE="/etc/ollama-cloudflare-colab"
+if [[ -z "${OLA_COLAB+x}" ]]; then
+  OLA_COLAB="0"
+  if [[ -n "${COLAB_RELEASE_TAG:-}" || -n "${COLAB_GPU:-}" || -n "${COLAB_BACKEND_VERSION:-}" || -f "$COLAB_RUNTIME_FILE" ]]; then
+    OLA_COLAB="1"
+  fi
+fi
+OLA_COLAB_STATE_DIR="${OLA_COLAB_STATE_DIR:-}"
+if [[ "$OLA_COLAB" == "1" && -z "$OLA_COLAB_STATE_DIR" && -f "$COLAB_RUNTIME_FILE" ]]; then
+  OLA_COLAB_STATE_DIR=$(sed -n '2p' "$COLAB_RUNTIME_FILE" 2>/dev/null || true)
+fi
+OLLAMA_MODELS_DIR="${OLLAMA_MODELS:-}"
+if [[ "$OLA_COLAB" == "1" ]]; then
+  # Colab is a single-user ephemeral runtime: the notebook user is root, and
+  # a dedicated service user cannot reliably access the Google Drive FUSE
+  # mount or GPU devices. Keep the dedicated users on normal VPS installs.
+  OLLAMA_USER="root"
+  CLOUDFLARED_USER="root"
+fi
 OLLAMA_GROUP=""
 CLOUDFLARED_GROUP=""
 OLLAMA_HOME=""
@@ -49,11 +71,16 @@ warn(){ printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
+is_colab_mode(){
+  [[ "${OLA_COLAB:-0}" == "1" ]]
+}
+
 usage(){
-  echo "Usage: bash $0 [setup|update|start|recover|status|doctor|test|bench|speed|fluid|tui|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
+  echo "Usage: bash $0 [setup|update|colab|start|recover|status|doctor|test|bench|speed|fluid|tui|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
   echo "setup, update, start, recover, use, unload, delete, restart, stop, 'speed apply|reset', 'fluid keepalive' and 'tui install' require root; status, doctor, test, speed, fluid status/preset, tui status, models, ps, logs and watchdog are read-only. Bench does not change config or disk files, but may load/unload models in RAM while testing."
   echo "ola update downloads the latest published ola artifact, verifies its SHA-256, keeps the previous version as a backup, installs it atomically, restarts the configured services and rolls back if the post-update restart/API check fails."
+  echo "ola colab status/save/restore reports or persists the Colab state when OLA_COLAB=1; save/restore require root."
   echo "ola setup default uses the built-in default model ($MODEL_DEFAULT) and a Quick Tunnel. ola setup <model> <1|quick|2|account|named> [hostname] runs the full setup without the model/tunnel prompts; the hostname is only for Named Tunnel mode."
   echo "ola tui opens the optional full-screen Textual interface (dashboard and model actions). 'ola tui install' repairs its isolated Python environment; 'ola tui status' reports it."
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
@@ -567,10 +594,12 @@ stop_loaded_models_except_soft(){
 }
 
 pull_model_with_retry(){
-  local model=$1 ollama_bin=$2 models_kb pull_attempt
-  models_kb=$(free_kb "$OLLAMA_HOME")
+  local model=$1 ollama_bin=$2 models_kb pull_attempt models_dir
+  models_dir=$(saved_ollama_models_dir)
+  [[ -n "$models_dir" ]] || models_dir="$OLLAMA_HOME"
+  models_kb=$(free_kb "$models_dir")
   if [[ "$models_kb" -gt 0 && "$models_kb" -lt 2000000 ]]; then
-    warn "Less than about 2 GB free on $OLLAMA_HOME. A larger model may fail while pulling; free disk space if needed."
+    warn "Less than about 2 GB free on $models_dir. A larger model may fail while pulling; free disk space if needed."
   fi
   info "Pulling model $model (this may take a while)..."
   for pull_attempt in 1 2; do
@@ -1023,11 +1052,57 @@ save_keep_alive(){
   chmod 600 "$KEEPALIVE_FILE" || die "Could not set permissions on $KEEPALIVE_FILE."
 }
 
+saved_ollama_models_dir(){
+  if [[ -n "${OLLAMA_MODELS_DIR:-}" ]]; then
+    printf '%s' "$OLLAMA_MODELS_DIR"
+    return 0
+  fi
+  ollama_config_value OLLAMA_MODELS
+}
+
+ensure_ollama_models_dir(){
+  local models_dir
+  models_dir=$(saved_ollama_models_dir)
+  [[ -n "$models_dir" ]] || return 0
+  if is_colab_mode; then
+    # Google Drive FUSE does not provide reliable Unix ownership/mode changes.
+    # The Colab service runs as root, so plain directory creation is enough.
+    mkdir -p "$models_dir" \
+      || die "Could not create the Ollama models directory: $models_dir"
+  else
+    install -d -o "$OLLAMA_USER" -g "$OLLAMA_GROUP" -m 0755 "$models_dir" \
+      || die "Could not create the Ollama models directory: $models_dir"
+  fi
+}
+
+colab_gpu_library_path(){
+  local gpu_path="/usr/lib64-nvidia:/usr/local/cuda/lib64" candidate
+  for candidate in /usr/lib64-nvidia /usr/local/cuda/lib64; do
+    if [[ -d "$candidate" ]]; then
+      case ":$gpu_path:" in
+        *":$candidate:"*) ;;
+        *) gpu_path="${gpu_path}:$candidate" ;;
+      esac
+    fi
+  done
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    gpu_path="${gpu_path}:${LD_LIBRARY_PATH}"
+  fi
+  printf '%s' "$gpu_path"
+}
+
 ollama_environment_line(){
-  local mode=$1 env
+  local mode=$1 env models_dir
   env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\""
   if [[ "$mode" == "speed" ]]; then
     env="${env},OLLAMA_FLASH_ATTENTION=\"1\",OLLAMA_KV_CACHE_TYPE=\"q8_0\""
+  fi
+  models_dir=$(saved_ollama_models_dir)
+  if [[ -n "$models_dir" ]]; then
+    env="${env},OLLAMA_MODELS=\"$models_dir\""
+  fi
+  if is_colab_mode; then
+    env="${env},LD_LIBRARY_PATH=\"$(colab_gpu_library_path)\""
   fi
   env="${env},HOME=\"$OLLAMA_HOME\""
   printf '%s' "$env"
@@ -1137,6 +1212,7 @@ install_ollama(){
   fi
 
   ensure_service_users
+  ensure_ollama_models_dir
 
   # The tunnel deliberately exposes Ollama without Cloudflare Access. Ollama
   # has two separate 403 guards: OLLAMA_ORIGINS controls browser Origin
@@ -3160,6 +3236,9 @@ setup_all(){
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
   esac
+  if is_colab_mode; then
+    colab_state_restore || warn "Impossible de restaurer complètement l'état Colab ; le setup continue avec l'état local du runtime."
+  fi
   install_ola_command
   apt_update
   apt_install curl ca-certificates gnupg jq tar
@@ -3190,6 +3269,9 @@ setup_all(){
   esac
   echo
   show_status
+  if is_colab_mode; then
+    colab_state_save || warn "Impossible de sauvegarder complètement l'état Colab dans Google Drive ; les services restent utilisables dans ce runtime."
+  fi
   echo
   ok "Setup finished. Try: ola doctor, ola test, ola recover, ola logs"
   warn "Supervisor can restart processes, but 24/7 uptime still depends on the hosting platform keeping this container alive and starting Supervisor again after container restart."
@@ -3500,6 +3582,143 @@ update_ola_command(){
   export OLA_UPDATE_NEW_SHA256="$candidate_hash"
   exec bash "$OLA_UPDATE_CANDIDATE" update
   die "Impossible d'exécuter l'artefact téléchargé pour terminer la mise à jour."
+}
+
+# Google Colab persistence helpers.
+#
+# Colab runtimes are disposable VMs. The notebook mounts Google Drive and
+# passes OLA_COLAB=1 plus OLA_COLAB_STATE_DIR=/content/drive/MyDrive/ola-colab.
+# In that profile (and only in that profile) Ollama/cloudflared run as root so
+# they can use the notebook user's Drive FUSE mount and NVIDIA devices. Normal
+# VPS/sandbox installs keep the dedicated ollama/cloudflared users.
+#
+# What can honestly persist between Colab runtimes:
+#   - Ollama model blobs, by pointing OLLAMA_MODELS at the Drive state dir;
+#   - the small ola settings files (default model, Pack Speed, keep-alive);
+#   - a record of the last Quick Tunnel URL (informational only).
+# What cannot persist: installed binaries, /etc configuration, Supervisor
+# processes and the Quick Tunnel URL itself. A new runtime must re-run the
+# notebook; setup recreates the system side and restores the Drive state.
+
+colab_write_runtime_marker(){
+  is_colab_mode || return 0
+  printf 'mode=colab\n%s\n' "${OLA_COLAB_STATE_DIR:-}" > "$COLAB_RUNTIME_FILE" || return 1
+  chmod 600 "$COLAB_RUNTIME_FILE" 2>/dev/null || true
+}
+
+colab_state_restore(){
+  is_colab_mode || return 0
+  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src dst
+  [[ -n "$state_dir" ]] || return 0
+  case "$state_dir" in
+    /*) ;;
+    *) warn "OLA_COLAB_STATE_DIR doit être un chemin absolu : $state_dir"; return 1 ;;
+  esac
+  config_dir="$state_dir/config"
+  mkdir -p "$config_dir" "$state_dir/models" || return 1
+  if [[ -z "${OLLAMA_MODELS_DIR:-}" ]]; then
+    OLLAMA_MODELS_DIR="$state_dir/models"
+  fi
+  for dst in "$MODEL_FILE" "$SPEED_FILE" "$KEEPALIVE_FILE"; do
+    src="$config_dir/$(basename "$dst")"
+    if [[ -f "$src" ]]; then
+      cp -f "$src" "$dst" || return 1
+    fi
+  done
+  colab_write_runtime_marker || return 1
+  info "État Colab restauré depuis $state_dir (modèles : $OLLAMA_MODELS_DIR)."
+}
+
+colab_state_save(){
+  is_colab_mode || return 0
+  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src
+  [[ -n "$state_dir" ]] || return 0
+  case "$state_dir" in
+    /*) ;;
+    *) warn "OLA_COLAB_STATE_DIR doit être un chemin absolu : $state_dir"; return 1 ;;
+  esac
+  config_dir="$state_dir/config"
+  mkdir -p "$config_dir" "$state_dir/models" || return 1
+  for src in "$MODEL_FILE" "$SPEED_FILE" "$KEEPALIVE_FILE"; do
+    if [[ -f "$src" ]]; then
+      cp -f "$src" "$config_dir/" || return 1
+    fi
+  done
+  if [[ -f "$URL_FILE" ]]; then
+    cp -f "$URL_FILE" "$config_dir/ollama-cloudflare-last-url" || return 1
+  fi
+  colab_write_runtime_marker || return 1
+  info "État Colab sauvegardé dans $state_dir (la prochaine URL Quick Tunnel sera nouvelle)."
+}
+
+colab_restore_command(){
+  is_colab_mode || die "Mode Colab inactif. Dans Colab, lance le notebook ou définis OLA_COLAB=1 avant cette commande."
+  [[ -n "${OLA_COLAB_STATE_DIR:-}" ]] || die "OLA_COLAB_STATE_DIR n'est pas défini ; aucun état Colab à restaurer."
+  colab_state_restore || die "Impossible de restaurer l'état Colab depuis ${OLA_COLAB_STATE_DIR}."
+  warn "Réglages restaurés. Relance 'ola setup default' dans ce runtime pour régénérer les services avec ces réglages."
+}
+
+colab_save_command(){
+  is_colab_mode || die "Mode Colab inactif. Dans Colab, lance le notebook ou définis OLA_COLAB=1 avant cette commande."
+  [[ -n "${OLA_COLAB_STATE_DIR:-}" ]] || die "OLA_COLAB_STATE_DIR n'est pas défini ; aucun dossier Google Drive où sauvegarder."
+  colab_state_save || die "Impossible de sauvegarder l'état Colab dans ${OLA_COLAB_STATE_DIR}."
+}
+
+show_colab_status(){
+  local state_dir=${OLA_COLAB_STATE_DIR:-} models_dir gpu_lines public_url
+  echo "--- Ola Colab ---"
+  if is_colab_mode; then
+    ok "Mode Colab : activé (profil runtime jetable, services en root)"
+  else
+    info "Mode Colab : inactif (profil standard VPS/sandbox, utilisateurs dédiés ollama/cloudflared)"
+  fi
+  echo "État persistant (Google Drive) : ${state_dir:-non configuré}"
+  if [[ -n "$state_dir" ]]; then
+    if [[ -d "$state_dir" ]]; then
+      ok "Dossier d'état accessible : $state_dir"
+    else
+      warn "Dossier d'état pas encore créé/accessible : $state_dir (monte Google Drive puis relance le setup)."
+    fi
+  fi
+  models_dir=$(saved_ollama_models_dir)
+  echo "Dossier modèles Ollama : ${models_dir:-par défaut (HOME du service Ollama)}"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu_lines=$(nvidia-smi -L 2>/dev/null || true)
+    if [[ -n "$gpu_lines" ]]; then
+      ok "GPU NVIDIA détecté :"
+      printf '%s\n' "$gpu_lines" | sed 's/^/  /'
+      echo "Bibliothèques NVIDIA exposées à Ollama : /usr/lib64-nvidia (configuration Supervisor en mode Colab)."
+    else
+      info "GPU NVIDIA : aucun détecté par nvidia-smi ; Ollama utilisera le CPU."
+    fi
+  else
+    info "GPU NVIDIA : nvidia-smi absent ; Ollama utilisera le CPU."
+  fi
+  if [[ -r "$URL_FILE" ]]; then
+    public_url=$(head -n 1 "$URL_FILE" 2>/dev/null || true)
+    [[ -n "$public_url" ]] && echo "URL publique actuelle : $public_url"
+  fi
+  echo "Limites Colab : le runtime, les binaires, /etc et l'URL Quick Tunnel sont recréés à chaque nouveau runtime ; seuls les modèles et réglages dans Google Drive sont restaurés."
+}
+
+colab_command(){
+  case "${1:-status}" in
+    status)
+      show_colab_status
+      ;;
+    save)
+      require_root
+      colab_save_command
+      ;;
+    restore)
+      require_root
+      colab_restore_command
+      ;;
+    *)
+      err "Usage: ola colab [status|save|restore]"
+      return 1
+      ;;
+  esac
 }
 
 # Optional Textual terminal interface.
@@ -5388,6 +5607,9 @@ case "${1:-}" in
     ;;
   update)
     update_ola_command
+    ;;
+  colab)
+    colab_command "${2:-status}"
     ;;
   doctor)
     show_doctor

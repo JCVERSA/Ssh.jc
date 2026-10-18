@@ -51,11 +51,57 @@ save_keep_alive(){
   chmod 600 "$KEEPALIVE_FILE" || die "Could not set permissions on $KEEPALIVE_FILE."
 }
 
+saved_ollama_models_dir(){
+  if [[ -n "${OLLAMA_MODELS_DIR:-}" ]]; then
+    printf '%s' "$OLLAMA_MODELS_DIR"
+    return 0
+  fi
+  ollama_config_value OLLAMA_MODELS
+}
+
+ensure_ollama_models_dir(){
+  local models_dir
+  models_dir=$(saved_ollama_models_dir)
+  [[ -n "$models_dir" ]] || return 0
+  if is_colab_mode; then
+    # Google Drive FUSE does not provide reliable Unix ownership/mode changes.
+    # The Colab service runs as root, so plain directory creation is enough.
+    mkdir -p "$models_dir" \
+      || die "Could not create the Ollama models directory: $models_dir"
+  else
+    install -d -o "$OLLAMA_USER" -g "$OLLAMA_GROUP" -m 0755 "$models_dir" \
+      || die "Could not create the Ollama models directory: $models_dir"
+  fi
+}
+
+colab_gpu_library_path(){
+  local gpu_path="/usr/lib64-nvidia:/usr/local/cuda/lib64" candidate
+  for candidate in /usr/lib64-nvidia /usr/local/cuda/lib64; do
+    if [[ -d "$candidate" ]]; then
+      case ":$gpu_path:" in
+        *":$candidate:"*) ;;
+        *) gpu_path="${gpu_path}:$candidate" ;;
+      esac
+    fi
+  done
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    gpu_path="${gpu_path}:${LD_LIBRARY_PATH}"
+  fi
+  printf '%s' "$gpu_path"
+}
+
 ollama_environment_line(){
-  local mode=$1 env
+  local mode=$1 env models_dir
   env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\""
   if [[ "$mode" == "speed" ]]; then
     env="${env},OLLAMA_FLASH_ATTENTION=\"1\",OLLAMA_KV_CACHE_TYPE=\"q8_0\""
+  fi
+  models_dir=$(saved_ollama_models_dir)
+  if [[ -n "$models_dir" ]]; then
+    env="${env},OLLAMA_MODELS=\"$models_dir\""
+  fi
+  if is_colab_mode; then
+    env="${env},LD_LIBRARY_PATH=\"$(colab_gpu_library_path)\""
   fi
   env="${env},HOME=\"$OLLAMA_HOME\""
   printf '%s' "$env"
