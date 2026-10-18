@@ -24,6 +24,9 @@ OLA_BIN_DIR="/usr/local/bin"
 OLA_COMMAND="$OLA_BIN_DIR/ola"
 OLA_INSTALL_DIR="/usr/local/lib/ollama-cloudflare"
 OLA_SCRIPT="$OLA_INSTALL_DIR/ollama-cloudflare-setup.sh"
+WATCHDOG_INTERVAL="${OLA_WATCHDOG_INTERVAL:-60}"
+WATCHDOG_FAILURES="${OLA_WATCHDOG_FAILURES:-3}"
+WATCHDOG_COOLDOWN="${OLA_WATCHDOG_COOLDOWN:-180}"
 
 info(){ printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -32,10 +35,10 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|start|status|logs|restart|stop]"
+  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, restart and stop require root; status and logs are read-only."
-  echo "After setup, the short system command is available: ola status | ola start | ola logs | ola stop"
+  echo "setup, start, recover, restart and stop require root; status, doctor, test, logs and watchdog are read-only."
+  echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola start | ola logs"
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
 
@@ -973,6 +976,497 @@ restart_services(){
   supervisor_ctl status || true
 }
 
+
+saved_model_name(){
+  local model=""
+  if [[ -r "$MODEL_FILE" ]]; then
+    model=$(head -n 1 "$MODEL_FILE" 2>/dev/null || true)
+  fi
+  [[ -n "$model" ]] || model="$MODEL_DEFAULT"
+  printf '%s' "$model"
+}
+
+ollama_home_for_status(){
+  local home_dir
+  home_dir=$(getent passwd "$OLLAMA_USER" 2>/dev/null | cut -d: -f6 || true)
+  case "$home_dir" in
+    ""|"/"|"/nonexistent"|"/root") home_dir="/var/lib/ollama" ;;
+  esac
+  printf '%s' "$home_dir"
+}
+
+# 0 = cloudflared reports ready, 1 = it definitively reports not ready,
+# 2 = the local metrics endpoint is unavailable/unknown. Watchdog and
+# recover only act on the definitive "not ready" state, never on "unknown".
+cloudflared_ready_state(){
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:20241/ready 2>/dev/null || true)
+  if [[ "$code" == "200" ]]; then
+    return 0
+  fi
+  if [[ -z "$code" || "$code" == "000" ]]; then
+    return 2
+  fi
+  return 1
+}
+
+wait_cloudflared_ready(){
+  local seconds=$1 i state=2
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=30
+  for ((i=1; i<=seconds; i++)); do
+    state=0
+    cloudflared_ready_state || state=$?
+    [[ "$state" -eq 0 ]] && return 0
+    sleep 1
+  done
+  return "$state"
+}
+
+ensure_watchdog(){
+  select_supervisor_paths
+  install -d -m 0750 "$LOG_DIR" "$SUP_DIR" \
+    || die "Could not create Supervisor directories for the watchdog."
+  cat > "$SUP_DIR/ollama-watchdog.conf" <<EOF
+[program:ollama-watchdog]
+command=$OLA_SCRIPT watchdog-daemon
+environment=HOME="/root"
+autostart=true
+autorestart=true
+startsecs=5
+startretries=999999
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/var/log/supervisor/ollama-watchdog.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile=/var/log/supervisor/ollama-watchdog-error.log
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
+EOF
+  chmod 600 "$SUP_DIR/ollama-watchdog.conf" \
+    || die "Could not set permissions on $SUP_DIR/ollama-watchdog.conf"
+  if supervisor_is_running; then
+    supervisor_apply
+    if supervisor_program_running ollama-watchdog; then
+      supervisor_ctl restart ollama-watchdog >/dev/null 2>&1 || true
+    else
+      supervisor_ctl start ollama-watchdog >/dev/null 2>&1 || true
+    fi
+  fi
+  ok "Health watchdog enabled (checks every ${WATCHDOG_INTERVAL}s; restart after ${WATCHDOG_FAILURES} failed checks)."
+}
+
+watchdog_log(){
+  printf '%s [watchdog] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+}
+
+watchdog_sleep(){
+  local seconds=$1 pid
+  sleep "$seconds" &
+  pid=$!
+  wait "$pid" 2>/dev/null || true
+}
+
+run_watchdog_daemon(){
+  local ollama_failures=0 cloudflared_failures=0 state
+  select_supervisor_paths
+  case "$WATCHDOG_INTERVAL" in ""|*[!0-9]*) die "Invalid OLA_WATCHDOG_INTERVAL='$WATCHDOG_INTERVAL'." ;; esac
+  case "$WATCHDOG_FAILURES" in ""|*[!0-9]*) die "Invalid OLA_WATCHDOG_FAILURES='$WATCHDOG_FAILURES'." ;; esac
+  case "$WATCHDOG_COOLDOWN" in ""|*[!0-9]*) die "Invalid OLA_WATCHDOG_COOLDOWN='$WATCHDOG_COOLDOWN'." ;; esac
+  [[ "$WATCHDOG_INTERVAL" -ge 10 ]] || die "OLA_WATCHDOG_INTERVAL must be at least 10 seconds."
+  [[ "$WATCHDOG_FAILURES" -ge 1 ]] || die "OLA_WATCHDOG_FAILURES must be at least 1."
+  [[ "$WATCHDOG_COOLDOWN" -ge 10 ]] || die "OLA_WATCHDOG_COOLDOWN must be at least 10 seconds."
+  trap 'exit 0' TERM INT
+  watchdog_log "started (interval=${WATCHDOG_INTERVAL}s failures=${WATCHDOG_FAILURES} cooldown=${WATCHDOG_COOLDOWN}s)"
+  watchdog_sleep "$WATCHDOG_INTERVAL"
+  while true; do
+    if [[ -f "$SUP_DIR/ollama.conf" ]] && supervisor_program_running ollama; then
+      if ollama_api_ready; then
+        ollama_failures=0
+      else
+        ollama_failures=$((ollama_failures + 1))
+        watchdog_log "Ollama API failed health check ${ollama_failures}/${WATCHDOG_FAILURES}."
+        if [[ "$ollama_failures" -ge "$WATCHDOG_FAILURES" ]]; then
+          watchdog_log "restarting Ollama after repeated API failures."
+          supervisor_ctl restart ollama || watchdog_log "ERROR: Supervisor could not restart Ollama."
+          ollama_failures=0
+          watchdog_sleep "$WATCHDOG_COOLDOWN"
+          continue
+        fi
+      fi
+    else
+      ollama_failures=0
+    fi
+
+    if [[ -f "$SUP_DIR/cloudflared-ollama.conf" ]] && supervisor_program_running cloudflared-ollama; then
+      state=0
+      cloudflared_ready_state || state=$?
+      if [[ "$state" -eq 0 ]]; then
+        cloudflared_failures=0
+      elif [[ "$state" -eq 1 ]]; then
+        cloudflared_failures=$((cloudflared_failures + 1))
+        watchdog_log "cloudflared failed readiness check ${cloudflared_failures}/${WATCHDOG_FAILURES}."
+        if [[ "$cloudflared_failures" -ge "$WATCHDOG_FAILURES" ]]; then
+          watchdog_log "restarting cloudflared after repeated readiness failures."
+          supervisor_ctl restart cloudflared-ollama || watchdog_log "ERROR: Supervisor could not restart cloudflared."
+          cloudflared_failures=0
+          watchdog_sleep "$WATCHDOG_COOLDOWN"
+          continue
+        fi
+      else
+        cloudflared_failures=0
+      fi
+    else
+      cloudflared_failures=0
+    fi
+    watchdog_sleep "$WATCHDOG_INTERVAL"
+  done
+}
+
+show_watchdog(){
+  select_supervisor_paths
+  echo "--- Health watchdog ---"
+  if [[ -f "$SUP_DIR/ollama-watchdog.conf" ]]; then
+    echo "Config: $SUP_DIR/ollama-watchdog.conf"
+  else
+    echo "Not installed yet. Run: ola start (or a full setup)."
+    return 0
+  fi
+  if command -v supervisorctl >/dev/null 2>&1 && [[ -f "$SUP_CONF" ]]; then
+    supervisor_ctl status ollama-watchdog 2>/dev/null || echo "ollama-watchdog is not RUNNING."
+  else
+    echo "Supervisor is not installed/configured yet."
+  fi
+  local f
+  for f in "$LOG_DIR/ollama-watchdog.log" "$LOG_DIR/ollama-watchdog-error.log"; do
+    if [[ -r "$f" ]]; then
+      echo "===== $f ====="
+      tail -n 30 "$f"
+    elif [[ -f "$f" ]]; then
+      echo "===== $f ====="
+      echo "Not readable by this user (run watchdog as root)."
+    fi
+  done
+}
+
+show_doctor(){
+  local failures=0 warnings=0 cmd program version_json ollama_version tags_json ps_json model_names loaded_names
+  local model home_dir mem_kb disk_kb log_bytes public_url state validate_output
+  select_supervisor_paths
+  echo "--- Ola doctor ---"
+
+  for cmd in curl jq supervisorctl supervisord; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      ok "$cmd found"
+    else
+      err "$cmd not found"
+      failures=$((failures + 1))
+    fi
+  done
+  if ollama_bin_path >/dev/null 2>&1; then
+    ok "Ollama binary found: $(ollama_bin_path)"
+  else
+    err "Ollama binary not found"
+    failures=$((failures + 1))
+  fi
+  if command -v cloudflared >/dev/null 2>&1; then
+    ok "cloudflared found: $(cloudflared --version 2>&1 | head -n 1)"
+  else
+    err "cloudflared binary not found"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$SUP_CONF" ]]; then
+    ok "Supervisor config: $SUP_CONF"
+  else
+    err "Supervisor config not found: $SUP_CONF"
+    failures=$((failures + 1))
+  fi
+  if supervisor_is_running; then
+    ok "Supervisor is responding"
+  else
+    err "Supervisor is not responding (try: ola recover)"
+    failures=$((failures + 1))
+  fi
+
+  for program in ollama cloudflared-ollama; do
+    if supervisor_program_running "$program"; then
+      ok "$program is RUNNING"
+    else
+      err "$program is not RUNNING (try: ola recover)"
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ -f "$SUP_DIR/ollama-watchdog.conf" ]]; then
+    if supervisor_program_running ollama-watchdog; then
+      ok "ollama-watchdog is RUNNING"
+    else
+      warn "ollama-watchdog is configured but not RUNNING (try: ola start)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    warn "Health watchdog is not installed yet (run: ola start)"
+    warnings=$((warnings + 1))
+  fi
+
+  version_json=$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/version 2>/dev/null || true)
+  if [[ -n "$version_json" ]]; then
+    ollama_version=""
+    if command -v jq >/dev/null 2>&1; then
+      ollama_version=$(printf '%s' "$version_json" | jq -r '.version // empty' 2>/dev/null || true)
+    fi
+    [[ -n "$ollama_version" ]] || ollama_version="$version_json"
+    ok "Ollama local API: $ollama_version"
+  else
+    err "Ollama local API is not answering on 127.0.0.1:11434"
+    failures=$((failures + 1))
+  fi
+
+  model=$(saved_model_name)
+  home_dir=$(ollama_home_for_status)
+  tags_json=$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags 2>/dev/null || true)
+  model_names=""
+  loaded_names=""
+  if [[ -n "$tags_json" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      model_names=$(printf '%s' "$tags_json" | jq -r '.models[]?.name // empty' 2>/dev/null || true)
+      ps_json=$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/ps 2>/dev/null || true)
+      loaded_names=$(printf '%s' "$ps_json" | jq -r '.models[]?.name // empty' 2>/dev/null || true)
+    else
+      model_names=$(printf '%s' "$tags_json" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)
+    fi
+  fi
+  if [[ -n "$model_names" ]]; then
+    ok "Installed models: $(printf '%s' "$model_names" | tr '\n' ' ')"
+    if printf '%s\n' "$model_names" | grep -Fxq "$model"; then
+      ok "Default model is installed: $model"
+    else
+      err "Default model is not installed: $model"
+      failures=$((failures + 1))
+    fi
+  elif [[ -n "$version_json" ]]; then
+    warn "Could not list installed Ollama models"
+    warnings=$((warnings + 1))
+  fi
+  if [[ -n "$loaded_names" ]]; then
+    ok "Currently loaded: $(printf '%s' "$loaded_names" | tr '\n' ' ')"
+  else
+    info "No model currently loaded (it will load on the next request)."
+  fi
+
+  if supervisor_program_running cloudflared-ollama; then
+    state=0
+    cloudflared_ready_state || state=$?
+    if [[ "$state" -eq 0 ]]; then
+      ok "cloudflared readiness endpoint reports ready"
+    elif [[ "$state" -eq 1 ]]; then
+      err "cloudflared is RUNNING but reports not ready"
+      failures=$((failures + 1))
+    else
+      warn "cloudflared readiness endpoint unavailable; readiness is unknown"
+      warnings=$((warnings + 1))
+    fi
+  fi
+
+  if [[ -f "$CF_CONF_DIR/config.yml" ]] && command -v cloudflared >/dev/null 2>&1; then
+    if validate_output=$(cloudflared tunnel --config "$CF_CONF_DIR/config.yml" ingress validate 2>&1); then
+      ok "Cloudflare ingress config is valid"
+    else
+      warn "Cloudflare ingress validation did not pass: $validate_output"
+      warnings=$((warnings + 1))
+    fi
+  fi
+
+  mem_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    if [[ "$mem_kb" -lt 524288 ]]; then
+      warn "Available RAM is low: about $((mem_kb / 1024)) MB"
+      warnings=$((warnings + 1))
+    else
+      ok "Available RAM: about $((mem_kb / 1024)) MB"
+    fi
+  else
+    warn "Could not determine available RAM"
+    warnings=$((warnings + 1))
+  fi
+
+  disk_kb=$(free_kb "$home_dir")
+  if [[ "$disk_kb" -gt 0 && "$disk_kb" -lt 1048576 ]]; then
+    warn "Free disk space on $home_dir is low: about $((disk_kb / 1024)) MB"
+    warnings=$((warnings + 1))
+  elif [[ "$disk_kb" -gt 0 ]]; then
+    ok "Free disk space on $home_dir: about $((disk_kb / 1024)) MB"
+  fi
+
+  log_bytes=0
+  local f size
+  for f in "$LOG_DIR"/*.log; do
+    [[ -f "$f" ]] || continue
+    size=$(file_size "$f")
+    log_bytes=$((log_bytes + size))
+  done
+  ok "Supervisor logs currently use about $((log_bytes / 1024 / 1024)) MB (rotation is enabled)."
+
+  if [[ -r "$URL_FILE" ]]; then
+    public_url=$(head -n 1 "$URL_FILE")
+    if [[ -n "$public_url" ]]; then
+      if https_url_ready "${public_url}/api/version"; then
+        ok "Public URL answers: $public_url"
+      else
+        err "Public URL does not answer yet: $public_url"
+        failures=$((failures + 1))
+      fi
+    else
+      warn "Public URL file is empty: $URL_FILE"
+      warnings=$((warnings + 1))
+    fi
+  elif [[ -f "$URL_FILE" ]]; then
+    warn "Public URL is saved but is not readable by this user"
+    warnings=$((warnings + 1))
+  else
+    warn "No public URL saved yet"
+    warnings=$((warnings + 1))
+  fi
+
+  echo "--- Doctor summary: ${failures} failure(s), ${warnings} warning(s) ---"
+  [[ "$failures" -eq 0 ]]
+}
+
+run_ola_test(){
+  local failures=0 model version_json tags_json model_names payload response content public_url
+  local start_ms end_ms elapsed_ms
+  model=$(saved_model_name)
+  echo "--- Ola test ---"
+  info "Default model: $model"
+
+  start_ms=$(date +%s%3N)
+  if version_json=$(curl -fsS --max-time 15 http://127.0.0.1:11434/api/version 2>/dev/null); then
+    end_ms=$(date +%s%3N)
+    elapsed_ms=$((end_ms - start_ms))
+    ok "Local Ollama API: $version_json (${elapsed_ms} ms)"
+  else
+    err "Local Ollama API failed"
+    failures=$((failures + 1))
+    echo "--- Test summary: FAILED ---"
+    return 1
+  fi
+
+  if tags_json=$(curl -fsS --max-time 15 http://127.0.0.1:11434/api/tags 2>/dev/null); then
+    model_names=""
+    if command -v jq >/dev/null 2>&1; then
+      model_names=$(printf '%s' "$tags_json" | jq -r '.models[]?.name // empty' 2>/dev/null || true)
+    else
+      model_names=$(printf '%s' "$tags_json" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)
+    fi
+    if printf '%s\n' "$model_names" | grep -Fxq "$model"; then
+      ok "Model is installed: $model"
+    else
+      err "Model is not installed: $model"
+      failures=$((failures + 1))
+    fi
+  else
+    err "Could not list Ollama models"
+    failures=$((failures + 1))
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    payload=$(jq -cn --arg model "$model" '{model:$model, messages:[{role:"user", content:"Reply only with OK."}], stream:false}')
+    start_ms=$(date +%s%3N)
+    if response=$(curl -fsS --max-time 180 http://127.0.0.1:11434/api/chat -H 'Content-Type: application/json' -d "$payload" 2>/dev/null); then
+      end_ms=$(date +%s%3N)
+      elapsed_ms=$((end_ms - start_ms))
+      content=$(printf '%s' "$response" | jq -r '.message.content // .response // empty' 2>/dev/null || true)
+      [[ -n "$content" ]] || content="(empty response)"
+      ok "Local chat test (${elapsed_ms} ms): $content"
+    else
+      err "Local chat test failed for model: $model"
+      failures=$((failures + 1))
+    fi
+  else
+    err "jq is required for the chat test"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -r "$URL_FILE" ]]; then
+    public_url=$(head -n 1 "$URL_FILE")
+    if [[ -n "$public_url" ]] && https_url_ready "${public_url}/api/version"; then
+      ok "Public API answers: $public_url"
+    else
+      err "Public API does not answer: ${public_url:-unknown}"
+      failures=$((failures + 1))
+    fi
+  else
+    err "No readable public URL saved"
+    failures=$((failures + 1))
+  fi
+
+  if [[ "$failures" -eq 0 ]]; then
+    ok "All tests passed."
+  else
+    err "Test summary: ${failures} failure(s)."
+  fi
+  [[ "$failures" -eq 0 ]]
+}
+
+recover_services(){
+  local want_ollama=0 want_cloudflared=0 state
+  select_supervisor_paths
+  [[ -f "$SUP_DIR/ollama.conf" ]] && want_ollama=1
+  [[ -f "$SUP_DIR/cloudflared-ollama.conf" ]] && want_cloudflared=1
+  if [[ "$want_ollama" -eq 0 && "$want_cloudflared" -eq 0 ]]; then
+    die "No Ollama/cloudflared Supervisor programs are configured. Run setup first: ola setup"
+  fi
+
+  if [[ "$want_ollama" -eq 1 ]]; then
+    if ! supervisor_program_running ollama; then
+      info "Ollama is not RUNNING; starting it..."
+      supervisor_ctl start ollama 2>/dev/null || supervisor_ctl restart ollama \
+        || die "Could not start Ollama. Check: ola logs"
+    fi
+    wait_for_supervisor_program ollama 30 \
+      || die "Ollama did not reach RUNNING during recover. Check: ola logs"
+    if ! ollama_api_ready; then
+      warn "Ollama is RUNNING but its API is not answering; restarting Ollama once..."
+      supervisor_ctl restart ollama || die "Could not restart Ollama during recover."
+      wait_for_supervisor_program ollama 30 \
+        || die "Ollama did not reach RUNNING after recover restart."
+      ollama_api_ready || die "Ollama API still does not answer after recover. Check: ola logs"
+    fi
+    ok "Ollama recovered and answering locally."
+  fi
+
+  if [[ "$want_cloudflared" -eq 1 ]]; then
+    if ! supervisor_program_running cloudflared-ollama; then
+      info "cloudflared-ollama is not RUNNING; starting it..."
+      supervisor_ctl start cloudflared-ollama 2>/dev/null || supervisor_ctl restart cloudflared-ollama \
+        || die "Could not start cloudflared. Check: ola logs"
+    fi
+    wait_for_supervisor_program cloudflared-ollama 30 \
+      || die "cloudflared did not reach RUNNING during recover. Check: ola logs"
+    state=0
+    wait_cloudflared_ready 30 || state=$?
+    if [[ "$state" -eq 1 ]]; then
+      warn "cloudflared reports not ready; restarting it once..."
+      supervisor_ctl restart cloudflared-ollama || die "Could not restart cloudflared during recover."
+      wait_for_supervisor_program cloudflared-ollama 30 \
+        || die "cloudflared did not reach RUNNING after recover restart."
+      state=0
+      wait_cloudflared_ready 60 || state=$?
+      [[ "$state" -eq 1 ]] && die "cloudflared still reports not ready after recover. Check: ola logs"
+    fi
+    if [[ "$state" -eq 2 ]]; then
+      warn "cloudflared is RUNNING; readiness endpoint was unavailable, so no restart was forced."
+    else
+      ok "cloudflared recovered and ready."
+    fi
+  fi
+
+  echo
+  show_status
+  ok "Recover finished."
+}
+
 setup_all(){
   case "$CF_TUNNEL_PROTOCOL" in
     auto|http2|quic) ;;
@@ -984,6 +1478,7 @@ setup_all(){
   require_commands curl jq sha256sum tar awk sed grep find stat df
   ensure_service_users
   ensure_supervisor_running
+  ensure_watchdog
   install_ollama
   install_cloudflared
   ensure_service_users
@@ -1003,16 +1498,36 @@ setup_all(){
   echo
   show_status
   echo
-  ok "Setup finished. Logs: ola logs"
+  ok "Setup finished. Try: ola doctor, ola test, ola recover, ola logs"
   warn "Supervisor can restart processes, but 24/7 uptime still depends on the hosting platform keeping this container alive and starting Supervisor again after container restart."
 }
 
 case "${1:-}" in
-  --help|-h)
+  --help|-h|help)
     usage
     ;;
   status)
     show_status
+    ;;
+  doctor)
+    show_doctor
+    ;;
+  test)
+    run_ola_test
+    ;;
+  watchdog)
+    show_watchdog
+    ;;
+  watchdog-daemon)
+    require_root
+    run_watchdog_daemon
+    ;;
+  recover)
+    require_root
+    install_ola_command
+    require_supervisor_running
+    ensure_watchdog
+    recover_services
     ;;
   logs)
     show_logs
@@ -1026,6 +1541,7 @@ case "${1:-}" in
     require_root
     install_ola_command
     require_supervisor_running
+    ensure_watchdog
     restart_services
     ;;
   stop)
@@ -1040,21 +1556,29 @@ case "${1:-}" in
     echo "===================================="
     echo "1) Full setup (Ollama + model + tunnel)"
     echo "2) Status"
-    echo "3) Show logs"
-    echo "4) Start/restart Ollama and tunnel"
-    echo "5) Stop tunnel"
-    echo "6) Exit"
-    if ! choice=$(prompt_value "Choice [6]: " "6"); then
+    echo "3) Doctor (full diagnostic)"
+    echo "4) Test API + model"
+    echo "5) Show logs"
+    echo "6) Start/restart Ollama and tunnel"
+    echo "7) Recover stopped/unhealthy services"
+    echo "8) Watchdog status"
+    echo "9) Stop tunnel"
+    echo "10) Exit"
+    if ! choice=$(prompt_value "Choice [10]: " "10"); then
       warn "No input received; exiting."
       exit 0
     fi
     case "$choice" in
       1) require_root; check_system; setup_all ;;
       2) show_status ;;
-      3) show_logs ;;
-      4) require_root; install_ola_command; require_supervisor_running; restart_services ;;
-      5) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
-      6) exit 0 ;;
+      3) show_doctor ;;
+      4) run_ola_test ;;
+      5) show_logs ;;
+      6) require_root; install_ola_command; require_supervisor_running; ensure_watchdog; restart_services ;;
+      7) require_root; install_ola_command; require_supervisor_running; ensure_watchdog; recover_services ;;
+      8) show_watchdog ;;
+      9) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
+      10) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
     ;;
