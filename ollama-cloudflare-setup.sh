@@ -299,11 +299,14 @@ install_ollama(){
 
   ensure_service_users
 
+  # The tunnel deliberately exposes Ollama without Cloudflare Access. Ollama
+  # still rejects non-localhost origins by default (403 on /api/version), so
+  # allow public origins for the tunnel-facing API.
   cat > "$SUP_DIR/ollama.conf" <<EOF
 [program:ollama]
 command=$ollama_bin serve
 user=$OLLAMA_USER
-environment=OLLAMA_HOST="127.0.0.1:11434",OLLAMA_CONTEXT_LENGTH="1024",OLLAMA_KEEP_ALIVE="5m",HOME="$OLLAMA_HOME"
+environment=OLLAMA_HOST="127.0.0.1:11434",OLLAMA_ORIGINS="*",OLLAMA_CONTEXT_LENGTH="1024",OLLAMA_KEEP_ALIVE="5m",HOME="$OLLAMA_HOME"
 autostart=true
 autorestart=true
 startsecs=5
