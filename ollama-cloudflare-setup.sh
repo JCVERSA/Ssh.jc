@@ -479,12 +479,23 @@ unload_model(){
   local model=$1 payload names i
   is_valid_model_name "$model" || return 1
   payload=$(jq -cn --arg model "$model" '{model:$model, keep_alive:0}') || return 1
-  curl -fsS --max-time 30 http://127.0.0.1:11434/api/generate \
-    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1 || return 1
-  for i in $(seq 1 30); do
-    names=$(loaded_model_names) || return 1
-    model_names_contain "$names" "$model" || return 0
-    sleep 1
+  # A runner can take a few seconds to release a model after a request (and
+  # can still be busy finishing one). Do not give up after a single unload
+  # request: re-send the official keep_alive:0 request while polling /api/ps
+  # for about 30 seconds in total.
+  for _ in 1 2 3; do
+    if curl -fsS --max-time 30 http://127.0.0.1:11434/api/generate \
+      -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+      for i in $(seq 1 10); do
+        names=$(loaded_model_names) || return 1
+        model_names_contain "$names" "$model" || return 0
+        sleep 1
+      done
+    else
+      names=$(loaded_model_names) || return 1
+      model_names_contain "$names" "$model" || return 0
+      sleep 2
+    fi
   done
   return 1
 }
@@ -507,6 +518,31 @@ stop_loaded_models_except(){
       ok "Model unloaded from RAM: $loaded"
     fi
   done <<< "$loaded_names"
+}
+
+# Softer variant for benchmark / speed-apply sequences: if a model stays in
+# RAM after the retried unload (for example because it is still finishing a
+# request), warn and continue the sequence instead of aborting everything.
+# The next request still asks Ollama for the target model, and the server is
+# configured with OLLAMA_MAX_LOADED_MODELS=1. Strict callers (model switch,
+# deletion, setup) keep using stop_loaded_models_except above.
+stop_loaded_models_except_soft(){
+  local target=$1 target_norm loaded_names loaded
+  target_norm=$(normalize_model_name "$target")
+  loaded_names=$(loaded_model_names) \
+    || die "Could not read the list of models currently loaded in RAM from Ollama. Refusing to continue blindly."
+  while IFS= read -r loaded; do
+    [[ -n "$loaded" ]] || continue
+    if [[ "$(normalize_model_name "$loaded")" != "$target_norm" ]]; then
+      info "Unloading current model from RAM first: $loaded"
+      if unload_model "$loaded"; then
+        ok "Model unloaded from RAM: $loaded"
+      else
+        warn "Could not unload $loaded from RAM after repeated attempts (it may still be busy). Continuing the sequence: the next request will ask Ollama for $target, and Ollama is limited to one loaded model."
+      fi
+    fi
+  done <<< "$loaded_names"
+  return 0
 }
 
 pull_model_with_retry(){
@@ -1870,7 +1906,7 @@ run_bench(){
     model="${models_to_bench[$idx]}"
     echo
     echo "=== Modèle $((idx + 1))/${#models_to_bench[@]} : $model ==="
-    stop_loaded_models_except "$model"
+    stop_loaded_models_except_soft "$model"
     loaded=$(loaded_model_names 2>/dev/null || true)
     if model_names_contain "$loaded" "$model"; then
       info "Le modèle est déjà chargé en RAM."
@@ -2077,7 +2113,7 @@ apply_speed_mode(){
     info "Measuring current speed for every present model before the change (short test, one model at a time)..."
     for idx in "${!present_models[@]}"; do
       model="${present_models[$idx]}"
-      stop_loaded_models_except "$model"
+      stop_loaded_models_except_soft "$model"
       if res=$(measure_model_once "$model"); then
         before_labels[idx]=$(printf '%s' "$res" | cut -f4)
         before_ok[idx]=1
@@ -2119,7 +2155,7 @@ apply_speed_mode(){
     info "Verifying and measuring every present model after the change (same short test, one model at a time)..."
     for idx in "${!present_models[@]}"; do
       model="${present_models[$idx]}"
-      stop_loaded_models_except "$model"
+      stop_loaded_models_except_soft "$model"
       if res=$(measure_model_once "$model"); then
         after_labels[idx]=$(printf '%s' "$res" | cut -f4)
         verified_after=$((verified_after + 1))

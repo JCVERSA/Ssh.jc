@@ -806,6 +806,8 @@ Il affiche pour chaque run le temps total, le temps de chargement, la vitesse du
 
 Un modèle peut refuser `think:false` s’il n’a pas de mode réflexion : le bench le signale pour ce modèle précis et continue avec les autres. Si un run échoue, la synthèse le marque sans empêcher les autres modèles d’être testés.
 
+Si un modèle met du temps à sortir de la RAM (runner encore occupé à terminer une requête), la demande de déchargement `keep_alive: 0` est renvoyée plusieurs fois pendant environ 30 secondes. Si le modèle reste malgré tout chargé, le bench avertit et continue la séquence en demandant le modèle suivant à Ollama (le serveur reste limité à un modèle chargé) au lieu d’abandonner tous les modèles restants. Les opérations strictes (`ola use`, `ola delete`, setup) gardent en revanche le blocage : elles exigent que le déchargement soit confirmé.
+
 `ola bench` ne change ni la configuration ni les fichiers des modèles, mais il peut charger/décharger des modèles en RAM pendant la séquence.
 
 ### Voir l’état avec `ola speed`
@@ -843,6 +845,8 @@ Ce que fait la commande, dans l’ordre :
 6. affiche combien de modèles présents ont passé la vérification.
 
 Si Ollama ne revient pas, ou si un modèle qui répondait avant le changement ne répond plus après, la commande **restaure automatiquement l’ancienne configuration** et l’ancien mode, puis redémarre Ollama : tu ne restes pas avec un réglage cassé. Un modèle qui ne répondait déjà pas avant le changement est signalé, mais ne déclenche pas à lui seul le retour arrière.
+
+Pendant ces mesures un par un, si un modèle tarde à se décharger de la RAM, la séquence réessaie puis continue avec le modèle suivant (même comportement que `ola bench`) au lieu d’abandonner toute la commande avant même le changement de configuration.
 
 Ce que `ola speed apply` ne change **jamais** :
 
@@ -902,6 +906,18 @@ Mesures de référence obtenues avec `ola bench` et `ola speed apply` sur un san
 | `speed`, modèle déjà chargé | `think:false` | 2,9 s | 0,0 s | 14,4 tok/s | 40 | oui |
 
 La mesure intégrée à `ola speed apply` a donné, sur son test court : **15,1 tok/s avant** puis **13,7 tok/s après**. Le bench complet suivant, à chaud, a mesuré **14,4 tok/s** en mode `speed`. Ces valeurs courtes varient sensiblement d’un run à l’autre.
+
+#### Bench global réel : 3 modèles présents
+
+Plus tard, le même sandbox contenait trois modèles et `ola bench` les a testés un par un (le modèle par défaut de ce run était `qwen3:0.6b`, donc testé en dernier) :
+
+| Modèle | Thinking par défaut | `think:false` | Génération `think:false` | Lecture |
+|---|---:|---:|---:|---|
+| `qwen2.5-coder:1.5b` | 5,6 s (chargement 3,3 s) | 1,5 s | 18,0 tok/s | le verdict « ~73 % » inclut le chargement initial |
+| `qwen3:1.7b` | 7,0 s, réponse vide | 3,2 s | 14,5 tok/s | le thinking a consommé les 48 tokens |
+| `qwen3:0.6b` | 2,6 s, réponse vide | 1,1 s | 39,8 tok/s | environ 2,7× la génération de `qwen3:1.7b` sur ce test |
+
+Dans ce bench global, la vitesse brute de génération classait donc : `qwen3:0.6b` (~39,8 tok/s) > `qwen2.5-coder:1.5b` (~18,0 tok/s) > `qwen3:1.7b` (~14,5 tok/s). Le bench mesure la vitesse, pas la qualité des réponses : choisis le modèle selon les deux.
 
 Interprétation honnête :
 
@@ -1273,6 +1289,29 @@ ola bench
 Vérifie aussi que tes requêtes simples utilisent `"think": false` et `"stream": true` (voir [Pack Speed](#vitesse--mesurer-et-optimiser-pack-speed)).
 
 Évite d’augmenter `OLLAMA_CONTEXT_LENGTH` sur un sandbox de 2 Go sans tester progressivement.
+
+### Un modèle refuse de se décharger de la RAM
+
+Symptôme possible pendant un bench global ou un `ola speed apply` :
+
+```text
+Could not unload the currently loaded model: <modèle>. It may be busy; try again in a moment.
+```
+
+ou, avec le comportement actuel des séquences de bench/apply, un avertissement indiquant que le modèle reste chargé après plusieurs tentatives puis que la séquence continue.
+
+Causes probables : le runner finit encore une requête (parfois une requête d’une application cliente connectée au tunnel), ou il met quelques secondes à se libérer après un test. Le déchargement renvoie maintenant la demande officielle `keep_alive: 0` plusieurs fois pendant environ 30 secondes.
+
+Conduite à tenir :
+
+1. vérifie ce qui est chargé : `ola ps` ;
+2. arrête ou attends la fin des requêtes clientes en cours sur ce modèle ;
+3. réessaie : `ola unload <modèle>`, puis `ola ps` ;
+4. pour `ola bench` et `ola speed apply`, tu peux relancer la commande : la séquence continue modèle par modèle même si l’un d’eux tarde à se libérer ;
+5. pour `ola use` et `ola delete`, le blocage est volontaire : l’ancien modèle doit être confirmé déchargé avant de continuer. Attends la fin de la requête en cours, puis réessaie ;
+6. si le modèle reste chargé sans aucune requête en cours, consulte `ola logs` et `ola doctor`.
+
+Si `ola speed apply` s’est arrêté sur ce message **pendant les mesures « avant »**, aucun réglage serveur n’a encore été appliqué : mets `ola` à jour, puis relance simplement `ola speed apply`.
 
 ### cloudflared n’est pas prêt ou QUIC échoue
 
