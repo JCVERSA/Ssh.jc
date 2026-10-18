@@ -300,8 +300,10 @@ install_ollama(){
   ensure_service_users
 
   # The tunnel deliberately exposes Ollama without Cloudflare Access. Ollama
-  # still rejects non-localhost origins by default (403 on /api/version), so
-  # allow public origins for the tunnel-facing API.
+  # has two separate 403 guards: OLLAMA_ORIGINS controls browser Origin
+  # headers, while its Host check rejects public tunnel hostnames. The
+  # origin allow-list is opened here, and cloudflared rewrites the Host
+  # header to localhost:11434 in both tunnel modes below.
   cat > "$SUP_DIR/ollama.conf" <<EOF
 [program:ollama]
 command=$ollama_bin serve
@@ -444,7 +446,7 @@ configure_quick_tunnel(){
 
   cat > "$SUP_DIR/cloudflared-ollama.conf" <<EOF
 [program:cloudflared-ollama]
-command=$cloudflared_bin tunnel --no-autoupdate --url http://127.0.0.1:11434
+command=$cloudflared_bin tunnel --no-autoupdate --url http://127.0.0.1:11434 --http-host-header=localhost:11434
 user=$CLOUDFLARED_USER
 environment=HOME="$CF_CONF_DIR"
 autostart=true
@@ -556,6 +558,8 @@ no-autoupdate: true
 ingress:
   - hostname: $hostname
     service: http://127.0.0.1:11434
+    originRequest:
+      httpHostHeader: "localhost:11434"
   - service: http_status:404
 EOF
   chown root:"$CLOUDFLARED_USER" "$CF_CONF_DIR/config.yml"
