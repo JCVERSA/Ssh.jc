@@ -919,6 +919,20 @@ Plus tard, le même sandbox contenait trois modèles et `ola bench` les a testé
 
 Dans ce bench global, la vitesse brute de génération classait donc : `qwen3:0.6b` (~39,8 tok/s) > `qwen2.5-coder:1.5b` (~18,0 tok/s) > `qwen3:1.7b` (~14,5 tok/s). Le bench mesure la vitesse, pas la qualité des réponses : choisis le modèle selon les deux.
 
+#### `ola speed apply` global réel : vérification 3/3
+
+Après le correctif de déchargement résilient, `ola speed apply` a ensuite été relancé sur ces trois mêmes modèles. Chaque modèle a été mesuré avant, déchargé, puis remesuré après l’activation du mode `speed` :
+
+| Modèle | Avant | Après | Écart sur ce run unique |
+|---|---:|---:|---:|
+| `qwen2.5-coder:1.5b` | 16,6 tok/s | 18,2 tok/s | +9,6 % |
+| `qwen3:1.7b` | 14,2 tok/s | 14,8 tok/s | +4,2 % |
+| `qwen3:0.6b` | 39,3 tok/s | 39,4 tok/s | +0,3 % |
+
+Résultat : **vérification réussie pour 3/3 modèles présents**, aucun retour arrière, et mode `speed` actif pour tout le serveur Ollama. Le déchargement de `qwen2.5-coder:1.5b`, qui avait bloqué le premier essai, est passé cette fois.
+
+Ces écarts positifs restent modestes et ne reposent que sur un seul test court par modèle : ils ne suffisent pas à attribuer un gain précis à Flash Attention ou au cache KV `q8_0`. Le résultat solidement démontré ici est la **couverture globale sans régression mesurée sur ce run** ; pour prouver un gain modèle par modèle, il faudrait répéter plusieurs benchs à chaud en `balanced` puis en `speed`.
+
 Interprétation honnête :
 
 - **Le gain clairement démontré vient de `think:false`, pas d’une génération brute plus rapide.** La génération reste autour de 12,6 à 14,4 tok/s dans ces tests ; `think:false` supprime surtout les tokens de réflexion invisibles, donc la réponse utile arrive plus tôt.
@@ -939,7 +953,7 @@ ola bench          # comparer à nouveau ; répéter si les écarts sont faibles
 
 ### Limites honnêtes
 
-- Aucun réglage ne promet un gain précis : l’effet de Flash Attention et du cache `q8_0` dépend du modèle, du CPU et de la version d’Ollama ; c’est pour cela que `ola speed apply` mesure avant/après au lieu de promettre un chiffre. Sur le sandbox de référence ci-dessus, aucun gain `speed` n’a été démontré sur prompts courts.
+- Aucun réglage ne promet un gain précis : l’effet de Flash Attention et du cache `q8_0` dépend du modèle, du CPU et de la version d’Ollama ; c’est pour cela que `ola speed apply` mesure avant/après au lieu de promettre un chiffre. Sur le sandbox de référence ci-dessus, les écarts `speed` observés sur prompts courts sont faibles ou variables ; aucun gain précis et reproductible n’a encore été démontré.
 - La qualité peut très légèrement varier avec un cache KV quantifié ; `q8_0` est le réglage prudent (le `q4_0`, plus agressif, n’est pas utilisé ici).
 - Si le modèle ne supporte pas le mode réflexion, `think:false` peut être refusé : `ola bench` te le signale et il suffit d’ignorer ce réglage pour ce modèle.
 - Le levier le plus radical reste un modèle plus petit, par exemple `ola use qwen3:0.6b` (environ 523 Mo) si la qualité suffit.
