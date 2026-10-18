@@ -35,11 +35,12 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|use|ps|unload|logs|restart|stop|watchdog]"
+  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, start, recover, use, unload, restart and stop require root; status, doctor, test, ps, logs and watchdog are read-only."
-  echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola start | ola logs"
+  echo "setup, start, recover, use, unload, delete, restart and stop require root; status, doctor, test, models, ps, logs and watchdog are read-only."
+  echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."
+  echo "ola delete (alias: ola rm) unloads the model from RAM first, then permanently deletes it from disk."
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
 
@@ -555,6 +556,89 @@ unload_models_command(){
     stop_loaded_models_except ""
     ok "All loaded models have been unloaded from RAM. The Ollama service itself is still running."
   fi
+}
+
+
+show_installed_models(){
+  local names
+  require_commands curl jq
+  if ! names=$(installed_model_names); then
+    die "Ollama API is not answering, so installed models cannot be listed. Try: ola recover"
+  fi
+  if [[ -z "$names" ]]; then
+    echo "No model is currently downloaded on disk."
+  else
+    echo "Models currently downloaded on disk:"
+    printf '%s\n' "$names"
+  fi
+}
+
+delete_model_command(){
+  local target=$1 force=${2:-0} ollama_bin installed_names loaded_names current_default payload remaining new_default i
+  is_valid_model_name "$target" || die "Invalid model name: $target (example: llama3.2:1b)"
+  require_commands curl jq
+  ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
+
+  if ! supervisor_program_running ollama; then
+    info "Ollama is not RUNNING; starting it before deleting the model..."
+    supervisor_ctl start ollama 2>/dev/null || supervisor_ctl restart ollama \
+      || die "Could not start Ollama. Check: ola logs"
+    wait_for_supervisor_program ollama 30 || die "Ollama did not reach RUNNING. Check: ola logs"
+  fi
+  ollama_api_ready || die "Ollama API is not answering. Try: ola recover"
+
+  installed_names=$(installed_model_names) \
+    || die "Could not read the installed model list from Ollama."
+  if ! model_names_contain "$installed_names" "$target"; then
+    ok "Model is not downloaded on disk: $target"
+    return 0
+  fi
+
+  current_default=$(saved_model_name)
+  if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$target")" && "$force" -ne 1 ]]; then
+    die "Refusing to delete the current default model '$target'. Switch first with: ola use <another-model> — or force it with: ola delete $target --force"
+  fi
+
+  loaded_names=$(loaded_model_names) || die "Could not list models loaded in RAM."
+  if model_names_contain "$loaded_names" "$target"; then
+    info "Model is loaded in RAM; unloading it before disk deletion: $target"
+    unload_model "$target" \
+      || die "Could not unload model $target from RAM. It may be busy; try again in a moment."
+    ok "Model unloaded from RAM: $target"
+  fi
+
+  warn "Permanently deleting model from disk: $target"
+  payload=$(jq -cn --arg model "$target" '{model:$model}') || die "Could not build the model deletion request."
+  if ! curl -fsS --max-time 60 -X DELETE http://127.0.0.1:11434/api/delete \
+    -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+    warn "The Ollama delete API did not accept the request; trying the Ollama CLI fallback..."
+    "$ollama_bin" rm "$target" \
+      || die "Could not delete model: $target. Check the exact name with: ola models"
+  fi
+
+  for i in $(seq 1 30); do
+    installed_names=$(installed_model_names) || die "Could not verify model deletion."
+    model_names_contain "$installed_names" "$target" || break
+    if [[ "$i" -eq 30 ]]; then
+      die "Model $target still appears in the installed list after deletion. Check: ola logs"
+    fi
+    sleep 1
+  done
+
+  if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$target")" ]]; then
+    remaining=$(installed_model_names) || die "Model deleted, but the remaining model list could not be read."
+    if [[ -n "$remaining" ]]; then
+      new_default=$(printf '%s\n' "$remaining" | head -n 1)
+      printf '%s\n' "$new_default" > "$MODEL_FILE" \
+        || die "Model deleted, but the new default model could not be saved."
+      chmod 600 "$MODEL_FILE" || die "Could not set permissions on $MODEL_FILE."
+      warn "Default model was deleted; the new default is: $new_default"
+    else
+      rm -f "$MODEL_FILE"
+      warn "Default model was deleted and no downloaded model remains. Install one with: ola use <model>"
+    fi
+  fi
+  ok "Model permanently deleted from disk: $target"
 }
 
 switch_model(){
@@ -1691,8 +1775,29 @@ case "${1:-}" in
     ensure_watchdog
     switch_model "$2"
     ;;
+  models)
+    show_installed_models
+    ;;
   ps)
     show_loaded_models
+    ;;
+  delete|rm)
+    require_root
+    if [[ -z "${2:-}" ]]; then
+      err "Usage: ola delete <model> [--force] (example: ola delete llama3.2:1b)"
+      exit 1
+    fi
+    delete_force=0
+    if [[ "${3:-}" == "--force" ]]; then
+      delete_force=1
+    elif [[ -n "${3:-}" ]]; then
+      err "Unknown delete option: $3 (only --force is supported)"
+      exit 1
+    fi
+    install_ola_command
+    require_supervisor_running
+    ensure_watchdog
+    delete_model_command "$2" "$delete_force"
     ;;
   unload)
     require_root
@@ -1749,10 +1854,11 @@ case "${1:-}" in
     echo "7) Recover stopped/unhealthy services"
     echo "8) Use another model (unload current from RAM first)"
     echo "9) Unload loaded model(s) from RAM"
-    echo "10) Watchdog status"
-    echo "11) Stop tunnel"
-    echo "12) Exit"
-    if ! choice=$(prompt_value "Choice [12]: " "12"); then
+    echo "10) Delete a model from disk"
+    echo "11) Watchdog status"
+    echo "12) Stop tunnel"
+    echo "13) Exit"
+    if ! choice=$(prompt_value "Choice [13]: " "13"); then
       warn "No input received; exiting."
       exit 0
     fi
@@ -1784,9 +1890,34 @@ case "${1:-}" in
         fi
         unload_models_command "$model_choice"
         ;;
-      10) show_watchdog ;;
-      11) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
-      12) exit 0 ;;
+      10)
+        require_root
+        install_ola_command
+        require_supervisor_running
+        ensure_watchdog
+        show_installed_models || true
+        if ! model_choice=$(prompt_value "Model to permanently delete from disk: " ""); then
+          die "No model received; cancelling deletion."
+        fi
+        delete_force=0
+        current_default=$(saved_model_name)
+        if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$model_choice")" ]]; then
+          if ! confirm_choice=$(prompt_value "This is the default model. Type DELETE to force deletion: " ""); then
+            die "No confirmation received; cancelling deletion."
+          fi
+          [[ "$confirm_choice" == "DELETE" ]] || die "Deletion cancelled."
+          delete_force=1
+        else
+          if ! confirm_choice=$(prompt_value "Type DELETE to confirm permanent disk deletion: " ""); then
+            die "No confirmation received; cancelling deletion."
+          fi
+          [[ "$confirm_choice" == "DELETE" ]] || die "Deletion cancelled."
+        fi
+        delete_model_command "$model_choice" "$delete_force"
+        ;;
+      11) show_watchdog ;;
+      12) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
+      13) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
     ;;
