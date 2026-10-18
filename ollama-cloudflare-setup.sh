@@ -41,6 +41,7 @@ usage(){
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."
   echo "ola delete (alias: ola rm) unloads the model from RAM first, then permanently deletes it from disk."
+  echo "In an interactive terminal, ola models opens a model manager: u=use, d=delete, l=unload from RAM, a=add+use, q=quit."
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
 }
 
@@ -558,6 +559,177 @@ unload_models_command(){
   fi
 }
 
+
+
+format_model_size(){
+  local bytes=${1:-0}
+  if [[ ! "$bytes" =~ ^[0-9]+$ ]] || [[ "$bytes" -eq 0 ]]; then
+    printf '%s' "taille inconnue"
+  elif [[ "$bytes" -ge 1073741824 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.1f GB", b / 1073741824 }'
+  elif [[ "$bytes" -ge 1048576 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.1f MB", b / 1048576 }'
+  elif [[ "$bytes" -ge 1024 ]]; then
+    awk -v b="$bytes" 'BEGIN { printf "%.1f KB", b / 1024 }'
+  else
+    printf '%s B' "$bytes"
+  fi
+}
+
+read_model_action(){
+  local -n _action_ref=$1
+  local raw=""
+  _action_ref=""
+  # Read a whole line (key + Enter), not a single raw character: with a PTY,
+  # Bash single-character reads can lose already-typed input after external
+  # commands run. A line-based read is the reliable interactive behaviour.
+  if ! IFS= read -r -p "Action (u utiliser, d supprimer, l libérer RAM, a ajouter+utiliser, r rafraîchir, q quitter, puis Entrée) : " raw; then
+    return 1
+  fi
+  _action_ref=${raw:0:1}
+}
+
+read_manager_value(){
+  local -n _value_ref=$1
+  local prompt=$2 default=${3-}
+  local value
+  _value_ref=""
+  if ! IFS= read -r -p "$prompt" value; then
+    return 1
+  fi
+  _value_ref=${value:-$default}
+}
+
+selected_model_from_prompt(){
+  local -n _selected_ref=$1
+  local idx=""
+  _selected_ref=""
+  if ! read_manager_value idx "Numéro du modèle : " ""; then
+    return 1
+  fi
+  [[ "$idx" =~ ^[0-9]+$ ]] || return 1
+  [[ "$idx" -ge 1 && "$idx" -le ${#MODEL_MANAGER_NAMES[@]} ]] || return 1
+  _selected_ref=${MODEL_MANAGER_NAMES[$((idx - 1))]}
+}
+
+model_manager(){
+  local tags_json loaded_names current_default rows name size markers action selected confirm prereqs_done=0 i
+  require_commands curl jq
+  while true; do
+    if ! tags_json=$(curl -fsS --max-time 10 http://127.0.0.1:11434/api/tags 2>/dev/null); then
+      die "Ollama API is not answering, so models cannot be managed. Try: ola recover"
+    fi
+    loaded_names=$(loaded_model_names 2>/dev/null || true)
+    current_default=$(saved_model_name)
+    MODEL_MANAGER_NAMES=()
+    local model_sizes=()
+    rows=$(printf '%s' "$tags_json" | jq -r '.models[]? | [.name, ((.size // 0) | tostring)] | @tsv' 2>/dev/null || true)
+    while IFS=$'\t' read -r name size; do
+      [[ -n "$name" ]] || continue
+      MODEL_MANAGER_NAMES+=("$name")
+      model_sizes+=("${size:-0}")
+    done <<< "$rows"
+
+    echo
+    echo "================ Modèles Ollama ================"
+    if [[ ${#MODEL_MANAGER_NAMES[@]} -eq 0 ]]; then
+      echo "Aucun modèle téléchargé pour le moment."
+    else
+      for i in "${!MODEL_MANAGER_NAMES[@]}"; do
+        markers=""
+        if [[ "$(normalize_model_name "${MODEL_MANAGER_NAMES[$i]}")" == "$(normalize_model_name "$current_default")" ]]; then
+          markers="$markers [défaut]"
+        fi
+        if model_names_contain "$loaded_names" "${MODEL_MANAGER_NAMES[$i]}"; then
+          markers="$markers [RAM]"
+        fi
+        printf '%2d) %-32s %14s%s\n' "$((i + 1))" "${MODEL_MANAGER_NAMES[$i]}" "$(format_model_size "${model_sizes[$i]}")" "$markers"
+      done
+    fi
+    echo "--------------------------------------------------"
+    echo "u = utiliser    d = supprimer    l = libérer la RAM"
+    echo "a = ajouter + utiliser un autre modèle"
+    echo "r = rafraîchir  q = quitter"
+    if [[ $EUID -ne 0 ]]; then
+      echo "Mode lecture seule : lance ola models en root pour utiliser/supprimer."
+    fi
+
+    if ! read_model_action action; then
+      echo
+      break
+    fi
+    action=${action,,}
+
+    case "$action" in
+      q|"")
+        [[ "$action" == "q" ]] && break
+        ;;
+      r)
+        ;;
+      a)
+        if [[ $EUID -ne 0 ]]; then
+          warn "Root requis pour ajouter/utiliser un modèle. Relance : sudo ola models"
+          continue
+        fi
+        if [[ "$prereqs_done" -eq 0 ]]; then
+          install_ola_command < /dev/null
+          require_supervisor_running < /dev/null
+          ensure_watchdog < /dev/null
+          prereqs_done=1
+        fi
+        if ! read_manager_value selected "Nom du modèle à télécharger et utiliser : " ""; then
+          warn "Ajout annulé."
+          continue
+        fi
+        [[ -n "$selected" ]] || { warn "Nom de modèle vide; ajout annulé."; continue; }
+        switch_model "$selected" < /dev/null
+        ;;
+      u|d|l)
+        if [[ ${#MODEL_MANAGER_NAMES[@]} -eq 0 ]]; then
+          warn "Aucun modèle à gérer. Utilise 'a' pour en ajouter un."
+          continue
+        fi
+        if ! selected_model_from_prompt selected; then
+          warn "Numéro invalide; action annulée."
+          continue
+        fi
+        if [[ $EUID -ne 0 ]]; then
+          warn "Root requis pour cette action. Relance : sudo ola models"
+          continue
+        fi
+        if [[ "$prereqs_done" -eq 0 ]]; then
+          install_ola_command < /dev/null
+          require_supervisor_running < /dev/null
+          ensure_watchdog < /dev/null
+          prereqs_done=1
+        fi
+        case "$action" in
+          u)
+            switch_model "$selected" < /dev/null
+            ;;
+          l)
+            unload_models_command "$selected" < /dev/null
+            ;;
+          d)
+            if ! read_manager_value confirm "Suppression définitive du disque. Tape DELETE pour confirmer : " ""; then
+              warn "Suppression annulée."
+              continue
+            fi
+            [[ "$confirm" == "DELETE" ]] || { warn "Suppression annulée."; continue; }
+            if [[ "$(normalize_model_name "$current_default")" == "$(normalize_model_name "$selected")" ]]; then
+              delete_model_command "$selected" 1 < /dev/null
+            else
+              delete_model_command "$selected" 0 < /dev/null
+            fi
+            ;;
+        esac
+        ;;
+      *)
+        warn "Action inconnue : $action"
+        ;;
+    esac
+  done
+}
 
 show_installed_models(){
   local names
@@ -1776,7 +1948,11 @@ case "${1:-}" in
     switch_model "$2"
     ;;
   models)
-    show_installed_models
+    if [[ -t 0 && -t 1 ]]; then
+      model_manager
+    else
+      show_installed_models
+    fi
     ;;
   ps)
     show_loaded_models
