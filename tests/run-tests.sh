@@ -154,6 +154,14 @@ fi
 bash "$ARTIFACT" --help > "$OUT/help.log" 2>&1
 check "$OUT/help.log" "ola tui opens" "help documents ola tui"
 check "$OUT/help.log" "ola bench --stream" "help documents streaming bench"
+check "$OUT/help.log" "ola update downloads" "help documents ola update"
+if (cd "$ROOT" && sha256sum -c ollama-cloudflare-setup.sh.sha256 > "$OUT/artifact-sha256.log" 2>&1); then
+  echo "PASS: published artifact SHA-256 matches"
+  pass=$((pass + 1))
+else
+  echo "FAIL: published artifact SHA-256 mismatch (see $OUT/artifact-sha256.log)"
+  fail=$((fail + 1))
+fi
 
 # --- Fluid status / warm / preset --------------------------------------------
 reset_case
@@ -267,6 +275,93 @@ reset_case
 run doctor > "$OUT/doctor.log" 2>&1; echo "doctor exit=$?"
 check "$OUT/doctor.log" "Textual TUI is not installed/ready" "doctor reports optional TUI state"
 check "$OUT/doctor.log" "Doctor summary: 0 failure(s)" "doctor has no failures"
+
+# --- Self-update -----------------------------------------------------------------
+export OLA_UPDATE_URL="https://updates.example.test/ollama-cloudflare-setup.sh"
+export OLA_UPDATE_SHA256_URL="https://updates.example.test/ollama-cloudflare-setup.sh.sha256"
+
+reset_case
+run start > "$OUT/update-prepare.log" 2>&1
+cp "$ARTIFACT" "$TEST_STATE/update-artifact.sh"
+printf '\n# ola update test candidate\n' >> "$TEST_STATE/update-artifact.sh"
+update_candidate_hash=$(sha256sum "$TEST_STATE/update-artifact.sh" | awk 'NR == 1 { print $1 }')
+printf '%s  ollama-cloudflare-setup.sh\n' "$update_candidate_hash" > "$TEST_STATE/update-artifact.sha256"
+update_install_dir="$TEST_LOCAL/lib/ollama-cloudflare"
+mkdir -p "$update_install_dir/update.lock"
+printf '999999\n' > "$update_install_dir/update.lock/pid"
+touch -d '2 hours ago' "$update_install_dir/update.lock"
+run update > "$OUT/update.log" 2>&1; update_exit=$?
+echo "update exit=$update_exit"
+check "$OUT/update.log" "Mise à jour de ola installée" "ola update installs a verified candidate"
+if cmp -s "$TEST_STATE/update-artifact.sh" "$update_install_dir/ollama-cloudflare-setup.sh"; then
+  echo "PASS: ola update replaces the installed artifact"
+  pass=$((pass + 1))
+else
+  echo "FAIL: ola update did not replace the installed artifact"
+  fail=$((fail + 1))
+fi
+check_file "$update_install_dir/backup/ollama-cloudflare-setup.sh.bak" "ola update keeps the previous artifact"
+check_absent "$update_install_dir/backup/ollama-cloudflare-setup.sh.bak" "ola update test candidate" "ola update backup is the previous version"
+if [[ ! -d "$update_install_dir/update.lock" ]]; then
+  echo "PASS: ola update releases its lock and cleans a stale lock"
+  pass=$((pass + 1))
+else
+  echo "FAIL: ola update left its lock behind"
+  fail=$((fail + 1))
+fi
+
+run update > "$OUT/update-current.log" 2>&1; update_current_exit=$?
+echo "update already-current exit=$update_current_exit"
+check "$OUT/update-current.log" "ola est déjà à jour" "ola update reports an already-current artifact"
+
+sleep 20 &
+update_lock_pid=$!
+mkdir -p "$update_install_dir/update.lock"
+printf '%s\n' "$update_lock_pid" > "$update_install_dir/update.lock/pid"
+run update > "$OUT/update-locked.log" 2>&1; update_locked_exit=$?
+kill "$update_lock_pid" 2>/dev/null || true
+wait "$update_lock_pid" 2>/dev/null || true
+rm -rf "$update_install_dir/update.lock"
+echo "update locked exit=$update_locked_exit"
+check "$OUT/update-locked.log" "déjà en cours" "ola update refuses a concurrent update"
+
+reset_case
+run start > "$OUT/update-bad-prepare.log" 2>&1
+update_before_hash=$(sha256sum "$update_install_dir/ollama-cloudflare-setup.sh" | awk 'NR == 1 { print $1 }')
+cp "$ARTIFACT" "$TEST_STATE/update-artifact.sh"
+printf '\n# ola update bad checksum candidate\n' >> "$TEST_STATE/update-artifact.sh"
+printf '%s  ollama-cloudflare-setup.sh\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$TEST_STATE/update-artifact.sha256"
+run update > "$OUT/update-bad-checksum.log" 2>&1; update_bad_exit=$?
+update_after_hash=$(sha256sum "$update_install_dir/ollama-cloudflare-setup.sh" | awk 'NR == 1 { print $1 }')
+echo "update bad checksum exit=$update_bad_exit"
+check "$OUT/update-bad-checksum.log" "SHA-256 différent" "ola update rejects a checksum mismatch"
+if [[ "$update_bad_exit" -ne 0 && "$update_before_hash" == "$update_after_hash" ]]; then
+  echo "PASS: rejected update leaves the installed artifact unchanged"
+  pass=$((pass + 1))
+else
+  echo "FAIL: rejected update changed the installed artifact or exited zero"
+  fail=$((fail + 1))
+fi
+
+reset_case
+run start > "$OUT/update-rollback-prepare.log" 2>&1
+cp "$ARTIFACT" "$TEST_STATE/update-artifact.sh"
+printf '\n# ola update rollback candidate\n' >> "$TEST_STATE/update-artifact.sh"
+update_candidate_hash=$(sha256sum "$TEST_STATE/update-artifact.sh" | awk 'NR == 1 { print $1 }')
+printf '%s  ollama-cloudflare-setup.sh\n' "$update_candidate_hash" > "$TEST_STATE/update-artifact.sha256"
+touch "$TEST_STATE/fail-restart"
+run update > "$OUT/update-rollback.log" 2>&1; update_rollback_exit=$?
+echo "update rollback exit=$update_rollback_exit"
+check "$OUT/update-rollback.log" "Mise à jour échouée" "ola update reports rollback after restart failure"
+check_absent "$update_install_dir/ollama-cloudflare-setup.sh" "ola update rollback candidate" "ola update rollback restores the previous artifact"
+if [[ "$update_rollback_exit" -ne 0 ]]; then
+  echo "PASS: failed post-update restart exits nonzero"
+  pass=$((pass + 1))
+else
+  echo "FAIL: failed post-update restart should exit nonzero"
+  fail=$((fail + 1))
+fi
+unset OLA_UPDATE_URL OLA_UPDATE_SHA256_URL
 
 # --- Python/Textual pilot tests ------------------------------------------------
 TUI_PYTHON=${OLA_TUI_TEST_PYTHON:-python3}

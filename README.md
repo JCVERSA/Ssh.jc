@@ -433,6 +433,7 @@ Attention : après avoir changé `OLLAMA_CONTEXT_LENGTH` ou `CF_TUNNEL_PROTOCOL`
 |---|---|
 | `/usr/local/bin/ola` | Commande courte, lien vers le script installé |
 | `/usr/local/lib/ollama-cloudflare/ollama-cloudflare-setup.sh` | Copie stable du gestionnaire |
+| `/usr/local/lib/ollama-cloudflare/backup/` | Version précédente conservée par `ola update` pour le retour arrière |
 | `/usr/local/lib/ollama-cloudflare/ola_tui.py` | Application Textual extraite depuis l’artefact unique |
 | `/usr/local/lib/ollama-cloudflare/tui-requirements.txt` | Versions Python/Textual épinglées pour la TUI |
 | `/usr/local/lib/ollama-cloudflare/tui-venv/` | Environnement Python isolé de la TUI, créé par le setup ou `ola tui install` |
@@ -534,6 +535,7 @@ En root, lance-les simplement. Depuis un utilisateur administrateur, utilise `su
 | `ola status` | Affiche Supervisor, l’API locale, les modèles connus et l’URL publique enregistrée. |
 | `ola doctor` | Diagnostic complet : binaires, Supervisor, services, API, modèles, tunnel, RAM, disque, logs et URL publique. |
 | `ola test` | Teste l’API locale, vérifie le modèle par défaut, fait une mini-conversation et teste l’URL publique. |
+| `ola update` | Met à jour le gestionnaire `ola` et les fichiers de la TUI depuis la version publiée sur GitHub : vérification SHA-256, sauvegarde de l’ancienne version, installation atomique, redémarrage des services et retour arrière si le redémarrage ou l’API échoue. Root requis. |
 | `ola bench` | Sans argument (ou `ola bench all`), mesure **tous les modèles téléchargés présents**, un par un : même question courte avec thinking par défaut puis `think:false`, tok/s, verdict par modèle et synthèse globale. Le modèle par défaut est testé en dernier. |
 | `ola bench <modèle>` | Mesure uniquement le modèle indiqué. |
 | `ola speed` | Affiche le mode vitesse global du serveur Ollama, la liste des modèles présents concernés, la configuration effective, le CPU (AVX/AVX2, cœurs), la RAM et les recommandations. Lecture seule. |
@@ -1312,13 +1314,10 @@ Elle doit répondre HTTP 200 avec un JSON de version.
 
 ## Mettre à jour `ola`
 
-Pour installer une nouvelle version du gestionnaire sur un sandbox déjà configuré :
+Sur un sandbox déjà configuré avec une version qui connaît la commande, la mise à jour du gestionnaire se fait simplement avec :
 
 ```bash
-cd /tmp
-curl -fsSLO https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/ollama-cloudflare-setup.sh
-chmod +x ollama-cloudflare-setup.sh
-./ollama-cloudflare-setup.sh start
+sudo ola update
 ```
 
 Puis vérifie :
@@ -1327,30 +1326,53 @@ Puis vérifie :
 ola doctor
 ola test
 ola watchdog
+ola tui status
 ```
 
-`start` redémarre brièvement Ollama et cloudflared. La copie stable de `ola` est remplacée par la nouvelle version.
+### Ce que fait `ola update`
 
-Pour la première installation de l’interface TUI après une mise à jour, crée ensuite son environnement Python isolé, puis lance-la :
+Dans l’esprit du `manage.sh update` de nebula-p, mais adapté à l’installation `ola` qui n’est pas un dépôt Git :
+
+1. un verrou empêche deux mises à jour simultanées ; un verrou dont le processus propriétaire a disparu est nettoyé ;
+2. la commande télécharge la dernière version publiée de `ollama-cloudflare-setup.sh` et son fichier compagnon `ollama-cloudflare-setup.sh.sha256` ;
+3. elle refuse l’installation si le SHA-256 ne correspond pas, si le fichier n’est pas un script `ola` reconnaissable ou si sa syntaxe Bash est invalide ;
+4. si le SHA-256 installé est déjà celui de la version publiée, elle affiche `ola est déjà à jour` et ne redémarre pas les services ;
+5. sinon, elle passe la main à la version téléchargée — comme nebula-p redémarre avec le `manage.sh` à jour — qui sauvegarde l’ancienne version dans `/usr/local/lib/ollama-cloudflare/backup/`, installe la nouvelle copie stable de façon atomique et met à jour les fichiers de la TUI ;
+6. si les dépendances épinglées de la TUI ont changé et que son environnement Python existe déjà, elle essaie de le réparer ; un échec de cette étape optionnelle ne bloque pas la mise à jour du moteur ;
+7. elle redémarre le watchdog, Ollama et cloudflared, puis attend que l’API Ollama réponde ;
+8. si le redémarrage ou le contrôle de l’API échoue, elle restaure la version précédente depuis la sauvegarde et tente de redémarrer les services avec elle.
+
+`ola update` met à jour le gestionnaire `ola` et les fichiers de la TUI. Il ne remplace ni les binaires Ollama/cloudflared, ni les modèles, ni l’URL/modèle enregistrés, ni les fichiers de configuration Supervisor existants. Un bref redémarrage des services est donc normal, mais les données et réglages persistants (Pack Speed, keep-alive, modèle par défaut) restent en place.
+
+Les URL de téléchargement peuvent être remplacées pour un miroir ou un fork avec `OLA_UPDATE_URL` et `OLA_UPDATE_SHA256_URL` ; par défaut, elles pointent vers la branche publiée du dépôt `JCVERSA/Ssh.jc`.
+
+### Première installation de la commande `update`
+
+Si la version actuellement installée répond `Unknown argument: update`, elle est trop ancienne pour se mettre à jour elle-même. Télécharge une fois la nouvelle version, vérifie-la manuellement, puis lance son `update` :
 
 ```bash
-ola tui install
+cd /tmp
+curl -fsSLO https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/ollama-cloudflare-setup.sh
+curl -fsSLO https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/ollama-cloudflare-setup.sh.sha256
+sha256sum -c ollama-cloudflare-setup.sh.sha256
+chmod +x ollama-cloudflare-setup.sh
+sudo ./ollama-cloudflare-setup.sh update
+```
+
+Ensuite, les mises à jour suivantes se feront directement avec `sudo ola update`.
+
+Pour la toute première installation de l’interface TUI sur un ancien sandbox, crée ensuite son environnement Python isolé, puis lance-la :
+
+```bash
+sudo ola tui install
 ola tui status
 ola tui
 ```
 
-Les mises à jour suivantes remplacent automatiquement le fichier `ola_tui.py` en même temps que `ola`. L’environnement `tui-venv` reste en place tant que les dépendances épinglées ne changent pas ; en cas de doute, `ola tui install` le répare.
-
-Si une mise à jour modifie les paramètres de génération des configurations — par exemple `OLLAMA_CONTEXT_LENGTH`, `CF_TUNNEL_PROTOCOL`, les paramètres Supervisor d’Ollama ou la configuration du tunnel — relance plutôt un setup pour régénérer proprement les fichiers concernés :
+Si une version future modifie les paramètres de génération des configurations — par exemple `OLLAMA_CONTEXT_LENGTH`, `CF_TUNNEL_PROTOCOL`, les paramètres Supervisor d’Ollama ou la configuration du tunnel — relance plutôt un setup pour régénérer proprement les fichiers concernés :
 
 ```bash
-ola setup
-```
-
-ou, sans la commande courte à jour :
-
-```bash
-./ollama-cloudflare-setup.sh setup
+sudo ola setup
 ```
 
 ## Dépannage
@@ -1822,12 +1844,14 @@ Le gestionnaire Ollama est maintenant développé comme un petit projet modulair
 | `src/55-fluid.sh` | Bench streaming/TTFT, état fluidité, préchauffage, preset et keep-alive serveur. |
 | `src/58-speed.sh` | État, application, vérification et retour arrière du Pack Speed. |
 | `src/60-diagnostics-setup.sh` | Doctor, test, récupération et setup complet. |
+| `src/65-update.sh` | Auto-mise à jour du gestionnaire : téléchargement, SHA-256, verrou, sauvegarde, installation, redémarrage et retour arrière. |
 | `src/70-tui.sh` | Intégration Bash de la TUI : extraction, environnement Python, statut, réparation et lancement. |
 | `src/90-main.sh` | Dispatch des commandes et menu texte historique. |
 | `tui/ola_tui.py` | Application Textual `ola tui`. |
 | `tui/requirements.txt` | Versions Python/Textual épinglées, embarquées dans l’artefact au build. |
 | `build.sh` | Assemble `src/*.sh`, embarque `tui/ola_tui.py` et `tui/requirements.txt` dans `src/70-tui.sh`, vérifie la syntaxe et régénère l’artefact unique. |
 | `ollama-cloudflare-setup.sh` | **Artefact généré par `build.sh`** : fichier unique téléchargé/installé sur le sandbox ; devient la commande `ola`. |
+| `ollama-cloudflare-setup.sh.sha256` | SHA-256 publié de l’artefact, régénéré par `build.sh` et vérifié par `ola update`. |
 | `tests/run-tests.sh` | Suite isolée Bash + Textual Pilot ; utilise uniquement des stubs et des namespaces temporaires. |
 | `tests/run-tui-tests.py` | Tests headless de navigation et d’actions TUI simulées. |
 | `tests/stub/` et `tests/fixtures/` | Faux `curl`, Ollama, Supervisor, Python/pip et faux fichiers système utilisés par les tests. |
@@ -1843,7 +1867,7 @@ bash -n ollama-cloudflare-setup.sh
 git diff --check
 ```
 
-Ne modifie pas directement `ollama-cloudflare-setup.sh` pour un changement durable : modifie le module source correspondant, puis relance `./build.sh`. Les commits doivent contenir à la fois les sources et l’artefact régénéré, afin que le téléchargement direct du fichier unique reste toujours à jour.
+Ne modifie pas directement `ollama-cloudflare-setup.sh` pour un changement durable : modifie le module source correspondant, puis relance `./build.sh`. Le build régénère aussi `ollama-cloudflare-setup.sh.sha256`. Les commits doivent contenir à la fois les sources, l’artefact régénéré et son SHA-256, afin que le téléchargement direct et `ola update` restent toujours cohérents.
 
 ### Tester
 

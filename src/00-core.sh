@@ -35,6 +35,10 @@ OLA_TUI_VENV="$OLA_INSTALL_DIR/tui-venv"
 OLA_TUI_PYTHON="$OLA_TUI_VENV/bin/python"
 OLA_TUI_REQUIREMENTS="$OLA_INSTALL_DIR/tui-requirements.txt"
 OLA_TUI_TEXTUAL_VERSION="8.2.8"
+OLA_UPDATE_URL="${OLA_UPDATE_URL:-https://raw.githubusercontent.com/JCVERSA/Ssh.jc/arena/e89a71aa-ssh-jc/ollama-cloudflare-setup.sh}"
+OLA_UPDATE_SHA256_URL="${OLA_UPDATE_SHA256_URL:-${OLA_UPDATE_URL}.sha256}"
+OLA_UPDATE_LOCK_DIR="$OLA_INSTALL_DIR/update.lock"
+OLA_UPDATE_BACKUP_DIR="$OLA_INSTALL_DIR/backup"
 WATCHDOG_INTERVAL="${OLA_WATCHDOG_INTERVAL:-60}"
 WATCHDOG_FAILURES="${OLA_WATCHDOG_FAILURES:-3}"
 WATCHDOG_COOLDOWN="${OLA_WATCHDOG_COOLDOWN:-180}"
@@ -46,9 +50,10 @@ err(){ printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 usage(){
-  echo "Usage: bash $0 [setup|start|recover|status|doctor|test|bench|speed|fluid|tui|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
+  echo "Usage: bash $0 [setup|update|start|recover|status|doctor|test|bench|speed|fluid|tui|models|use|ps|unload|delete|logs|restart|stop|watchdog]"
   echo "No argument opens an interactive menu."
-  echo "setup, start, recover, use, unload, delete, restart, stop, 'speed apply|reset', 'fluid keepalive' and 'tui install' require root; status, doctor, test, speed, fluid status/preset, tui status, models, ps, logs and watchdog are read-only. Bench does not change config or disk files, but may load/unload models in RAM while testing."
+  echo "setup, update, start, recover, use, unload, delete, restart, stop, 'speed apply|reset', 'fluid keepalive' and 'tui install' require root; status, doctor, test, speed, fluid status/preset, tui status, models, ps, logs and watchdog are read-only. Bench does not change config or disk files, but may load/unload models in RAM while testing."
+  echo "ola update downloads the latest published ola artifact, verifies its SHA-256, keeps the previous version as a backup, installs it atomically, restarts the configured services and rolls back if the post-update restart/API check fails."
   echo "ola tui opens the optional full-screen Textual interface (dashboard and model actions). 'ola tui install' repairs its isolated Python environment; 'ola tui status' reports it."
   echo "After setup, the short system command is available: ola status | ola doctor | ola test | ola recover | ola use <model> | ola delete <model> | ola start | ola logs"
   echo "ola use first unloads any different model currently in RAM, then installs/loads the requested model."

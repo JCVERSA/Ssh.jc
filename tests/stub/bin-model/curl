@@ -9,6 +9,14 @@ models_json(){
   jq -R -s '{models: (split("\n") | map(select(length > 0) | {name:.}))}' "$1"
 }
 case "$url" in
+  *ollama-cloudflare-setup.sh.sha256)
+    cat "${TEST_STATE}/update-artifact.sha256" 2>/dev/null || exit 22
+    exit 0 ;;
+  *ollama-cloudflare-setup.sh)
+    cat "${TEST_STATE}/update-artifact.sh" 2>/dev/null || exit 22
+    exit 0 ;;
+esac
+case "$url" in
   *127.0.0.1:11434/api/ps*)
     jq -R -s '{models: (split("\n") | map(select(length > 0) | {name:., size:1500000000, expires_at:"2030-01-01T00:00:00Z", context_length:1024}))}' "${TEST_STATE}/loaded-models"; exit 0 ;;
   *127.0.0.1:11434/api/show*)

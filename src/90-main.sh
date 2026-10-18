@@ -5,6 +5,9 @@ case "${1:-}" in
   status)
     show_status
     ;;
+  update)
+    update_ola_command
+    ;;
   doctor)
     show_doctor
     ;;
@@ -199,8 +202,9 @@ case "${1:-}" in
     echo "13) Vitesse / Pack Speed (état)"
     echo "14) Fluidité (état, ola fluid)"
     echo "15) Stop tunnel"
-    echo "16) Exit"
-    if ! choice=$(prompt_value "Choice [16]: " "16"); then
+    echo "16) Update ola (download + verified install + restart)"
+    echo "17) Exit"
+    if ! choice=$(prompt_value "Choice [17]: " "17"); then
       warn "No input received; exiting."
       exit 0
     fi
@@ -253,7 +257,8 @@ case "${1:-}" in
       13) show_speed ;;
       14) show_fluid_status ;;
       15) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
-      16) exit 0 ;;
+      16) update_ola_command ;;
+      17) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
     ;;

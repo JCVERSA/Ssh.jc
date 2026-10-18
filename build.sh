@@ -38,5 +38,7 @@ done <<< "$modules"
 chmod 755 "$TMP"
 bash -n "$TMP"
 mv "$TMP" "$OUTPUT"
+artifact_sha256=$(sha256sum "$OUTPUT" | awk 'NR == 1 { print $1 }')
+printf '%s  %s\n' "$artifact_sha256" "$(basename "$OUTPUT")" > "${OUTPUT}.sha256"
 trap - EXIT
 printf 'Built %s from %s modules.\n' "$OUTPUT" "$(printf '%s\n' "$modules" | wc -l)"

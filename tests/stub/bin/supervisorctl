@@ -13,6 +13,7 @@ case "$cmd" in
   reread|update) exit 0;;
   start) touch "${TEST_STATE}/${prog}.running"; exit 0;;
   restart)
+    [[ -f "${TEST_STATE}/fail-restart" ]] && exit 1
     for p in "$@"; do [[ "$p" == restart ]] && continue; touch "${TEST_STATE}/${p}.running"; done
     if [[ " $* " == *" cloudflared-ollama "* ]]; then printf 'INF new tunnel https://fresh-quick.trycloudflare.com\n' >> /var/log/supervisor/cloudflared-ollama-error.log; fi
     exit 0;;
