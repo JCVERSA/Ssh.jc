@@ -9,6 +9,7 @@ SUP_DIR="/etc/supervisor/conf.d"
 SUP_CONF="/etc/supervisor/supervisord.conf"
 LOG_DIR="/var/log/supervisor"
 CF_CONF_DIR="/etc/cloudflared"
+CF_CLI_HOME="${HOME:-/root}/.cloudflared"
 URL_FILE="/etc/ollama-cloudflare-url"
 MODEL_FILE="/etc/ollama-cloudflare-model"
 MODEL_DEFAULT="llama3.2:1b"
@@ -146,7 +147,7 @@ ensure_service_users(){
 
 ollama_version_text(){
   local bin=$1 ver
-  ver=$("$bin" --version 2>/dev/null | head -1)
+  ver=$("$bin" --version 2>/dev/null | grep -Ei 'ollama version|version is [0-9]' | head -1 || true)
   [[ -n "$ver" ]] || ver="binary at $bin"
   printf '%s' "$ver"
 }
@@ -516,15 +517,15 @@ configure_named_tunnel(){
 
   ensure_service_users
   rm -f "$URL_FILE"
-  install -d -m 700 /root/.cloudflared
+  install -d -m 700 "$CF_CLI_HOME"
   install -d -o root -g "$CLOUDFLARED_USER" -m 0750 "$CF_CONF_DIR"
 
-  if [[ ! -f /root/.cloudflared/cert.pem ]]; then
+  if [[ ! -f "$CF_CLI_HOME/cert.pem" ]]; then
     info "Cloudflare will print a login URL. Open it in your browser, sign in, and authorize the domain."
     cloudflared tunnel login
   fi
-  [[ -f /root/.cloudflared/cert.pem ]] || die "Cloudflare login certificate not found at /root/.cloudflared/cert.pem"
-  chmod 600 /root/.cloudflared/cert.pem
+  [[ -f "$CF_CLI_HOME/cert.pem" ]] || die "Cloudflare login certificate not found at $CF_CLI_HOME/cert.pem"
+  chmod 600 "$CF_CLI_HOME/cert.pem"
 
   refresh_named_tunnel_uuid "$tunnel_name"
   uuid="$NAMED_TUNNEL_UUID"
@@ -538,7 +539,7 @@ configure_named_tunnel(){
   [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Could not determine tunnel ID. Check 'cloudflared tunnel list'."
   uuid="${uuid,,}"
 
-  source_cred="/root/.cloudflared/${uuid}.json"
+  source_cred="$CF_CLI_HOME/${uuid}.json"
   [[ -f "$source_cred" ]] || die "Tunnel credentials missing: $source_cred"
   chmod 600 "$source_cred"
   cred_file="$CF_CONF_DIR/${uuid}.json"
