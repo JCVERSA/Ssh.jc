@@ -12,7 +12,7 @@ CF_CONF_DIR="/etc/cloudflared"
 CF_CLI_HOME="${HOME:-/root}/.cloudflared"
 URL_FILE="/etc/ollama-cloudflare-url"
 MODEL_FILE="/etc/ollama-cloudflare-model"
-MODEL_DEFAULT="llama3.2:1b"
+MODEL_DEFAULT="qwen3:1.7b"
 OLLAMA_USER="ollama"
 CLOUDFLARED_USER="cloudflared"
 OLLAMA_GROUP=""
@@ -742,7 +742,7 @@ show_installed_models(){
 
 delete_model_command(){
   local target=$1 force=${2:-0} ollama_bin installed_names loaded_names current_default payload remaining new_default i
-  is_valid_model_name "$target" || die "Invalid model name: $target (example: llama3.2:1b)"
+  is_valid_model_name "$target" || die "Invalid model name: $target (example: qwen3:1.7b)"
   require_commands curl jq
   ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
 
@@ -810,7 +810,7 @@ delete_model_command(){
 
 switch_model(){
   local target=$1 ollama_bin installed_names loaded_names payload response content mem_kb
-  is_valid_model_name "$target" || die "Invalid model name: $target (example: llama3.2:1b)"
+  is_valid_model_name "$target" || die "Invalid model name: $target (example: qwen3:1.7b)"
   require_commands curl jq
   ollama_bin=$(ollama_bin_path) || die "Ollama binary not found. Run setup first: ola setup"
   ensure_service_users
@@ -1934,7 +1934,7 @@ case "${1:-}" in
   use)
     require_root
     if [[ -z "${2:-}" ]]; then
-      err "Usage: ola use <model> (example: ola use llama3.2:1b)"
+      err "Usage: ola use <model> (example: ola use qwen3:1.7b)"
       exit 1
     fi
     install_ola_command
@@ -1955,7 +1955,7 @@ case "${1:-}" in
   delete|rm)
     require_root
     if [[ -z "${2:-}" ]]; then
-      err "Usage: ola delete <model> [--force] (example: ola delete llama3.2:1b)"
+      err "Usage: ola delete <model> [--force] (example: ola delete qwen3:1.7b)"
       exit 1
     fi
     delete_force=0
@@ -2046,7 +2046,7 @@ case "${1:-}" in
         install_ola_command
         require_supervisor_running
         ensure_watchdog
-        if ! model_choice=$(prompt_value "Model to use (example llama3.2:1b): " ""); then
+        if ! model_choice=$(prompt_value "Model to use (example qwen3:1.7b): " ""); then
           die "No model received; cancelling model switch."
         fi
         switch_model "$model_choice"

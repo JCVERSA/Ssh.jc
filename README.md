@@ -145,17 +145,17 @@ Aucun port entrant n’a besoin d’être ouvert ou redirigé pour le tunnel : c
 
 Configuration minimale conseillée pour les petits modèles utilisés par défaut :
 
-- **RAM : 2 Go** pour `llama3.2:1b` et les modèles d’environ 1 à 1,5 Go ;
+- **RAM : 2 Go** pour `qwen3:1.7b` et les modèles d’environ 1 à 1,5 Go ;
 - **disque : au moins 5 Go libres** avant une installation complète ;
 - un sandbox qui reste actif si l’objectif est une disponibilité 24/7.
 
 À titre indicatif :
 
 - l’archive Ollama fait environ **1,37 Go** ;
-- le modèle `llama3.2:1b` occupe environ **1,3 Go** sur le disque ;
+- le modèle par défaut `qwen3:1.7b` occupe environ **1,4 Go** sur le disque [1](https://ollama.com/library/qwen3:1.7b) ;
 - le setup vérifie l’espace avant le téléchargement/extraction et choisit un dossier temporaire assez grand, ce qui évite le piège classique d’un `/tmp` limité à 1 Go.
 
-Les modèles plus gros peuvent nécessiter beaucoup plus de RAM et de disque. En cas de doute, commence par un modèle 1B ou 1.5B et vérifie avec `ola doctor`.
+Les modèles plus gros peuvent nécessiter beaucoup plus de RAM et de disque. En cas de doute, commence par un petit modèle d’environ 1 à 1,5 Go et vérifie avec `ola doctor`.
 
 ### Pour le mode Named Tunnel
 
@@ -206,7 +206,7 @@ Le setup effectue notamment les étapes suivantes :
 4. active le watchdog de santé ;
 5. installe Ollama depuis l’archive officielle GitHub vérifiée par SHA-256 ;
 6. démarre Ollama sous Supervisor, lié uniquement à `127.0.0.1:11434` ;
-7. demande le modèle à télécharger ;
+7. demande le modèle à télécharger (`qwen3:1.7b` si tu appuies simplement sur Entrée) ;
 8. décharge d’abord, si besoin, un autre modèle déjà présent en RAM ;
 9. télécharge le modèle choisi ;
 10. installe cloudflared, d’abord via le dépôt apt officiel Cloudflare, puis en secours via le paquet GitHub vérifié ;
@@ -574,8 +574,8 @@ Exemple d’écran :
 
 ```text
 ================ Modèles Ollama ================
- 1) llama3.2:1b                      1.3 GB [défaut] [RAM]
- 2) qwen2.5:1.5b                     986 MB
+ 1) qwen3:1.7b                        1.4 GB [défaut] [RAM]
+ 2) llama3.2:1b                       1.3 GB
 --------------------------------------------------
 u = utiliser    d = supprimer    l = libérer la RAM
 a = ajouter + utiliser un autre modèle
@@ -627,7 +627,7 @@ En mode non interactif, par exemple dans un pipe ou un script, `ola models` gard
 Commande :
 
 ```bash
-ola use qwen2.5:1.5b
+ola use llama3.2:1b
 ```
 
 Ordre exact des opérations :
@@ -643,8 +643,8 @@ Ordre exact des opérations :
 Exemple :
 
 ```bash
+ola use qwen3:1.7b
 ola use llama3.2:1b
-ola use qwen2.5:1.5b
 ola ps
 ```
 
@@ -665,7 +665,7 @@ Exemple :
 
 ```text
 Models currently loaded in RAM:
-qwen2.5:1.5b
+qwen3:1.7b
 ```
 
 Si aucun modèle n’est chargé :
@@ -702,8 +702,8 @@ Exemple :
 
 ```text
 Models currently downloaded on disk:
+qwen3:1.7b
 llama3.2:1b
-qwen2.5:1.5b
 ```
 
 ### `ola delete` : supprimer définitivement un modèle du disque
@@ -711,13 +711,13 @@ qwen2.5:1.5b
 Supprimer un modèle :
 
 ```bash
-ola delete qwen2.5:1.5b
+ola delete llama3.2:1b
 ```
 
 Alias :
 
 ```bash
-ola rm qwen2.5:1.5b
+ola rm llama3.2:1b
 ```
 
 Comportement :
@@ -732,7 +732,7 @@ Comportement :
 La suppression du modèle par défaut est refusée sans `--force`, pour éviter de laisser `ola test` sans modèle valide :
 
 ```bash
-ola delete llama3.2:1b
+ola delete qwen3:1.7b
 ```
 
 Message attendu : il faut d’abord changer de modèle ou forcer.
@@ -740,14 +740,14 @@ Message attendu : il faut d’abord changer de modèle ou forcer.
 Changement propre recommandé :
 
 ```bash
-ola use qwen2.5:1.5b
-ola delete llama3.2:1b
+ola use llama3.2:1b
+ola delete qwen3:1.7b
 ```
 
 Suppression forcée :
 
 ```bash
-ola delete llama3.2:1b --force
+ola delete qwen3:1.7b --force
 ```
 
 Si d’autres modèles restent, le premier modèle restant devient le nouveau défaut. Si aucun modèle ne reste, le fichier de défaut est retiré et il faudra installer un modèle avec `ola use <modèle>`.
@@ -765,7 +765,7 @@ L’URL publique enregistrée est affichée par :
 ola status
 ```
 
-Dans les exemples ci-dessous, remplace `https://ton-hostname.example` par ton URL publique réelle et `llama3.2:1b` par ton modèle.
+Dans les exemples ci-dessous, remplace `https://ton-hostname.example` par ton URL publique réelle et `qwen3:1.7b` par ton modèle si tu en utilises un autre.
 
 ### Tester la version
 
@@ -811,7 +811,7 @@ ola ps
 curl -fsS https://ton-hostname.example/api/chat \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "llama3.2:1b",
+    "model": "qwen3:1.7b",
     "messages": [
       {"role": "user", "content": "Explique-moi simplement ce qu'est un tunnel Cloudflare."}
     ],
@@ -835,7 +835,7 @@ Paramètres usuels :
 
 ```text
 API key : ollama
-Model   : llama3.2:1b
+Model   : qwen3:1.7b
 ```
 
 La clé `ollama` est une valeur de remplissage pour les clients qui exigent une clé ; elle n’ajoute pas d’authentification réelle, puisque le tunnel reste public.
@@ -847,7 +847,7 @@ curl -fsS https://ton-hostname.example/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer ollama' \
   -d '{
-    "model": "llama3.2:1b",
+    "model": "qwen3:1.7b",
     "messages": [
       {"role": "user", "content": "Dis bonjour en une phrase."}
     ]
@@ -1086,7 +1086,7 @@ ola unload
 Change pour un modèle plus petit :
 
 ```bash
-ola use llama3.2:1b
+ola use qwen3:0.6b
 ```
 
 Évite d’augmenter `OLLAMA_CONTEXT_LENGTH` sur un sandbox de 2 Go sans tester progressivement.
