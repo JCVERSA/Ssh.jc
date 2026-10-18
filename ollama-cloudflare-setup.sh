@@ -20,6 +20,10 @@ CLOUDFLARED_GROUP=""
 OLLAMA_HOME=""
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
 CF_TUNNEL_PROTOCOL="${CF_TUNNEL_PROTOCOL:-auto}"
+OLA_BIN_DIR="/usr/local/bin"
+OLA_COMMAND="$OLA_BIN_DIR/ola"
+OLA_INSTALL_DIR="/usr/local/lib/ollama-cloudflare"
+OLA_SCRIPT="$OLA_INSTALL_DIR/ollama-cloudflare-setup.sh"
 
 info(){ printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -31,7 +35,70 @@ usage(){
   echo "Usage: bash $0 [setup|start|status|logs|restart|stop]"
   echo "No argument opens an interactive menu."
   echo "setup, restart and stop require root; status and logs are read-only."
+  echo "After setup, the short system command is available: ola status | ola start | ola logs | ola stop"
   echo "Environment: CF_TUNNEL_PROTOCOL=auto|http2|quic (default auto), OLLAMA_TMPDIR=<large temp dir>."
+}
+
+script_source_path(){
+  local src=${BASH_SOURCE[0]:-} dir next
+  [[ -n "$src" ]] || return 1
+  if [[ "$src" != */* ]]; then
+    src=$(command -v -- "$src" 2>/dev/null || true)
+    [[ -n "$src" ]] || return 1
+  fi
+  while [[ -L "$src" ]]; do
+    dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || return 1
+    next=$(readlink "$src" 2>/dev/null || true)
+    [[ -n "$next" ]] || return 1
+    if [[ "$next" == /* ]]; then
+      src="$next"
+    else
+      src="$dir/$next"
+    fi
+  done
+  case "$src" in
+    /dev/*|/proc/*) return 1 ;;
+  esac
+  [[ -f "$src" ]] || return 1
+  dir=$(cd -P "$(dirname "$src")" 2>/dev/null && pwd) || return 1
+  printf '%s/%s' "$dir" "$(basename "$src")"
+}
+
+install_ola_command(){
+  local source tmp_script existing_target
+  source=$(script_source_path) \
+    || die "Could not locate this script as a regular file, so the 'ola' command was not installed. Download the script to a file (for example /tmp/ollama-cloudflare-setup.sh), then run that file."
+  install -d -m 0755 "$OLA_BIN_DIR" "$OLA_INSTALL_DIR" \
+    || die "Could not create $OLA_INSTALL_DIR or $OLA_BIN_DIR for the 'ola' command."
+
+  if [[ "$source" != "$OLA_SCRIPT" ]]; then
+    tmp_script=$(mktemp "$OLA_INSTALL_DIR/.ollama-cloudflare-setup.sh-XXXXXX") \
+      || die "Could not create a temporary file in $OLA_INSTALL_DIR for the 'ola' command."
+    if ! install -m 0755 "$source" "$tmp_script"; then
+      rm -f "$tmp_script"
+      die "Could not install this script as $OLA_SCRIPT."
+    fi
+    mv -f "$tmp_script" "$OLA_SCRIPT" \
+      || die "Could not install this script as $OLA_SCRIPT."
+  fi
+  chmod 0755 "$OLA_SCRIPT" || die "Could not make $OLA_SCRIPT executable."
+
+  if [[ -L "$OLA_COMMAND" ]]; then
+    existing_target=$(readlink -f "$OLA_COMMAND" 2>/dev/null || true)
+    [[ "$existing_target" == "$OLA_SCRIPT" ]] \
+      || die "$OLA_COMMAND already exists and points to '${existing_target:-unknown}', not to this tool. Refusing to overwrite it; rename/remove that command, then re-run."
+  elif [[ -e "$OLA_COMMAND" ]]; then
+    cmp -s "$OLA_COMMAND" "$OLA_SCRIPT" \
+      || die "$OLA_COMMAND already exists and is not this tool. Refusing to overwrite it; rename/remove that file, then re-run."
+  fi
+  ln -sfn "$OLA_SCRIPT" "$OLA_COMMAND" \
+    || die "Could not create the short command $OLA_COMMAND."
+  hash -r 2>/dev/null || true
+  case ":$PATH:" in
+    *":$OLA_BIN_DIR:"*) ;;
+    *) warn "$OLA_BIN_DIR is not in the current PATH. Use $OLA_COMMAND in this shell, or open a new root shell before typing: ola" ;;
+  esac
+  ok "Short command installed: ola (examples: ola, ola status, ola start, ola logs)"
 }
 
 require_root(){
@@ -911,6 +978,7 @@ setup_all(){
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
   esac
+  install_ola_command
   apt_update
   apt_install curl ca-certificates gnupg jq tar
   require_commands curl jq sha256sum tar awk sed grep find stat df
@@ -935,7 +1003,7 @@ setup_all(){
   echo
   show_status
   echo
-  ok "Setup finished. Logs: $0 logs"
+  ok "Setup finished. Logs: ola logs"
   warn "Supervisor can restart processes, but 24/7 uptime still depends on the hosting platform keeping this container alive and starting Supervisor again after container restart."
 }
 
@@ -956,11 +1024,13 @@ case "${1:-}" in
     ;;
   start|restart)
     require_root
+    install_ola_command
     require_supervisor_running
     restart_services
     ;;
   stop)
     require_root
+    install_ola_command
     require_supervisor_running
     stop_tunnel
     ;;
@@ -982,8 +1052,8 @@ case "${1:-}" in
       1) require_root; check_system; setup_all ;;
       2) show_status ;;
       3) show_logs ;;
-      4) require_root; require_supervisor_running; restart_services ;;
-      5) require_root; require_supervisor_running; stop_tunnel ;;
+      4) require_root; install_ola_command; require_supervisor_running; restart_services ;;
+      5) require_root; install_ola_command; require_supervisor_running; stop_tunnel ;;
       6) exit 0 ;;
       *) die "Invalid choice." ;;
     esac
