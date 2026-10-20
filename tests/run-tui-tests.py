@@ -169,10 +169,20 @@ async def main() -> None:
     print("PASS: saved theme loads and an unknown saved theme falls back safely")
 
     app = mod.OlaTui()
+    copied_text: list[str] = []
+    app.copy_to_clipboard = copied_text.append
     async with app.run_test(size=(120, 38)) as pilot:
         await wait_until(pilot, lambda: app.query_one("#models").row_count == 2, "model rows")
         assert app.selected_model_name() == "qwen3:1.7b"
         print("PASS: initial table and default-last selection")
+
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "main screen copy")
+        assert "Résumé" in copied_text[-1]
+        assert "qwen3:1.7b" in copied_text[-1]
+        assert "https://ollama.example.com" in copied_text[-1]
+        assert "Détails" in copied_text[-1]
+        print("PASS: Shift+C copies the main screen as plain text")
 
         summary_text = str(app.query_one("#summary").render())
         details_text = str(app.query_one("#details").render())
@@ -230,6 +240,12 @@ async def main() -> None:
         assert app.screen.__class__.__name__ == "OutputScreen"
         print("PASS: background refresh works while an output screen is open")
         await wait_output_finished(pilot, app)
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "output screen copy")
+        assert "Preset fluidité" in copied_text[-1]
+        assert "SORTIE SIMULÉE fluid preset llama3.2:1b" in copied_text[-1]
+        print("PASS: Shift+C copies an output screen")
         await pilot.press("q")
         await wait_until(
             pilot,
@@ -245,6 +261,12 @@ async def main() -> None:
         )
         assert app.focused is not None and app.focused.id == "cancel"
         assert app.screen.query_one("#confirm").variant == "primary"
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "confirmation copy")
+        assert "Utiliser ce modèle ?" in copied_text[-1]
+        assert app.screen.__class__.__name__ == "ConfirmScreen"
+        print("PASS: Shift+C copies a confirmation without confirming it")
         await pilot.press("enter")
         await wait_until(
             pilot,
@@ -381,6 +403,14 @@ async def main() -> None:
             lambda: app.screen.__class__.__name__ == "AddModelScreen",
             "add model screen",
         )
+        await pilot.press("C")
+        await wait_until(
+            pilot,
+            lambda: app.screen.query_one("#model-name").value == "C",
+            "Shift+C remains text input in the add-model field",
+        )
+        print("PASS: Shift+C still types C in a text field")
+        await pilot.press("backspace")
         await pilot.press(*"qwen3:0.6b")
         await pilot.press("enter")
         await wait_until(
@@ -436,6 +466,20 @@ async def main() -> None:
         )
         await pilot.press("f")
         await wait_until(pilot, lambda: logs_screen.follow is False, "logs follow disabled")
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "full log copy")
+        assert "ligne beta erreur" in copied_text[-1]
+        assert "nouvelle ligne pendant le suivi" in copied_text[-1]
+        print("PASS: Shift+C copies the displayed log")
+        log_area = logs_screen.query_one("#log-content")
+        log_area.move_cursor((0, 6))
+        await pilot.press(*(["shift+right"] * 5))
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "selected log text copy")
+        assert copied_text[-1] == "alpha", copied_text[-1]
+        print("PASS: Shift+C copies the selected log text when a selection exists")
         await pilot.press("q")
         await wait_until(
             pilot, lambda: app.screen.__class__.__name__ != "LogsScreen", "logs close"
@@ -458,6 +502,11 @@ async def main() -> None:
         await wait_until(
             pilot, lambda: app.screen.__class__.__name__ == "HelpScreen", "help screen"
         )
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "help screen copy")
+        assert "COPIE (Maj+C)" in copied_text[-1]
+        print("PASS: Shift+C copies the help screen")
         await pilot.press("q")
         await wait_until(
             pilot, lambda: app.screen.__class__.__name__ != "HelpScreen", "help close"
@@ -470,6 +519,12 @@ async def main() -> None:
             lambda: app.screen.__class__.__name__ == "ActionMenuScreen",
             "action menu",
         )
+        copied_text.clear()
+        await pilot.press("C")
+        await wait_until(pilot, lambda: bool(copied_text), "action menu copy")
+        assert "Actions —" in copied_text[-1]
+        assert "g — Journaux" in copied_text[-1]
+        print("PASS: Shift+C copies the action menu")
         await pilot.press("escape")
         await wait_until(
             pilot,

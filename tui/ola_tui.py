@@ -95,6 +95,62 @@ def dialog_classes(app: App) -> str:
     return "dialog compact" if compact else "dialog"
 
 
+def renderable_plain_text(renderable: object) -> str:
+    """Return the visible text of a Rich renderable without style markup."""
+    if isinstance(renderable, Text):
+        return renderable.plain
+    return str(renderable or "")
+
+
+def static_plain_text(widget: Static) -> str:
+    try:
+        return renderable_plain_text(widget.render()).strip()
+    except Exception:
+        return ""
+
+
+class CopyTextScreenMixin:
+    """Delegate Maj+C to the application's global copy action.
+
+    App-level bindings cover normal screens, while modal screens need their
+    own binding for the shortcut to stay available above the dashboard.
+    """
+
+    def action_copy_screen_text(self) -> None:
+        handler = getattr(self.app, "action_copy_screen_text", None)
+        if callable(handler):
+            handler()
+
+
+def screen_plain_text(screen: Screen) -> str:
+    """Best-effort plain-text copy of a screen without a dedicated exporter."""
+    copyable_text = getattr(screen, "copyable_text", None)
+    if callable(copyable_text):
+        try:
+            text = str(copyable_text() or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            return text
+
+    parts: list[str] = []
+    for widget in screen.query("*"):
+        if isinstance(widget, (Header, Footer)):
+            continue
+        text = ""
+        if isinstance(widget, TextArea):
+            text = (widget.selected_text or widget.text).strip()
+        elif isinstance(widget, Static):
+            text = static_plain_text(widget)
+        elif isinstance(widget, Button):
+            text = renderable_plain_text(widget.label).strip()
+        elif isinstance(widget, Input):
+            text = widget.value.strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
 def read_first_line(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
@@ -473,10 +529,11 @@ def run_cli_stream(
             pass
 
 
-class ConfirmScreen(ModalScreen[bool]):
+class ConfirmScreen(CopyTextScreenMixin, ModalScreen[bool]):
     BINDINGS = [
         Binding("escape", "cancel", "Annuler"),
         Binding("q", "cancel", "Annuler"),
+        Binding("C", "copy_screen_text", "Copier"),
     ]
 
     def __init__(
@@ -509,12 +566,18 @@ class ConfirmScreen(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "confirm")
 
+    def copyable_text(self) -> str:
+        return f"{self.dialog_title}\n\n{self.dialog_message}\n\n[Annuler] [{self.confirm_label}]"
+
     def action_cancel(self) -> None:
         self.dismiss(False)
 
 
-class AddModelScreen(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "cancel", "Annuler")]
+class AddModelScreen(CopyTextScreenMixin, ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "cancel", "Annuler"),
+        Binding("C", "copy_screen_text", "Copier"),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(classes=dialog_classes(self.app)):
@@ -530,6 +593,19 @@ class AddModelScreen(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         self.query_one("#model-name", Input).focus()
+
+    def copyable_text(self) -> str:
+        value = ""
+        try:
+            value = self.query_one("#model-name", Input).value.strip()
+        except Exception:
+            pass
+        suffix = f"\n\nModèle saisi : {value}" if value else ""
+        return (
+            "Ajouter et utiliser un modèle\n\n"
+            "Le modèle sera téléchargé si nécessaire, puis chargé. Les autres modèles seront déchargés de la RAM par ola use."
+            f"{suffix}"
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -562,6 +638,7 @@ class OutputScreen(Screen):
         super().__init__()
         self.output_title = title
         self.output_content = content
+        self.output_parts: list[str] = [content] if content else []
         self.running = running
         self.finished_code: int | None = None
         self.started_at = time.monotonic()
@@ -593,18 +670,29 @@ class OutputScreen(Screen):
             return
         if self.running:
             status.update(
-                f"En cours depuis {self._elapsed()} s · sortie en direct · q ou Ctrl+C : annuler"
+                f"En cours depuis {self._elapsed()} s · sortie en direct · C : copier · q ou Ctrl+C : annuler"
             )
         elif self.finished_code is not None:
             status.update(
-                f"Terminé · code {self.finished_code} · durée {self._elapsed()} s · q : fermer"
+                f"Terminé · code {self.finished_code} · durée {self._elapsed()} s · C : copier · q : fermer"
             )
 
     def append_output(self, text: str) -> None:
+        self.output_parts.append(text)
         try:
             self.query_one("#output-log", RichLog).write(text)
         except Exception:
             pass
+
+    def copyable_text(self) -> str:
+        parts = [self.output_title, "\n".join(self.output_parts).strip()]
+        try:
+            status = static_plain_text(self.query_one("#output-status", Static))
+        except Exception:
+            status = ""
+        if status:
+            parts.append(status)
+        return "\n\n".join(part for part in parts if part)
 
     def set_finished(self, code: int) -> None:
         self.finished_code = int(code)
@@ -680,7 +768,7 @@ class LogsScreen(Screen):
             else:
                 search = f" · recherche « {self.search_term} » : aucun résultat"
         self.query_one("#log-title", Static).update(
-            f"Journal {name} — {path}  (1-5 fichiers, / recherche, f suivi, r rafraîchir, q fermer){search}"
+            f"Journal {name} — {path}  (1-5 fichiers, / recherche, f suivi, r rafraîchir, C copier, q fermer){search}"
         )
         self.query_one("#log-mode", Static).update(
             "Suivi : oui (2 s)" if self.follow else "Suivi : non"
@@ -708,6 +796,13 @@ class LogsScreen(Screen):
         area = self.query_one("#log-content", TextArea)
         area.move_cursor((line, column), center=True)
         self._update_title()
+
+    def copyable_text(self) -> str:
+        try:
+            area = self.query_one("#log-content", TextArea)
+        except Exception:
+            return "\n".join(self.current_lines)
+        return area.selected_text or area.text
 
     def show_current(self, goto_end: bool = False) -> None:
         _name, path = LOG_FILES[self.current_index]
@@ -802,6 +897,14 @@ NAVIGATION
   t            Changer de thème
   q / Échap    Fermer l'écran courant ; quitter depuis l'écran principal
 
+COPIE (Maj+C)
+  C            Copier le texte de l'écran courant dans le presse-papiers
+               du terminal. Sur l'écran principal : résumé, modèles,
+               détails et statut. Dans les journaux : la sélection si
+               elle existe, sinon le journal affiché entier. Dans une
+               sortie d'action : le titre, la sortie et le statut.
+               Dans un champ de saisie, Maj+C continue de taper « C ».
+
 ACTIONS SUR LE MODÈLE SÉLECTIONNÉ
   u  Utiliser : décharger les autres modèles, charger celui-ci, le définir par défaut
   d  Supprimer définitivement du disque (confirmation)
@@ -856,14 +959,22 @@ class HelpScreen(Screen):
     def on_mount(self) -> None:
         self.query_one("#help-content", TextArea).focus()
 
+    def copyable_text(self) -> str:
+        try:
+            area = self.query_one("#help-content", TextArea)
+        except Exception:
+            return HELP_TEXT
+        return area.selected_text or area.text
+
     def action_close(self) -> None:
         self.app.pop_screen()
 
 
-class ActionMenuScreen(ModalScreen[str | None]):
+class ActionMenuScreen(CopyTextScreenMixin, ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "cancel", "Annuler"),
         Binding("q", "cancel", "Annuler"),
+        Binding("C", "copy_screen_text", "Copier"),
     ]
 
     def __init__(self, model: str, protected_disabled: bool = False):
@@ -891,6 +1002,21 @@ class ActionMenuScreen(ModalScreen[str | None]):
 
     def on_mount(self) -> None:
         self.query_one("#action-list", OptionList).focus()
+
+    def copyable_text(self) -> str:
+        labels = [
+            "u — Utiliser et définir par défaut",
+            "d — Supprimer définitivement du disque…",
+            "l — Libérer de la RAM…",
+            "w — Préchauffer 30 minutes…",
+            "p — Preset fluidité",
+            "b — Benchmark classique…",
+            "B — Benchmark streaming…",
+            "s — État Pack Speed",
+            "f — État Pack Fluidité",
+            "g — Journaux",
+        ]
+        return f"Actions — {self.model_name}\n" + "\n".join(labels)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -996,6 +1122,7 @@ class OlaTui(App):
     BINDINGS = [
         Binding("q", "quit", "Quitter"),
         Binding("?", "help", "Aide"),
+        Binding("C", "copy_screen_text", "Copier"),
         Binding("m", "action_menu", "Actions"),
         Binding("r", "refresh", "Rafraîchir"),
         Binding("u", "use_model", "Utiliser"),
@@ -1109,7 +1236,7 @@ class OlaTui(App):
             )
         return (
             f"{len(snap.models)} modèle(s) · défaut : {snap.default_model} · "
-            f"{self._freshness_text()} · ? aide · m actions"
+            f"{self._freshness_text()} · ? aide · m actions · C copier"
         )
 
     def _tick_status(self) -> None:
@@ -1310,6 +1437,82 @@ class OlaTui(App):
                     pass
         self.status_widget.update(self._status_text())
         self._render_details()
+
+    def _main_screen_plain_text(self) -> str:
+        snap = self.snapshot
+        parts = ["OLA — Ollama + Cloudflare Tunnel"]
+        if self.summary_widget is not None:
+            summary = static_plain_text(self.summary_widget)
+            if summary:
+                parts.append(f"Résumé\n{summary}")
+
+        rows = ["État | Modèle | Taille | RAM | Défaut | Expiration | Contexte"]
+        default_norm = normalize_model(snap.default_model)
+        if snap.models:
+            for model in snap.models:
+                rows.append(
+                    " | ".join(
+                        (
+                            "● RAM" if model.loaded else "○ disque",
+                            model.name,
+                            format_bytes(model.size),
+                            format_bytes(model.loaded_size) if model.loaded else "—",
+                            "défaut" if normalize_model(model.name) == default_norm else "—",
+                            format_expiry_relative(model.expires_at) if model.loaded else "—",
+                            str(model.context_length or "—"),
+                        )
+                    )
+                )
+        else:
+            rows.append("Aucun modèle téléchargé — touche a pour ajouter")
+        parts.append("Modèles\n" + "\n".join(rows))
+
+        if self.details_widget is not None:
+            details = static_plain_text(self.details_widget)
+            if details:
+                parts.append(f"Détails\n{details}")
+        if self.status_widget is not None:
+            status = static_plain_text(self.status_widget)
+            if status:
+                parts.append(status)
+        return "\n\n".join(parts)
+
+    def _current_screen_plain_text(self) -> str:
+        screen = self.screen
+        text = screen_plain_text(screen)
+        if text:
+            # The default screen needs the DataTable reconstructed as text;
+            # other screens expose their own copyable_text() through
+            # screen_plain_text(). Detect the dashboard by its table.
+            try:
+                screen.query_one("#models", DataTable)
+            except Exception:
+                return text
+            return self._main_screen_plain_text()
+        try:
+            screen.query_one("#models", DataTable)
+        except Exception:
+            return ""
+        return self._main_screen_plain_text()
+
+    def action_copy_screen_text(self) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            # Shift+C is text input in a field (for example the log search or
+            # a model name); do not steal it for the copy shortcut.
+            return
+        if isinstance(focused, TextArea) and not focused.read_only:
+            return
+        text = self._current_screen_plain_text()
+        if not text:
+            self.notify("Aucun texte à copier sur cet écran.", severity="warning")
+            return
+        try:
+            self.copy_to_clipboard(text)
+        except Exception as exc:
+            self.notify(f"Copie impossible : {exc}", severity="error")
+            return
+        self.notify(f"Texte copié ({len(text)} caractères) — Maj+C.")
 
     def selected_model_name(self) -> str:
         if self.models_table is None:

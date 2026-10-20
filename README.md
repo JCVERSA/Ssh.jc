@@ -1249,12 +1249,15 @@ L’affichage s’adapte à la taille du terminal : mode standard à partir d’
 | `f` | Afficher `ola fluid` |
 | `g` | Ouvrir les journaux Supervisor (`1` à `5` : fichier, `/` : recherche, `Entrée` puis `n`/`N` : résultats, `f` : suivi automatique, `r`, `q`) |
 | `t` | Changer de thème parmi `textual-dark`, `nord` et `textual-light` ; le choix est mémorisé |
+| `C` (Maj+C) | Copier le texte de l’écran courant : sur l’écran principal, résumé + modèles + détails + statut ; dans les journaux, la sélection si elle existe sinon le journal affiché ; dans une sortie d’action, la sortie complète. Dans un champ de saisie, Maj+C continue de taper « C ». |
 | `r` | Rafraîchir maintenant |
 | `q` | Quitter ou fermer l’écran courant |
 
 Les actions longues ouvrent immédiatement un écran d’exécution : la sortie de `ola` y défile en direct, avec le temps écoulé. Pendant l’exécution, `q` ou `Ctrl+C` demande l’annulation du processus (le CLI et ses sous-processus sont arrêtés proprement) ; une fois l’action terminée ou annulée, `q` ferme l’écran. La suppression demande une confirmation dans la TUI, mais pas de mot à taper. Dans toutes les confirmations, le focus initial est placé sur **Annuler** : appuyer immédiatement sur `Entrée` annule, et il faut choisir explicitement le bouton d’exécution pour lancer l’action. Seul le bouton de suppression utilise la couleur de danger. En utilisateur non-root, l’affichage et les lectures restent disponibles, mais `u`, `d`, `l` et `a` sont refusés avant confirmation car ils exigent root.
 
 Dans l’écran des journaux, `/` place le curseur dans la recherche ; `Entrée` valide le terme et positionne le journal sur le premier résultat, puis `n` et `N` parcourent les résultats dans les deux sens, avec le compteur affiché dans le titre. La touche `f` active ou désactive le suivi automatique, qui relit le fichier toutes les deux secondes et se place à la fin ; l’état du suivi reste visible à côté du champ de recherche.
+
+La touche `C` (Maj+C) copie le texte de l’écran courant dans le presse-papiers du terminal. Dans les journaux et l’aide, elle copie d’abord la sélection faite dans la zone de texte ; sans sélection, elle copie tout le contenu affiché. Sur l’écran principal, elle copie le résumé, le tableau des modèles, le détail du modèle sélectionné et la barre d’état ; dans un écran de sortie, elle copie le titre, toute la sortie reçue et le statut final. Les écrans de confirmation et le menu d’actions peuvent aussi être copiés sans déclencher l’action. Dans un champ de saisie, Maj+C reste la saisie du caractère « C ». Cette copie utilise le mécanisme presse-papiers du terminal (OSC 52 via Textual) : le terminal doit l’accepter pour que le texte arrive dans le presse-papiers local.
 
 La touche `t` fait défiler trois thèmes Textual choisis pour garder une interface lisible : `textual-dark` (défaut), `nord` et `textual-light`. Le dernier thème utilisé est écrit dans `~/.config/ola-tui/theme` — ou dans le fichier indiqué par `OLA_TUI_THEME_FILE` — et restauré au lancement suivant. Un fichier absent, illisible ou contenant un thème inconnu retombe proprement sur `textual-dark`.
 
@@ -1264,6 +1267,7 @@ La touche `t` fait défiler trois thèmes Textual choisis pour garder une interf
 - Elle ne remplace ni le menu `ola`, ni les commandes scriptables.
 - Les actions passent par le CLI : un bench lancé depuis la TUI a donc les mêmes effets RAM que `ola bench` en ligne de commande.
 - Le rendu exact dépend du terminal (taille, couleurs, police). Un terminal d’au moins environ 100 colonnes est recommandé pour tout voir ; `80×24` reste propre en mode compact, et les très petits terminaux conservent le tableau en masquant les panneaux.
+- La copie Maj+C envoie le texte au presse-papiers du terminal (OSC 52) ; si le terminal ou le terminal web utilisé refuse ce mécanisme, la TUI affiche la copie comme envoyée mais le presse-papiers local peut rester inchangé.
 
 ## Utiliser l’API Ollama
 
