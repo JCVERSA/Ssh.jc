@@ -167,6 +167,20 @@ else
   echo "FAIL: published artifact SHA-256 mismatch (see $OUT/artifact-sha256.log)"
   fail=$((fail + 1))
 fi
+if bash -n "$ROOT/Install.sh"; then
+  echo "PASS: Install.sh syntax"
+  pass=$((pass + 1))
+else
+  echo "FAIL: Install.sh syntax"
+  fail=$((fail + 1))
+fi
+check_file_contains "$ROOT/Install.sh" "signed-by=/usr/share/keyrings/nodesource.gpg" "NodeSource uses a signed apt repository"
+check_absent "$ROOT/Install.sh" "deb.nodesource.com/setup_" "NodeSource remote setup script is not downloaded"
+check_absent "$ROOT/Install.sh" "sudo -E bash" "remote setup scripts are not executed as root"
+check_file_contains "$ROOT/tui/requirements.txt" "--hash=sha256:" "TUI dependencies carry PyPI wheel hashes"
+check_file_contains "$ARTIFACT" "--require-hashes" "TUI installer enforces PyPI hashes"
+check_file_contains "$ARTIFACT" "Python 3.11 or newer" "TUI installer states the supported Python floor"
+check_file_contains "$ARTIFACT" "--max-filesize" "self-update bounds download sizes"
 
 # --- Fluid status / warm / preset --------------------------------------------
 reset_case
@@ -220,6 +234,7 @@ reset_case
 run speed apply > "$OUT/speed-apply.log" 2>&1; echo "speed apply exit=$?"
 check "$OUT/speed-apply.log" "Verification passed for 2/2" "global speed apply verifies all models"
 check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" 'OLLAMA_FLASH_ATTENTION="1"' "speed config enables Flash Attention"
+check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" 'OLLAMA_MAX_QUEUE="10"' "Ollama pending request queue is bounded"
 
 run fluid keepalive 30m > "$OUT/keepalive.log" 2>&1; echo "keepalive exit=$?"
 check "$OUT/keepalive.log" "Keep-alive serveur par défaut : 30m" "keep-alive applies"
@@ -250,6 +265,21 @@ reset_case
 run fluid keepalive nonsense > "$OUT/keepalive-invalid.log" 2>&1; invalid_exit=$?
 echo "invalid keepalive exit=$invalid_exit"
 check "$OUT/keepalive-invalid.log" "Invalid keep-alive duration" "invalid keep-alive rejected"
+
+reset_case
+export OLLAMA_CONTEXT_LENGTH='1024",OLLAMA_HOST="0.0.0.0:11434'
+run setup default > "$OUT/setup-invalid-context.log" 2>&1; invalid_context_exit=$?
+unset OLLAMA_CONTEXT_LENGTH
+echo "invalid context exit=$invalid_context_exit"
+check "$OUT/setup-invalid-context.log" "Invalid OLLAMA_CONTEXT_LENGTH" "invalid Ollama context is rejected"
+check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "0.0.0.0:11434" "context value cannot inject a public Ollama bind address"
+if [[ "$invalid_context_exit" -ne 0 ]]; then
+  echo "PASS: invalid Ollama context exits nonzero"
+  pass=$((pass + 1))
+else
+  echo "FAIL: invalid Ollama context should exit nonzero"
+  fail=$((fail + 1))
+fi
 
 # --- TUI shell integration -----------------------------------------------------
 reset_case
@@ -309,6 +339,13 @@ check "$OUT/setup-default.log" "Setup rapide : modèle qwen3:1.7b · tunnel 1" "
 check "$OUT/setup-default.log" "Quick Tunnel URL: https://fresh-quick.trycloudflare.com" "setup default configures a Quick Tunnel"
 check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:1.7b" "setup default saves the built-in default model"
 check_file_contains "$TEST_ETC/ollama-cloudflare-url" "https://fresh-quick.trycloudflare.com" "setup default saves the Quick Tunnel URL"
+if [[ "$(stat -c %a "$TEST_ETC/ollama-cloudflare-url" 2>/dev/null || true)" == "600" ]]; then
+  echo "PASS: saved public URL is created with mode 600"
+  pass=$((pass + 1))
+else
+  echo "FAIL: saved public URL should have mode 600"
+  fail=$((fail + 1))
+fi
 check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "user=ollama" "standard setup keeps the dedicated Ollama user"
 check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "OLLAMA_MODELS=" "standard setup does not force a Colab models directory"
 check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "LD_LIBRARY_PATH=" "standard setup does not add the Colab NVIDIA library path"
@@ -338,14 +375,17 @@ check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:0.6b" "interactiv
 export OLA_COLAB=1
 export OLA_COLAB_STATE_DIR="$TEST_STATE/colab-state"
 export OLLAMA_MODELS="$TEST_STATE/colab-state/models"
+export LD_LIBRARY_PATH="/tmp/attacker-libs"
 reset_case
 run setup default > "$OUT/setup-colab.log" 2>&1; setup_colab_exit=$?
+unset LD_LIBRARY_PATH
 echo "setup colab exit=$setup_colab_exit"
 check "$OUT/setup-colab.log" "État Colab sauvegardé" "Colab setup saves persistent state"
 check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "user=root" "Colab Supervisor runs Ollama as root"
 check_file_contains "$TEST_ETC/supervisor/conf.d/cloudflared-ollama.conf" "user=root" "Colab Supervisor runs cloudflared as root"
 check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "OLLAMA_MODELS=\"$TEST_STATE/colab-state/models\"" "Colab setup writes the persistent models directory"
 check_file_contains "$TEST_ETC/supervisor/conf.d/ollama.conf" "LD_LIBRARY_PATH=\"/usr/lib64-nvidia" "Colab setup exposes NVIDIA libraries to Ollama"
+check_absent "$TEST_ETC/supervisor/conf.d/ollama.conf" "/tmp/attacker-libs" "Colab service does not inherit a caller LD_LIBRARY_PATH"
 check_file_contains "$TEST_STATE/colab-state/config/ollama-cloudflare-model" "qwen3:1.7b" "Colab state keeps the default model setting"
 check_file "$TEST_ETC/ollama-cloudflare-colab" "Colab setup writes the runtime profile marker"
 run colab status > "$OUT/colab-status.log" 2>&1; colab_status_exit=$?
@@ -361,6 +401,28 @@ printf 'qwen3:0.6b\n' > "$TEST_ETC/ollama-cloudflare-model"
 run colab restore > "$OUT/colab-restore.log" 2>&1; colab_restore_exit=$?
 echo "colab restore exit=$colab_restore_exit"
 check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:1.7b" "Colab restore brings back the saved default model"
+
+printf '%s\n' 'bad model!' > "$TEST_STATE/colab-state/config/ollama-cloudflare-model"
+printf 'qwen3:0.6b\n' > "$TEST_ETC/ollama-cloudflare-model"
+run colab restore > "$OUT/colab-restore-invalid.log" 2>&1; colab_restore_invalid_exit=$?
+echo "colab restore invalid exit=$colab_restore_invalid_exit"
+check "$OUT/colab-restore-invalid.log" "État Colab invalide (modèle)" "Colab restore rejects an invalid saved model"
+check_file_contains "$TEST_ETC/ollama-cloudflare-model" "qwen3:0.6b" "invalid Colab state does not replace the local model"
+if [[ "$colab_restore_invalid_exit" -ne 0 ]]; then
+  echo "PASS: invalid Colab restore exits nonzero"
+  pass=$((pass + 1))
+else
+  echo "FAIL: invalid Colab restore should exit nonzero"
+  fail=$((fail + 1))
+fi
+printf '%s\n' 'qwen3:1.7b' > "$TEST_STATE/colab-state/config/ollama-cloudflare-model"
+
+reset_case
+export COLAB_GPU="test-only"
+run colab status > "$OUT/colab-status-ambient.log" 2>&1; colab_ambient_exit=$?
+unset COLAB_GPU
+echo "colab ambient status exit=$colab_ambient_exit"
+check "$OUT/colab-status-ambient.log" "Mode Colab : inactif" "ambient Colab variables do not enable the root profile"
 
 # --- Self-update -----------------------------------------------------------------
 export OLA_UPDATE_URL="https://updates.example.test/ollama-cloudflare-setup.sh"
@@ -445,6 +507,18 @@ if [[ "$update_rollback_exit" -ne 0 ]]; then
   pass=$((pass + 1))
 else
   echo "FAIL: failed post-update restart should exit nonzero"
+  fail=$((fail + 1))
+fi
+
+export OLA_UPDATE_URL="http://updates.example.test/ollama-cloudflare-setup.sh"
+run update > "$OUT/update-http.log" 2>&1; update_http_exit=$?
+echo "update http exit=$update_http_exit"
+check "$OUT/update-http.log" "doit utiliser HTTPS" "ola update refuses a non-HTTPS artifact URL"
+if [[ "$update_http_exit" -ne 0 ]]; then
+  echo "PASS: non-HTTPS update exits nonzero"
+  pass=$((pass + 1))
+else
+  echo "FAIL: non-HTTPS update should exit nonzero"
   fail=$((fail + 1))
 fi
 unset OLA_UPDATE_URL OLA_UPDATE_SHA256_URL

@@ -51,6 +51,19 @@ save_keep_alive(){
   chmod 600 "$KEEPALIVE_FILE" || die "Could not set permissions on $KEEPALIVE_FILE."
 }
 
+# Paths interpolated into the Supervisor environment line must not be able
+# to break out of their quoted value or smuggle in another environment
+# assignment. Reject quotes, backslashes, commas and line breaks rather than
+# trying to escape a format that has no safe general escaping rule here.
+is_safe_service_path(){
+  local value=$1
+  [[ -n "$value" && "$value" == /* ]] || return 1
+  case "$value" in
+    *\"*|*\\*|*,*|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  return 0
+}
+
 saved_ollama_models_dir(){
   if [[ -n "${OLLAMA_MODELS_DIR:-}" ]]; then
     printf '%s' "$OLLAMA_MODELS_DIR"
@@ -63,6 +76,8 @@ ensure_ollama_models_dir(){
   local models_dir
   models_dir=$(saved_ollama_models_dir)
   [[ -n "$models_dir" ]] || return 0
+  is_safe_service_path "$models_dir" \
+    || die "Unsafe Ollama models directory: $models_dir (expected an absolute path without quotes, backslashes, commas or line breaks)."
   if is_colab_mode; then
     # Google Drive FUSE does not provide reliable Unix ownership/mode changes.
     # The Colab service runs as root, so plain directory creation is enough.
@@ -75,29 +90,27 @@ ensure_ollama_models_dir(){
 }
 
 colab_gpu_library_path(){
-  local gpu_path="/usr/lib64-nvidia:/usr/local/cuda/lib64" candidate
-  for candidate in /usr/lib64-nvidia /usr/local/cuda/lib64; do
-    if [[ -d "$candidate" ]]; then
-      case ":$gpu_path:" in
-        *":$candidate:"*) ;;
-        *) gpu_path="${gpu_path}:$candidate" ;;
-      esac
-    fi
-  done
-  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-    gpu_path="${gpu_path}:${LD_LIBRARY_PATH}"
-  fi
-  printf '%s' "$gpu_path"
+  # Only the fixed Colab/NVIDIA locations are trusted in the root service
+  # environment. Never propagate an inherited LD_LIBRARY_PATH into the
+  # Supervisor configuration: a caller-supplied search path would control
+  # which shared libraries the Ollama service loads.
+  printf '%s' "/usr/lib64-nvidia:/usr/local/cuda/lib64"
 }
 
 ollama_environment_line(){
   local mode=$1 env models_dir
-  env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\""
+  is_valid_context_length "$OLLAMA_CONTEXT_LENGTH" \
+    || die "Invalid OLLAMA_CONTEXT_LENGTH='$OLLAMA_CONTEXT_LENGTH' (expected a positive integer)."
+  is_safe_service_path "$OLLAMA_HOME" \
+    || die "Unsafe Ollama service home path: $OLLAMA_HOME"
+  env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\",OLLAMA_MAX_QUEUE=\"$OLLAMA_MAX_QUEUE\""
   if [[ "$mode" == "speed" ]]; then
     env="${env},OLLAMA_FLASH_ATTENTION=\"1\",OLLAMA_KV_CACHE_TYPE=\"q8_0\""
   fi
   models_dir=$(saved_ollama_models_dir)
   if [[ -n "$models_dir" ]]; then
+    is_safe_service_path "$models_dir" \
+      || die "Unsafe Ollama models directory: $models_dir (expected an absolute path without quotes, backslashes, commas or line breaks)."
     env="${env},OLLAMA_MODELS=\"$models_dir\""
   fi
   if is_colab_mode; then

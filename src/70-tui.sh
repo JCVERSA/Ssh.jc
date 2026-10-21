@@ -78,8 +78,8 @@ install_tui_environment(){
   if ! command -v python3 >/dev/null 2>&1; then
     apt_install python3 python3-venv || { err "Could not install Python 3 for the TUI."; return 1; }
   fi
-  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
-    err "Python 3.9 or newer is required for Textual; found: $(python3 --version 2>&1 || echo unknown)"
+  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+    err "Python 3.11 or newer is required for the pinned TUI dependencies; found: $(python3 --version 2>&1 || echo unknown)"
     return 1
   fi
 
@@ -104,7 +104,7 @@ install_tui_environment(){
   fi
 
   info "Installing pinned Python packages for Textual $OLA_TUI_TEXTUAL_VERSION (network access to PyPI is required)..."
-  if ! "$OLA_TUI_PYTHON" -m pip install --disable-pip-version-check --no-input -r "$OLA_TUI_REQUIREMENTS"; then
+  if ! "$OLA_TUI_PYTHON" -m pip install --disable-pip-version-check --no-input --require-hashes -r "$OLA_TUI_REQUIREMENTS"; then
     err "Could not install the pinned Textual packages from PyPI."
     return 1
   fi

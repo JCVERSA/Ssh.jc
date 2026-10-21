@@ -651,18 +651,48 @@ apt_install() {
 }
 
 install_nodejs_nodesource() {
-    local major=$1 tmp_script
-    tmp_script=$(mktemp "/tmp/nodesource-setup-XXXXXX.sh") || return 1
-    info "Downloading the NodeSource setup script for Node.js ${major}.x ..."
-    if ! curl -fsSL "https://deb.nodesource.com/setup_${major}.x" -o "$tmp_script" 2>&1 | tee -a "$LOG_FILE"; then
-        rm -f "$tmp_script"
+    local major=$1 arch key_tmp keyring_tmp
+    case "$major" in
+        22|24) ;;
+        *) error "Unsupported Node.js major version: '$major' (supported: 22 or 24)."; return 1 ;;
+    esac
+    arch=$(dpkg --print-architecture 2>/dev/null || true)
+    case "$arch" in
+        amd64|arm64|armhf) ;;
+        *) error "Unsupported dpkg architecture for NodeSource: '${arch:-unknown}'."; return 1 ;;
+    esac
+
+    # Do not download and execute NodeSource's remote setup shell script.
+    # Configure the same vendor repository through apt instead: the key is
+    # installed as a dedicated keyring and every package is then verified by
+    # apt against that key (signed-by), with no remote code execution.
+    apt_install curl gnupg ca-certificates || return 1
+    sudo install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d || return 1
+
+    key_tmp=$(mktemp "/tmp/nodesource-key-XXXXXX.asc") || return 1
+    keyring_tmp=$(mktemp "/tmp/nodesource-keyring-XXXXXX.gpg") || { rm -f "$key_tmp"; return 1; }
+    info "Adding the signed NodeSource apt repository for Node.js ${major}.x ..."
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 --max-filesize 65536 "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key" -o "$key_tmp" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "$key_tmp" "$keyring_tmp"
         return 1
     fi
-    if ! sudo -E bash "$tmp_script" 2>&1 | tee -a "$LOG_FILE"; then
-        rm -f "$tmp_script"
+    if ! gpg --batch --yes --dearmor -o "$keyring_tmp" "$key_tmp" 2>&1 | tee -a "$LOG_FILE"; then
+        rm -f "$key_tmp" "$keyring_tmp"
         return 1
     fi
-    rm -f "$tmp_script"
+    if ! sudo install -m 0644 "$keyring_tmp" /usr/share/keyrings/nodesource.gpg; then
+        rm -f "$key_tmp" "$keyring_tmp"
+        return 1
+    fi
+    rm -f "$key_tmp" "$keyring_tmp"
+
+    if ! printf '%s\n' \
+        "deb [arch=${arch} signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${major}.x nodistro main" \
+        | sudo tee /etc/apt/sources.list.d/nodesource.list >/dev/null; then
+        return 1
+    fi
+
+    apt_update || return 1
     apt_install nodejs || return 1
     command -v node &>/dev/null && command -v npm &>/dev/null
 }
@@ -726,10 +756,10 @@ install_essentials() {
     apt_install python3 python3-venv python3-pip || failures=$((failures + 1))
 
     while true; do
-        node_choice=$(ask "Node.js major version to install (20 LTS or 22)" "20")
+        node_choice=$(ask "Node.js major version to install (22 LTS or 24 LTS)" "24")
         case "$node_choice" in
-            20|22) break ;;
-            *) error "Invalid Node.js version: '$node_choice'. Enter 20 or 22." ;;
+            22|24) break ;;
+            *) error "Invalid Node.js version: '$node_choice'. Enter 22 or 24." ;;
         esac
     done
     if install_nodejs_nodesource "$node_choice"; then
@@ -1073,7 +1103,7 @@ if [[ "$DO_ESSENTIALS" -eq 1 ]]; then
     exit 1
 fi
 
-if [[ "$DO_FULL" -eq 1 ]] && confirm "Install the essential VPS tools pack too (build tools, Python, Node.js 20/22 + pm2, cloudflared, admin utilities)?"; then
+if [[ "$DO_FULL" -eq 1 ]] && confirm "Install the essential VPS tools pack too (build tools, Python, Node.js 22/24 + pm2, cloudflared, admin utilities)?"; then
     if ! install_essentials; then
         warn "The essentials pack reported failures. Continuing with the SSH + tunnel setup; you can re-run menu option 7 later. See the log: $LOG_FILE"
     fi

@@ -64,7 +64,7 @@ Le pack comprend :
 - outils de base et de compilation : `build-essential`, `curl`, `wget`, `git`, `vim`, `nano`, `unzip`, `zip`, `ca-certificates`, `gnupg`, `apt-transport-https`, `sudo` ;
 - confort d’administration : `tmux`, `screen`, `htop`, `net-tools`, `ufw`, `fail2ban`, `rsync`, `jq`, `dnsutils`, `lsof` ;
 - Python : `python3`, `python3-venv`, `python3-pip` ;
-- Node.js : le script demande la version majeure à installer (**20 LTS** ou **22**) via NodeSource, puis installe `nodejs` et `pm2` en global ;
+- Node.js : le script demande la version majeure à installer (**22 LTS** ou **24 LTS**, 24 par défaut) via le dépôt apt signé de NodeSource, puis installe `nodejs` et `pm2` en global ;
 - `cloudflared` : le script essaie d’abord le dépôt apt officiel Cloudflare ; en cas d’échec, il utilise en secours le paquet `.deb` GitHub vérifié par SHA-256.
 
 Le pack est “best-effort” : si un composant échoue, les autres sont quand même tentés et les échecs sont résumés dans le log. Dans le menu dédié, le script termine avec une erreur si au moins un composant a échoué ; dans l’installation complète, il avertit et continue vers SSH + tunnel.
@@ -88,7 +88,7 @@ Si ton compte vient juste d’être ajouté au groupe `sudo`, reconnecte ta sess
 
 - Le script rend SSH joignable depuis Internet une fois le tunnel lancé : préfère un utilisateur admin dédié avec clé SSH, puis désactive l’authentification par mot de passe quand c’est proposé.
 - Avant modification, `sshd_config` est sauvegardé et vérifié avec `sshd -t` / `sshd -T`.
-- Les paquets/scripts distants sans checksum vérifiable ne sont pas installés automatiquement.
+- Les paquets/scripts distants sans checksum vérifiable ne sont pas installés automatiquement. Node.js n’exécute plus le script distant de NodeSource : le script configure son dépôt apt avec une clé dédiée (`signed-by`) et laisse apt vérifier les paquets.
 
 ---
 
@@ -128,7 +128,7 @@ Principes :
 - La commande courte **`ola`** est installée dans `/usr/local/bin/ola`.
 - Une interface terminal optionnelle, **`ola tui`**, est installée automatiquement par le setup ; le moteur et toutes les commandes texte continuent de fonctionner si son installation échoue.
 - Les téléchargements d’Ollama et de cloudflared sont vérifiés quand un checksum est disponible.
-- Ollama est volontairement limité pour les petits sandboxes : un seul modèle chargé, une requête parallèle et un contexte de 1024 tokens par défaut.
+- Ollama est volontairement limité pour les petits sandboxes : un seul modèle chargé, une requête parallèle, une file d’attente d’au plus 10 requêtes et un contexte de 1024 tokens par défaut.
 - Le même artefact fonctionne sur **VPS/sandbox Debian/Ubuntu classique** et dans **Google Colab**. Le profil Colab est explicitement activé par le notebook (`OLA_COLAB=1`) : il conserve les modèles et les petits réglages dans Google Drive et utilise le GPU NVIDIA quand Colab en fournit un. Sans ce profil, le comportement VPS/sandbox historique reste inchangé : utilisateurs système dédiés `ollama`/`cloudflared`, stockage local des modèles et aucun chemin NVIDIA Colab ajouté.
 
 ## Prérequis
@@ -492,6 +492,7 @@ OLLAMA_CONTEXT_LENGTH="1024"
 OLLAMA_KEEP_ALIVE="5m"
 OLLAMA_MAX_LOADED_MODELS="1"
 OLLAMA_NUM_PARALLEL="1"
+OLLAMA_MAX_QUEUE="10"
 HOME="/var/lib/ollama"
 ```
 
@@ -503,7 +504,8 @@ Explications :
 - `OLLAMA_CONTEXT_LENGTH` : taille de contexte par défaut, volontairement basse pour les petits sandboxes ;
 - `OLLAMA_KEEP_ALIVE="5m"` : un modèle inactif peut être déchargé après 5 minutes ; cette valeur par défaut du serveur est enregistrée dans `/etc/ollama-cloudflare-keepalive` et se change délibérément avec `ola fluid keepalive <durée|reset>` (voir [Fluidité](#fluidité--premier-token-et-streaming)) ;
 - `OLLAMA_MAX_LOADED_MODELS="1"` : objectif d’un seul modèle chargé en RAM sur une nouvelle installation ;
-- `OLLAMA_NUM_PARALLEL="1"` : une seule requête à la fois, plus sûr en RAM.
+- `OLLAMA_NUM_PARALLEL="1"` : une seule requête à la fois, plus sûr en RAM ;
+- `OLLAMA_MAX_QUEUE="10"` : au plus 10 requêtes en attente derrière la requête active. Au-delà, Ollama refuse vite la requête au lieu d’accumuler des connexions et des contextes en attente sur un petit serveur exposé sans authentification.
 
 En mode **Pack Speed** (voir [Vitesse : mesurer et optimiser](#vitesse--mesurer-et-optimiser-pack-speed)), deux variables supplémentaires sont ajoutées par `ola speed apply` :
 
@@ -1210,7 +1212,7 @@ Le setup installe automatiquement l’environnement TUI dans un environnement Py
 /usr/local/lib/ollama-cloudflare/tui-venv/
 ```
 
-Il faut Python 3.9 ou plus, le paquet système `python3-venv` si la création du venv le demande, et un accès à PyPI pendant l’installation. Les versions Python sont épinglées dans `tui-requirements.txt` (Textual `8.2.8` au moment de l’introduction). L’environnement de référence occupait environ 47 Mo. Contrairement aux binaires Ollama/cloudflared, ces paquets PyPI ne sont pas vérifiés par une somme SHA-256 dans ce projet : c’est une limite explicite du choix Textual.
+Il faut Python 3.11 ou plus, le paquet système `python3-venv` si la création du venv le demande, et un accès à PyPI pendant l’installation. Les versions Python sont épinglées dans `tui-requirements.txt` (Textual `8.2.8` au moment de l’introduction), avec les empreintes SHA-256 des wheels PyPI : l’installation utilise `pip --require-hashes`, donc un paquet modifié ou remplacé est refusé. L’environnement de référence occupait environ 47 Mo.
 
 Si l’installation de la TUI échoue, le setup continue et toutes les commandes classiques restent disponibles. `ola doctor` signale alors la TUI comme un avertissement, pas comme une panne du moteur. `sudo ola tui install` permet de réessayer sans refaire tout le setup.
 
@@ -1627,7 +1629,7 @@ Causes fréquentes :
 
 - lancement dans un pipe, un script ou un terminal non interactif : la TUI refuse volontairement et les commandes texte restent la bonne interface ;
 - première mise à jour effectuée seulement avec `start` : le fichier Python a été extrait, mais le venv doit être créé une fois par `ola tui install` (ou par un setup complet) ;
-- Python 3.9+, `python3-venv` ou l’accès réseau à PyPI manquant pendant l’installation ;
+- Python 3.11+, `python3-venv` ou l’accès réseau à PyPI manquant pendant l’installation ;
 - paquets Python épinglés non installés ou venv incomplet : `ola tui install` recrée proprement un venv sans pip et réinstalle les versions de `tui-requirements.txt`.
 
 Si la réparation échoue, le moteur n’est pas en panne : `ola status`, `ola doctor`, `ola models` et le menu texte continuent de fonctionner.
@@ -1821,14 +1823,27 @@ Bonnes pratiques compatibles avec ce choix :
 - La configuration du tunnel et les journaux sont protégés par des permissions restrictives.
 - Plusieurs commandes d’administration demandent root. Évite de lancer le script téléchargé sans vérifier son origine.
 
-### Origine des binaires
+### Origine des binaires et des paquets
 
 Pendant le setup :
 
 - Ollama est installé depuis l’archive officielle GitHub après vérification SHA-256 ;
 - le script essaie plusieurs formats d’archive publiés (`tar.zst`, puis formats compressés publiés) et refuse une archive sans checksum correspondant ;
 - cloudflared est installé d’abord via le dépôt apt officiel Cloudflare ;
-- si ce dépôt échoue, le script retombe sur le paquet GitHub dont le digest SHA-256 est vérifié dans les métadonnées de release.
+- si ce dépôt échoue, le script retombe sur le paquet GitHub dont le digest SHA-256 est vérifié dans les métadonnées de release ;
+- les dépendances Python de la TUI sont épinglées par version **et** par SHA-256, puis installées avec `pip --require-hashes` ;
+- dans `Install.sh`, Node.js est installé depuis le dépôt apt signé de NodeSource : le script distant `setup_*.x` n’est ni téléchargé ni exécuté.
+
+Un SHA-256 téléchargé depuis la même origine que l’artefact protège contre une corruption ou une substitution du fichier seul, mais il ne remplace pas une signature indépendante si le compte ou le dépôt de publication lui-même est compromis. C’est une limite résiduelle assumée pour les binaires et pour `ola update`.
+
+### Durcissements appliqués au gestionnaire
+
+- `ola update` refuse les URL non-HTTPS et borne la taille des téléchargements (10 Mio pour l’artefact, 4 Kio pour le fichier SHA-256) avant vérification.
+- L’URL publique enregistrée est créée directement avec des permissions `600` : elle ne passe plus par une création temporaire dépendante de l’`umask` du shell.
+- La configuration Supervisor générée refuse un contexte non numérique et les chemins de service contenant guillemets, antislashs, virgules ou retours à la ligne, afin qu’une variable d’environnement ne puisse pas injecter une autre directive dans la configuration.
+- En mode Colab, seul un profil explicitement demandé (`OLA_COLAB=1`) ou le marqueur créé par un setup Colab précédent active les services en root ; les variables ambiantes `COLAB_*` ne suffisent plus. Le chemin de bibliothèques transmis à Ollama est limité aux emplacements NVIDIA fixes de Colab, sans recopier un `LD_LIBRARY_PATH` hérité.
+- L’état restauré depuis Google Drive est validé avant copie dans `/etc` : fichiers réguliers uniquement (pas de liens symboliques), 4 Kio maximum, nom de modèle valide, mode Pack Speed connu et keep-alive valide.
+- La file d’attente Ollama est limitée à 10 requêtes (`OLLAMA_MAX_QUEUE="10"`) en plus des limites existantes : 1 modèle chargé, 1 requête parallèle et contexte par défaut de 1024.
 
 ## Désactivation
 

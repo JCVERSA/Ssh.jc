@@ -24,10 +24,13 @@ CLOUDFLARED_USER="cloudflared"
 # Colab support is opt-in. A normal VPS or sandbox keeps the historical
 # dedicated service users and local model storage unless OLA_COLAB=1 (or a
 # previous Colab setup marker) explicitly selects the Colab runtime profile.
+# Ambient COLAB_* variables alone are not enough to select the root-service
+# profile: they are descriptive runtime metadata, not an operator's explicit
+# decision to relax the normal service-user isolation.
 COLAB_RUNTIME_FILE="/etc/ollama-cloudflare-colab"
 if [[ -z "${OLA_COLAB+x}" ]]; then
   OLA_COLAB="0"
-  if [[ -n "${COLAB_RELEASE_TAG:-}" || -n "${COLAB_GPU:-}" || -n "${COLAB_BACKEND_VERSION:-}" || -f "$COLAB_RUNTIME_FILE" ]]; then
+  if [[ -f "$COLAB_RUNTIME_FILE" ]]; then
     OLA_COLAB="1"
   fi
 fi
@@ -47,6 +50,11 @@ OLLAMA_GROUP=""
 CLOUDFLARED_GROUP=""
 OLLAMA_HOME=""
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
+# The public tunnel is intentionally unauthenticated, and Ollama's own
+# default would queue up to 512 requests behind the single worker. Keep the
+# pending queue deliberately small on these resource-constrained hosts;
+# excess requests fail fast instead of accumulating connections and memory.
+OLLAMA_MAX_QUEUE="10"
 CF_TUNNEL_PROTOCOL="${CF_TUNNEL_PROTOCOL:-auto}"
 OLA_BIN_DIR="/usr/local/bin"
 OLA_COMMAND="$OLA_BIN_DIR/ola"
@@ -186,6 +194,10 @@ is_valid_hostname(){
   [[ ${#h} -le 253 ]] || return 1
   [[ "$h" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || return 1
   return 0
+}
+
+is_valid_context_length(){
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
 apt_update(){

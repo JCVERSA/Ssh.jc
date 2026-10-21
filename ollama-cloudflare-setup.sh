@@ -24,10 +24,13 @@ CLOUDFLARED_USER="cloudflared"
 # Colab support is opt-in. A normal VPS or sandbox keeps the historical
 # dedicated service users and local model storage unless OLA_COLAB=1 (or a
 # previous Colab setup marker) explicitly selects the Colab runtime profile.
+# Ambient COLAB_* variables alone are not enough to select the root-service
+# profile: they are descriptive runtime metadata, not an operator's explicit
+# decision to relax the normal service-user isolation.
 COLAB_RUNTIME_FILE="/etc/ollama-cloudflare-colab"
 if [[ -z "${OLA_COLAB+x}" ]]; then
   OLA_COLAB="0"
-  if [[ -n "${COLAB_RELEASE_TAG:-}" || -n "${COLAB_GPU:-}" || -n "${COLAB_BACKEND_VERSION:-}" || -f "$COLAB_RUNTIME_FILE" ]]; then
+  if [[ -f "$COLAB_RUNTIME_FILE" ]]; then
     OLA_COLAB="1"
   fi
 fi
@@ -47,6 +50,11 @@ OLLAMA_GROUP=""
 CLOUDFLARED_GROUP=""
 OLLAMA_HOME=""
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-1024}"
+# The public tunnel is intentionally unauthenticated, and Ollama's own
+# default would queue up to 512 requests behind the single worker. Keep the
+# pending queue deliberately small on these resource-constrained hosts;
+# excess requests fail fast instead of accumulating connections and memory.
+OLLAMA_MAX_QUEUE="10"
 CF_TUNNEL_PROTOCOL="${CF_TUNNEL_PROTOCOL:-auto}"
 OLA_BIN_DIR="/usr/local/bin"
 OLA_COMMAND="$OLA_BIN_DIR/ola"
@@ -186,6 +194,10 @@ is_valid_hostname(){
   [[ ${#h} -le 253 ]] || return 1
   [[ "$h" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || return 1
   return 0
+}
+
+is_valid_context_length(){
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
 apt_update(){
@@ -1052,6 +1064,19 @@ save_keep_alive(){
   chmod 600 "$KEEPALIVE_FILE" || die "Could not set permissions on $KEEPALIVE_FILE."
 }
 
+# Paths interpolated into the Supervisor environment line must not be able
+# to break out of their quoted value or smuggle in another environment
+# assignment. Reject quotes, backslashes, commas and line breaks rather than
+# trying to escape a format that has no safe general escaping rule here.
+is_safe_service_path(){
+  local value=$1
+  [[ -n "$value" && "$value" == /* ]] || return 1
+  case "$value" in
+    *\"*|*\\*|*,*|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  return 0
+}
+
 saved_ollama_models_dir(){
   if [[ -n "${OLLAMA_MODELS_DIR:-}" ]]; then
     printf '%s' "$OLLAMA_MODELS_DIR"
@@ -1064,6 +1089,8 @@ ensure_ollama_models_dir(){
   local models_dir
   models_dir=$(saved_ollama_models_dir)
   [[ -n "$models_dir" ]] || return 0
+  is_safe_service_path "$models_dir" \
+    || die "Unsafe Ollama models directory: $models_dir (expected an absolute path without quotes, backslashes, commas or line breaks)."
   if is_colab_mode; then
     # Google Drive FUSE does not provide reliable Unix ownership/mode changes.
     # The Colab service runs as root, so plain directory creation is enough.
@@ -1076,29 +1103,27 @@ ensure_ollama_models_dir(){
 }
 
 colab_gpu_library_path(){
-  local gpu_path="/usr/lib64-nvidia:/usr/local/cuda/lib64" candidate
-  for candidate in /usr/lib64-nvidia /usr/local/cuda/lib64; do
-    if [[ -d "$candidate" ]]; then
-      case ":$gpu_path:" in
-        *":$candidate:"*) ;;
-        *) gpu_path="${gpu_path}:$candidate" ;;
-      esac
-    fi
-  done
-  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
-    gpu_path="${gpu_path}:${LD_LIBRARY_PATH}"
-  fi
-  printf '%s' "$gpu_path"
+  # Only the fixed Colab/NVIDIA locations are trusted in the root service
+  # environment. Never propagate an inherited LD_LIBRARY_PATH into the
+  # Supervisor configuration: a caller-supplied search path would control
+  # which shared libraries the Ollama service loads.
+  printf '%s' "/usr/lib64-nvidia:/usr/local/cuda/lib64"
 }
 
 ollama_environment_line(){
   local mode=$1 env models_dir
-  env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\""
+  is_valid_context_length "$OLLAMA_CONTEXT_LENGTH" \
+    || die "Invalid OLLAMA_CONTEXT_LENGTH='$OLLAMA_CONTEXT_LENGTH' (expected a positive integer)."
+  is_safe_service_path "$OLLAMA_HOME" \
+    || die "Unsafe Ollama service home path: $OLLAMA_HOME"
+  env="OLLAMA_HOST=\"127.0.0.1:11434\",OLLAMA_ORIGINS=\"*\",OLLAMA_CONTEXT_LENGTH=\"$OLLAMA_CONTEXT_LENGTH\",OLLAMA_KEEP_ALIVE=\"$(saved_keep_alive)\",OLLAMA_MAX_LOADED_MODELS=\"1\",OLLAMA_NUM_PARALLEL=\"1\",OLLAMA_MAX_QUEUE=\"$OLLAMA_MAX_QUEUE\""
   if [[ "$mode" == "speed" ]]; then
     env="${env},OLLAMA_FLASH_ATTENTION=\"1\",OLLAMA_KV_CACHE_TYPE=\"q8_0\""
   fi
   models_dir=$(saved_ollama_models_dir)
   if [[ -n "$models_dir" ]]; then
+    is_safe_service_path "$models_dir" \
+      || die "Unsafe Ollama models directory: $models_dir (expected an absolute path without quotes, backslashes, commas or line breaks)."
     env="${env},OLLAMA_MODELS=\"$models_dir\""
   fi
   if is_colab_mode; then
@@ -1371,6 +1396,17 @@ wait_for_supervisor_program(){
   return 1
 }
 
+write_saved_public_url(){
+  local value=$1
+  # The tunnel URL is the only credential protecting the public API. Create
+  # or replace the file with mode 0600 before writing the URL, instead of
+  # briefly creating it with the process umask and chmod-ing it afterwards.
+  install -m 0600 /dev/null "$URL_FILE" \
+    || die "Could not create $URL_FILE with private permissions."
+  printf '%s\n' "$value" > "$URL_FILE" \
+    || die "Could not save the public URL to $URL_FILE."
+}
+
 configure_quick_tunnel(){
   info "Configuring a temporary Cloudflare Quick Tunnel..."
   install -d -m 0750 "$LOG_DIR"
@@ -1431,8 +1467,7 @@ EOF
     sleep 1
   done
 
-  printf '%s\n' "$url" > "$URL_FILE"
-  chmod 600 "$URL_FILE"
+  write_saved_public_url "$url"
   tighten_log_permissions
   echo
   ok "Quick Tunnel URL: $url"
@@ -1599,8 +1634,7 @@ EOF
     sleep 2
   done
 
-  printf '%s\n' "$public_url" > "$URL_FILE"
-  chmod 600 "$URL_FILE"
+  write_saved_public_url "$public_url"
   tighten_log_permissions
   if [[ "$public_verified" -eq 1 ]]; then
     ok "Named tunnel configured and verified: $public_url"
@@ -2621,6 +2655,7 @@ show_speed(){
     echo "  OLLAMA_KEEP_ALIVE      : $(ollama_config_value OLLAMA_KEEP_ALIVE)"
     echo "  OLLAMA_MAX_LOADED_MODELS : $(ollama_config_value OLLAMA_MAX_LOADED_MODELS)"
     echo "  OLLAMA_NUM_PARALLEL    : $(ollama_config_value OLLAMA_NUM_PARALLEL)"
+    echo "  OLLAMA_MAX_QUEUE       : $(ollama_config_value OLLAMA_MAX_QUEUE)"
   else
     echo "  Non lisible par cet utilisateur (relance en root pour le détail)."
   fi
@@ -3236,6 +3271,8 @@ setup_all(){
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
   esac
+  is_valid_context_length "$OLLAMA_CONTEXT_LENGTH" \
+    || die "Invalid OLLAMA_CONTEXT_LENGTH='$OLLAMA_CONTEXT_LENGTH' (expected a positive integer)."
   if is_colab_mode; then
     colab_state_restore || warn "Impossible de restaurer complètement l'état Colab ; le setup continue avec l'état local du runtime."
   fi
@@ -3291,6 +3328,12 @@ setup_all(){
 OLA_UPDATE_CANDIDATE=${OLA_UPDATE_CANDIDATE:-}
 OLA_UPDATE_CHECKSUM_FILE=${OLA_UPDATE_CHECKSUM_FILE:-}
 OLA_UPDATE_LOCK_OWNED=0
+# Bound the self-update downloads so a redirected or malfunctioning endpoint
+# cannot fill the installation filesystem before the SHA-256 check runs.
+# The generated artifact is currently well under 1 MiB; 10 MiB leaves ample
+# room for growth while still failing closed on an unbounded response.
+OLA_UPDATE_MAX_ARTIFACT_BYTES=10485760
+OLA_UPDATE_MAX_CHECKSUM_BYTES=4096
 
 update_short_hash(){
   local hash=${1:-}
@@ -3382,10 +3425,10 @@ update_exit_cleanup(){
 }
 
 update_download(){
-  local url=$1 dest=$2 label=$3
-  if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$url" > "$dest"; then
+  local url=$1 dest=$2 label=$3 max_bytes=$4
+  if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 --proto-redir =https --max-filesize "$max_bytes" "$url" > "$dest"; then
     rm -f "$dest"
-    die "Téléchargement impossible : $label ($url). Vérifie la connexion Internet puis réessaie."
+    die "Téléchargement impossible ou trop volumineux (limite $max_bytes octets) : $label ($url). Vérifie la connexion Internet puis réessaie."
   fi
   [[ -s "$dest" ]] || die "Téléchargement vide : $label ($url)."
 }
@@ -3541,6 +3584,15 @@ update_ola_command(){
     return 0
   fi
 
+  case "$OLA_UPDATE_URL" in
+    https://*) ;;
+    *) die "OLA_UPDATE_URL doit utiliser HTTPS ; mise à jour refusée." ;;
+  esac
+  case "$OLA_UPDATE_SHA256_URL" in
+    https://*) ;;
+    *) die "OLA_UPDATE_SHA256_URL doit utiliser HTTPS ; mise à jour refusée." ;;
+  esac
+
   require_commands curl sha256sum awk grep head install mktemp
   update_lock_acquire
   trap update_exit_cleanup EXIT
@@ -3556,9 +3608,9 @@ update_ola_command(){
 
   echo "--- Mise à jour de ola ---"
   info "Téléchargement de la dernière version publiée…"
-  update_download "$OLA_UPDATE_URL" "$OLA_UPDATE_CANDIDATE" "artefact ola"
+  update_download "$OLA_UPDATE_URL" "$OLA_UPDATE_CANDIDATE" "artefact ola" "$OLA_UPDATE_MAX_ARTIFACT_BYTES"
   info "Téléchargement du SHA-256 publié…"
-  update_download "$OLA_UPDATE_SHA256_URL" "$OLA_UPDATE_CHECKSUM_FILE" "SHA-256 ola"
+  update_download "$OLA_UPDATE_SHA256_URL" "$OLA_UPDATE_CHECKSUM_FILE" "SHA-256 ola" "$OLA_UPDATE_MAX_CHECKSUM_BYTES"
   expected=$(update_expected_sha256 "$OLA_UPDATE_CHECKSUM_FILE")
   candidate_hash=$(update_file_sha256 "$OLA_UPDATE_CANDIDATE" || true)
   [[ "$candidate_hash" == "$expected" ]] \
@@ -3608,7 +3660,7 @@ colab_write_runtime_marker(){
 
 colab_state_restore(){
   is_colab_mode || return 0
-  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src dst
+  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src dst value size
   [[ -n "$state_dir" ]] || return 0
   case "$state_dir" in
     /*) ;;
@@ -3621,8 +3673,30 @@ colab_state_restore(){
   fi
   for dst in "$MODEL_FILE" "$SPEED_FILE" "$KEEPALIVE_FILE"; do
     src="$config_dir/$(basename "$dst")"
-    if [[ -f "$src" ]]; then
+    if [[ -f "$src" && ! -L "$src" ]]; then
+      # Drive is a separate trust boundary from the root-owned runtime
+      # files. Restore only tiny regular files with values this program
+      # itself could have written; never follow a Drive symlink into a
+      # runtime file or copy an unexpected value into /etc.
+      size=$(stat -c %s "$src" 2>/dev/null || printf '%s' "999999")
+      if [[ ! "$size" =~ ^[0-9]+$ || "$size" -gt 4096 ]]; then
+        warn "État Colab ignoré car trop volumineux ou illisible : $src"
+        return 1
+      fi
+      value=$(head -n 1 "$src" 2>/dev/null || true)
+      case "$dst" in
+        "$MODEL_FILE")
+          is_valid_model_name "$value" || { warn "État Colab invalide (modèle) : $src"; return 1; }
+          ;;
+        "$SPEED_FILE")
+          case "$value" in balanced|speed) ;; *) warn "État Colab invalide (Pack Speed) : $src"; return 1 ;; esac
+          ;;
+        "$KEEPALIVE_FILE")
+          is_valid_keep_alive "$value" || { warn "État Colab invalide (keep-alive) : $src"; return 1; }
+          ;;
+      esac
       cp -f "$src" "$dst" || return 1
+      chmod 600 "$dst" || return 1
     fi
   done
   colab_write_runtime_marker || return 1
@@ -5669,15 +5743,26 @@ write_ola_tui_requirements(){
   local target=$1 tmp
   tmp=$(mktemp "${target}.tmp-XXXXXX") || return 1
   cat > "$tmp" <<'EOF'
-linkify-it-py==2.2.0
-markdown-it-py==4.2.0
-mdit-py-plugins==0.6.1
-mdurl==0.1.2
-platformdirs==4.13.4
-Pygments==2.21.0
-rich==15.0.0
-textual==8.2.8
-typing_extensions==4.16.0
+# Pinned Textual dependencies. The SHA-256 hashes are for the universal
+# wheels published on PyPI and are verified by pip --require-hashes.
+linkify-it-py==2.2.0 \
+    --hash=sha256:3adc40eb5af300b2605fcfdb968c24e1d780a90f1f2221af7c15e5111e94d443
+markdown-it-py==4.2.0 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdit-py-plugins==0.6.1 \
+    --hash=sha256:214c82fb2ac524472ab6a5bcab1de80f73b50443e187f401bfd77efbc7c6481d
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+platformdirs==4.13.4 \
+    --hash=sha256:502ce08e9d36cf90579ee44e1e764838842fa658e4975ef47344fd053011d2c8
+Pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
+textual==8.2.8 \
+    --hash=sha256:267375fd402dc8d981457212efa71f0e3365fd17bba144ba9bb3ed7563cb374a
+typing_extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
 EOF
   chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$target"
@@ -5735,8 +5820,8 @@ install_tui_environment(){
   if ! command -v python3 >/dev/null 2>&1; then
     apt_install python3 python3-venv || { err "Could not install Python 3 for the TUI."; return 1; }
   fi
-  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
-    err "Python 3.9 or newer is required for Textual; found: $(python3 --version 2>&1 || echo unknown)"
+  if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+    err "Python 3.11 or newer is required for the pinned TUI dependencies; found: $(python3 --version 2>&1 || echo unknown)"
     return 1
   fi
 
@@ -5761,7 +5846,7 @@ install_tui_environment(){
   fi
 
   info "Installing pinned Python packages for Textual $OLA_TUI_TEXTUAL_VERSION (network access to PyPI is required)..."
-  if ! "$OLA_TUI_PYTHON" -m pip install --disable-pip-version-check --no-input -r "$OLA_TUI_REQUIREMENTS"; then
+  if ! "$OLA_TUI_PYTHON" -m pip install --disable-pip-version-check --no-input --require-hashes -r "$OLA_TUI_REQUIREMENTS"; then
     err "Could not install the pinned Textual packages from PyPI."
     return 1
   fi

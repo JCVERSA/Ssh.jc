@@ -18,6 +18,7 @@ show_speed(){
     echo "  OLLAMA_KEEP_ALIVE      : $(ollama_config_value OLLAMA_KEEP_ALIVE)"
     echo "  OLLAMA_MAX_LOADED_MODELS : $(ollama_config_value OLLAMA_MAX_LOADED_MODELS)"
     echo "  OLLAMA_NUM_PARALLEL    : $(ollama_config_value OLLAMA_NUM_PARALLEL)"
+    echo "  OLLAMA_MAX_QUEUE       : $(ollama_config_value OLLAMA_MAX_QUEUE)"
   else
     echo "  Non lisible par cet utilisateur (relance en root pour le détail)."
   fi

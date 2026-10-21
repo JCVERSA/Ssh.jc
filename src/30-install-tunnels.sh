@@ -169,6 +169,17 @@ wait_for_supervisor_program(){
   return 1
 }
 
+write_saved_public_url(){
+  local value=$1
+  # The tunnel URL is the only credential protecting the public API. Create
+  # or replace the file with mode 0600 before writing the URL, instead of
+  # briefly creating it with the process umask and chmod-ing it afterwards.
+  install -m 0600 /dev/null "$URL_FILE" \
+    || die "Could not create $URL_FILE with private permissions."
+  printf '%s\n' "$value" > "$URL_FILE" \
+    || die "Could not save the public URL to $URL_FILE."
+}
+
 configure_quick_tunnel(){
   info "Configuring a temporary Cloudflare Quick Tunnel..."
   install -d -m 0750 "$LOG_DIR"
@@ -229,8 +240,7 @@ EOF
     sleep 1
   done
 
-  printf '%s\n' "$url" > "$URL_FILE"
-  chmod 600 "$URL_FILE"
+  write_saved_public_url "$url"
   tighten_log_permissions
   echo
   ok "Quick Tunnel URL: $url"
@@ -397,8 +407,7 @@ EOF
     sleep 2
   done
 
-  printf '%s\n' "$public_url" > "$URL_FILE"
-  chmod 600 "$URL_FILE"
+  write_saved_public_url "$public_url"
   tighten_log_permissions
   if [[ "$public_verified" -eq 1 ]]; then
     ok "Named tunnel configured and verified: $public_url"

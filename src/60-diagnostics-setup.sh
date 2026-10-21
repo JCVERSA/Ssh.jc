@@ -392,6 +392,8 @@ setup_all(){
     auto|http2|quic) ;;
     *) die "Invalid CF_TUNNEL_PROTOCOL='$CF_TUNNEL_PROTOCOL' (expected auto, http2 or quic)." ;;
   esac
+  is_valid_context_length "$OLLAMA_CONTEXT_LENGTH" \
+    || die "Invalid OLLAMA_CONTEXT_LENGTH='$OLLAMA_CONTEXT_LENGTH' (expected a positive integer)."
   if is_colab_mode; then
     colab_state_restore || warn "Impossible de restaurer complètement l'état Colab ; le setup continue avec l'état local du runtime."
   fi

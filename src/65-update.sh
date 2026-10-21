@@ -12,6 +12,12 @@
 OLA_UPDATE_CANDIDATE=${OLA_UPDATE_CANDIDATE:-}
 OLA_UPDATE_CHECKSUM_FILE=${OLA_UPDATE_CHECKSUM_FILE:-}
 OLA_UPDATE_LOCK_OWNED=0
+# Bound the self-update downloads so a redirected or malfunctioning endpoint
+# cannot fill the installation filesystem before the SHA-256 check runs.
+# The generated artifact is currently well under 1 MiB; 10 MiB leaves ample
+# room for growth while still failing closed on an unbounded response.
+OLA_UPDATE_MAX_ARTIFACT_BYTES=10485760
+OLA_UPDATE_MAX_CHECKSUM_BYTES=4096
 
 update_short_hash(){
   local hash=${1:-}
@@ -103,10 +109,10 @@ update_exit_cleanup(){
 }
 
 update_download(){
-  local url=$1 dest=$2 label=$3
-  if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$url" > "$dest"; then
+  local url=$1 dest=$2 label=$3 max_bytes=$4
+  if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 --proto-redir =https --max-filesize "$max_bytes" "$url" > "$dest"; then
     rm -f "$dest"
-    die "Téléchargement impossible : $label ($url). Vérifie la connexion Internet puis réessaie."
+    die "Téléchargement impossible ou trop volumineux (limite $max_bytes octets) : $label ($url). Vérifie la connexion Internet puis réessaie."
   fi
   [[ -s "$dest" ]] || die "Téléchargement vide : $label ($url)."
 }
@@ -262,6 +268,15 @@ update_ola_command(){
     return 0
   fi
 
+  case "$OLA_UPDATE_URL" in
+    https://*) ;;
+    *) die "OLA_UPDATE_URL doit utiliser HTTPS ; mise à jour refusée." ;;
+  esac
+  case "$OLA_UPDATE_SHA256_URL" in
+    https://*) ;;
+    *) die "OLA_UPDATE_SHA256_URL doit utiliser HTTPS ; mise à jour refusée." ;;
+  esac
+
   require_commands curl sha256sum awk grep head install mktemp
   update_lock_acquire
   trap update_exit_cleanup EXIT
@@ -277,9 +292,9 @@ update_ola_command(){
 
   echo "--- Mise à jour de ola ---"
   info "Téléchargement de la dernière version publiée…"
-  update_download "$OLA_UPDATE_URL" "$OLA_UPDATE_CANDIDATE" "artefact ola"
+  update_download "$OLA_UPDATE_URL" "$OLA_UPDATE_CANDIDATE" "artefact ola" "$OLA_UPDATE_MAX_ARTIFACT_BYTES"
   info "Téléchargement du SHA-256 publié…"
-  update_download "$OLA_UPDATE_SHA256_URL" "$OLA_UPDATE_CHECKSUM_FILE" "SHA-256 ola"
+  update_download "$OLA_UPDATE_SHA256_URL" "$OLA_UPDATE_CHECKSUM_FILE" "SHA-256 ola" "$OLA_UPDATE_MAX_CHECKSUM_BYTES"
   expected=$(update_expected_sha256 "$OLA_UPDATE_CHECKSUM_FILE")
   candidate_hash=$(update_file_sha256 "$OLA_UPDATE_CANDIDATE" || true)
   [[ "$candidate_hash" == "$expected" ]] \

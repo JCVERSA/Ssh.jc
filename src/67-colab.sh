@@ -22,7 +22,7 @@ colab_write_runtime_marker(){
 
 colab_state_restore(){
   is_colab_mode || return 0
-  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src dst
+  local state_dir=${OLA_COLAB_STATE_DIR:-} config_dir src dst value size
   [[ -n "$state_dir" ]] || return 0
   case "$state_dir" in
     /*) ;;
@@ -35,8 +35,30 @@ colab_state_restore(){
   fi
   for dst in "$MODEL_FILE" "$SPEED_FILE" "$KEEPALIVE_FILE"; do
     src="$config_dir/$(basename "$dst")"
-    if [[ -f "$src" ]]; then
+    if [[ -f "$src" && ! -L "$src" ]]; then
+      # Drive is a separate trust boundary from the root-owned runtime
+      # files. Restore only tiny regular files with values this program
+      # itself could have written; never follow a Drive symlink into a
+      # runtime file or copy an unexpected value into /etc.
+      size=$(stat -c %s "$src" 2>/dev/null || printf '%s' "999999")
+      if [[ ! "$size" =~ ^[0-9]+$ || "$size" -gt 4096 ]]; then
+        warn "État Colab ignoré car trop volumineux ou illisible : $src"
+        return 1
+      fi
+      value=$(head -n 1 "$src" 2>/dev/null || true)
+      case "$dst" in
+        "$MODEL_FILE")
+          is_valid_model_name "$value" || { warn "État Colab invalide (modèle) : $src"; return 1; }
+          ;;
+        "$SPEED_FILE")
+          case "$value" in balanced|speed) ;; *) warn "État Colab invalide (Pack Speed) : $src"; return 1 ;; esac
+          ;;
+        "$KEEPALIVE_FILE")
+          is_valid_keep_alive "$value" || { warn "État Colab invalide (keep-alive) : $src"; return 1; }
+          ;;
+      esac
       cp -f "$src" "$dst" || return 1
+      chmod 600 "$dst" || return 1
     fi
   done
   colab_write_runtime_marker || return 1
